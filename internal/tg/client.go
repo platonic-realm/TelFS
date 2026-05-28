@@ -8,29 +8,32 @@ import (
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/tg"
 
 	"telfs/internal/config"
 )
 
-// Client wraps a gotd Telegram client with TelFS-specific operations.
+// Client is a façade over gotd's telegram.Client. It is responsible for:
 //
-// Each call to Run (and Login) spins up a fresh *telegram.Client because
-// gotd's Client is single-shot: after one Run completes, its internal ctx
-// is canceled and subsequent calls fail with "client already closed".
-// That's fine for one-shot CLI commands.
+//   - One-shot CLI operations (PostMessage, ListChannels, ...). Each one
+//     opens a fresh telegram.Client via RunSession, runs the op, and
+//     closes the client. gotd's *telegram.Client is single-shot — once
+//     its Run completes, the next Run on the same instance fails with
+//     "client already closed".
 //
-// TODO(M3): the FUSE daemon will issue thousands of chunk ops per mount,
-// so paying a full MTProto handshake per call is unworkable. When wiring
-// M3 (read path), hold a single long-lived telegram.Client for the
-// daemon's lifetime and expose the live *tg.Client to the chunk pipeline
-// directly.
+//   - Long-lived daemon mode: RunSession exposes a *Session to a callback
+//     that lives as long as the callback runs. The FUSE mount uses this
+//     to hold one MTProto connection for the daemon's lifetime.
+//
+// The teardown contract: callers of RunSession MUST ensure that all of
+// their consumers (background goroutines that issue Session ops) have
+// drained before they return from the callback. After return, the
+// Session's underlying client is closed and any further use will fail.
 type Client struct {
 	cfg *config.Config
 }
 
-// ErrNotAuthorized is returned by Run when no valid local session exists.
-// Callers should invoke Login first.
+// ErrNotAuthorized is returned by RunSession when no valid local session
+// file exists. Callers should invoke Login first.
 var ErrNotAuthorized = errors.New("not authorized — run 'telfs login' first")
 
 // New constructs a Client. Returns an error if the config is missing the
@@ -53,14 +56,15 @@ func (c *Client) newTG() *telegram.Client {
 	return telegram.NewClient(c.cfg.APIID, c.cfg.APIHash, opts)
 }
 
-// Run executes fn within an authenticated MTProto session. If no session
-// file exists, fn is not invoked and ErrNotAuthorized is returned without
-// any network round-trip.
+// RunSession runs fn within an authenticated MTProto session. fn receives
+// a *Session valid only for the duration of the callback. If no local
+// session file exists, fn is not invoked and ErrNotAuthorized is returned
+// without any network round-trip.
 //
 // gotd's telegram.Client.Run swallows context.Canceled to nil; we
 // re-surface it via ctx.Err() so callers can distinguish a clean cancel
 // from "the work succeeded with empty results."
-func (c *Client) Run(ctx context.Context, fn func(ctx context.Context, api *tg.Client) error) error {
+func (c *Client) RunSession(ctx context.Context, fn func(ctx context.Context, sess *Session) error) error {
 	if _, err := os.Stat(c.cfg.SessionPath()); errors.Is(err, os.ErrNotExist) {
 		return ErrNotAuthorized
 	}
@@ -73,10 +77,54 @@ func (c *Client) Run(ctx context.Context, fn func(ctx context.Context, api *tg.C
 		if !status.Authorized {
 			return ErrNotAuthorized
 		}
-		return fn(ctx, tgc.API())
+		return fn(ctx, &Session{api: tgc.API(), cfg: c.cfg})
 	})
 	if err == nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
 	return err
+}
+
+// ListChannels is a one-shot wrapper around Session.ListChannels.
+func (c *Client) ListChannels(ctx context.Context) ([]ChannelInfo, error) {
+	var out []ChannelInfo
+	err := c.RunSession(ctx, func(ctx context.Context, s *Session) error {
+		var err error
+		out, err = s.ListChannels(ctx)
+		return err
+	})
+	return out, err
+}
+
+// SetChannel is a one-shot wrapper around Session.SetChannel.
+func (c *Client) SetChannel(ctx context.Context, id int64) (ChannelInfo, error) {
+	var out ChannelInfo
+	err := c.RunSession(ctx, func(ctx context.Context, s *Session) error {
+		var err error
+		out, err = s.SetChannel(ctx, id)
+		return err
+	})
+	return out, err
+}
+
+// PostMessage is a one-shot wrapper around Session.PostMessage.
+func (c *Client) PostMessage(ctx context.Context, text string) (int, error) {
+	var id int
+	err := c.RunSession(ctx, func(ctx context.Context, s *Session) error {
+		var err error
+		id, err = s.PostMessage(ctx, text)
+		return err
+	})
+	return id, err
+}
+
+// GetMessageText is a one-shot wrapper around Session.GetMessageText.
+func (c *Client) GetMessageText(ctx context.Context, msgID int) (string, error) {
+	var text string
+	err := c.RunSession(ctx, func(ctx context.Context, s *Session) error {
+		var err error
+		text, err = s.GetMessageText(ctx, msgID)
+		return err
+	})
+	return text, err
 }

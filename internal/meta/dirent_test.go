@@ -52,6 +52,31 @@ func TestCreateChildRejectsNonDirParent(t *testing.T) {
 	}
 }
 
+func TestReaddirInfoReturnsKindAndMode(t *testing.T) {
+	s := newTestStore(t)
+	ctx := ctxT(t)
+	_, _ = s.CreateChild(ctx, RootIno, "f", Inode{Kind: KindFile, Mode: 0o100644, Size: 17})
+	_, _ = s.CreateChild(ctx, RootIno, "d", Inode{Kind: KindDir, Mode: 0o40755})
+	_, _ = s.CreateChild(ctx, RootIno, "l", Inode{Kind: KindSymlink, Mode: 0o120777, SymlinkTarget: "f"})
+	infos, err := s.ReaddirInfo(ctx, RootIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 3 {
+		t.Fatalf("got %d entries, want 3", len(infos))
+	}
+	// Returned in name order.
+	if infos[0].Name != "d" || infos[1].Name != "f" || infos[2].Name != "l" {
+		t.Fatalf("order = %s/%s/%s, want d/f/l", infos[0].Name, infos[1].Name, infos[2].Name)
+	}
+	if infos[0].Kind != KindDir || infos[1].Kind != KindFile || infos[2].Kind != KindSymlink {
+		t.Fatalf("kinds wrong: %+v", infos)
+	}
+	if infos[1].Size != 17 {
+		t.Fatalf("file size = %d, want 17", infos[1].Size)
+	}
+}
+
 func TestReaddirReturnsChildren(t *testing.T) {
 	s := newTestStore(t)
 	mkfile(t, s, RootIno, "a")

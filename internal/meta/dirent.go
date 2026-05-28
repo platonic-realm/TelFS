@@ -28,21 +28,26 @@ func (s *Store) Lookup(ctx context.Context, parent int64, name string) (Inode, e
 }
 
 func lookup(ctx context.Context, e execQuerier, parent int64, name string) (Inode, error) {
-	// TODO(M3): collapse into a single JOIN. FUSE walks path components
-	// per-lookup; a 4-deep path issues 8 round trips with this two-step
-	// shape. Halving that is a worthwhile micro-optimization once the
-	// read path is the hot loop.
-	var childIno int64
+	// Single JOIN: dirent + inode in one round trip. This is FUSE's hot
+	// path (one Lookup per path component on every syscall).
+	var in Inode
+	var kind string
+	var target sql.NullString
 	err := e.QueryRowContext(ctx,
-		`SELECT child_ino FROM dirents WHERE parent_ino = ? AND name = ?`,
-		parent, name).Scan(&childIno)
+		`SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.nlink, i.mtime, i.ctime, i.symlink_target
+		   FROM dirents d JOIN inodes i ON i.ino = d.child_ino
+		  WHERE d.parent_ino = ? AND d.name = ?`,
+		parent, name,
+	).Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Inode{}, ErrNotFound
 	}
 	if err != nil {
 		return Inode{}, fmt.Errorf("lookup %d/%q: %w", parent, name, err)
 	}
-	return getInode(ctx, e, childIno)
+	in.Kind = Kind(kind)
+	in.SymlinkTarget = target.String
+	return in, nil
 }
 
 // Readdir returns the entries of a directory in arbitrary order. The caller
@@ -61,6 +66,44 @@ func (s *Store) Readdir(ctx context.Context, parent int64) ([]Dirent, error) {
 			return nil, err
 		}
 		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DirentInfo carries everything FUSE needs to fill out a fuse.DirEntry
+// (plus a getattr cache hint) in one JOIN, avoiding a per-child round
+// trip during `ls -l`.
+type DirentInfo struct {
+	Name string
+	Ino  int64
+	Kind Kind
+	Mode uint32
+	Size int64
+}
+
+// ReaddirInfo returns a directory's entries joined with their inode
+// attributes in a single query.
+func (s *Store) ReaddirInfo(ctx context.Context, parent int64) ([]DirentInfo, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT d.name, i.ino, i.kind, i.mode, i.size
+		   FROM dirents d JOIN inodes i ON i.ino = d.child_ino
+		  WHERE d.parent_ino = ?
+		  ORDER BY d.name`,
+		parent,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("readdirinfo %d: %w", parent, err)
+	}
+	defer rows.Close()
+	var out []DirentInfo
+	for rows.Next() {
+		var e DirentInfo
+		var kind string
+		if err := rows.Scan(&e.Name, &e.Ino, &kind, &e.Mode, &e.Size); err != nil {
+			return nil, err
+		}
+		e.Kind = Kind(kind)
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }
