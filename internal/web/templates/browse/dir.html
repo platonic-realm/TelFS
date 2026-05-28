@@ -1,0 +1,57 @@
+{{define "content"}}
+<h2>{{.At}}{{if .P}}/{{.P}}{{end}}</h2>
+<p>
+  <a href="/browse">⌂ all mounts</a>
+  {{if not .IsRoot}} · <a href="{{.UpURL}}">↑ parent</a>{{end}}
+</p>
+
+<table>
+  <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>
+  <tbody>
+    {{range .Entries}}
+    <tr>
+      <td>
+        {{if .IsDir}}📁 <a href="{{.HrefDir}}">{{.Name}}/</a>
+        {{else if .IsLink}}🔗 {{.Name}}
+        {{else}}📄 <a href="{{.HrefFile}}">{{.Name}}</a>{{end}}
+      </td>
+      <td>{{if not .IsDir}}{{humanBytes .Size}}{{end}}</td>
+      <td><small>{{.Mtime}}</small></td>
+      <td>
+        <form method="post" action="/browse/delete" style="display:inline" onsubmit="return confirm('Delete {{.Name}}?')">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="at" value="{{$.At}}">
+          <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
+          <button type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {{else}}
+    <tr><td colspan="4"><em>(empty)</em></td></tr>
+    {{end}}
+  </tbody>
+</table>
+
+<section class="card">
+  <h3>Upload</h3>
+  <form method="post" action="/browse/upload" enctype="multipart/form-data">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="at" value="{{.At}}">
+    <input type="hidden" name="p" value="{{.P}}">
+    <input type="file" name="file" required>
+    <button type="submit">Upload</button>
+  </form>
+  <p><small>Up to 2 GiB per file. Writes go through FUSE → chunk pipeline → channel.</small></p>
+</section>
+
+<section class="card">
+  <h3>Make directory</h3>
+  <form method="post" action="/browse/mkdir">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="at" value="{{.At}}">
+    <input type="hidden" name="p" value="{{.P}}">
+    <label>Name <input type="text" name="name" required></label>
+    <button type="submit">Create</button>
+  </form>
+</section>
+{{end}}

@@ -1,0 +1,16 @@
+{{define "content"}}
+<h2>Browse</h2>
+{{if .Mounts}}
+<p>Pick a TelFS mountpoint to browse:</p>
+<ul>
+  {{range .Mounts}}
+  <li>
+    <a href="/browse/dir?at={{.Path}}"><code>{{.Path}}</code></a>
+    <small>({{.Label}})</small>
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<p><em>No TelFS mounts on this host.</em> <a href="/mount/new">Start one</a> first.</p>
+{{end}}
+{{end}}

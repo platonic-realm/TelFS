@@ -58,6 +58,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /mount/{profile}", s.mountDetail)
 	s.mux.HandleFunc("POST /mount/{profile}/stop", s.mountStop)
 	s.mux.HandleFunc("GET /mount/{profile}/log", s.mountLog)
+
+	// File browser.
+	s.mux.HandleFunc("GET /browse", s.browsePick)
+	s.mux.HandleFunc("GET /browse/dir", s.browseDir)
+	s.mux.HandleFunc("GET /browse/file", s.browseFile)
+	s.mux.HandleFunc("POST /browse/mkdir", s.browseMkdir)
+	s.mux.HandleFunc("POST /browse/upload", s.browseUpload)
+	s.mux.HandleFunc("POST /browse/delete", s.browseDelete)
 }
 
 // renderTemplate parses + executes a template set (always including
