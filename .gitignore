@@ -1,0 +1,30 @@
+# --- Build artifacts ---
+/bin/
+/telfs
+*.test
+*.out
+coverage.*
+*.prof
+
+# --- Go ---
+# Vendor only if intentionally checked in; default off.
+/vendor/
+
+# --- TelFS runtime state (created when running locally) ---
+# Holds gotd session, SQLite DB, chunk cache. Never commit.
+/.telfs/
+
+# --- Workspace / operational files (Claude session use, not for the repo) ---
+/CLAUDE.md
+/.claude/
+/notes/
+
+# --- Editor / OS noise ---
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# --- Logs ---
+*.log
