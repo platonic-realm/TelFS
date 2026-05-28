@@ -1,0 +1,27 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TelFS</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+<header>
+  <h1><a href="/">TelFS</a></h1>
+  <nav>
+    <a href="/">Dashboard</a>
+    <a href="/profiles">Profiles</a>
+  </nav>
+</header>
+<main>
+{{if .Flash.Msg}}<div class="flash {{.Flash.Kind}}">{{.Flash.Msg}}</div>{{end}}
+{{template "content" .}}
+</main>
+<footer>
+  <small>telfs web · single-binary management UI</small>
+</footer>
+</body>
+</html>
+{{end}}

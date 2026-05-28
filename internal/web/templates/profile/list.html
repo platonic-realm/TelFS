@@ -1,0 +1,29 @@
+{{define "content"}}
+<h2>Profiles</h2>
+<p>
+  <a href="/profiles/new" class="btn">Create</a>
+  <a href="/profiles/import" class="btn">Import bundle</a>
+</p>
+{{if .Profiles}}
+<table>
+<tr><th>Name</th><th>Active</th><th></th></tr>
+{{range .Profiles}}
+<tr>
+  <td><a href="/profiles/{{.}}">{{.}}</a></td>
+  <td>{{if eq . $.Active}}<strong>yes</strong>{{end}}</td>
+  <td>
+    {{if ne . $.Active}}
+    <form method="post" action="/profiles/{{.}}/use" style="display:inline">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <button type="submit">Use</button>
+    </form>
+    {{end}}
+    <a href="/profiles/{{.}}/export" class="btn">Export</a>
+  </td>
+</tr>
+{{end}}
+</table>
+{{else}}
+<p><em>No profiles yet.</em></p>
+{{end}}
+{{end}}

@@ -1,0 +1,56 @@
+{{define "content"}}
+<h2>Profile: {{.Name}} {{if eq .Name .Active}}<small>(active)</small>{{end}}</h2>
+
+<section class="card">
+  <h3>Location</h3>
+  <p><code>{{.Dir}}</code></p>
+</section>
+
+<section class="card">
+  <h3>Credentials</h3>
+  {{if .HasAPI}}
+    <dl>
+      <dt>API ID</dt><dd><code>{{.APIID}}</code></dd>
+      <dt>Auth mode</dt><dd>{{.AuthMode}}{{if .HasBot}} <small>(bot token set)</small>{{end}}</dd>
+    </dl>
+  {{else}}
+    <p><em>API credentials not set — edit <code>{{.Dir}}/config.toml</code> with values from <a href="https://my.telegram.org/apps">my.telegram.org</a>.</em></p>
+  {{end}}
+</section>
+
+<section class="card">
+  <h3>Channel</h3>
+  {{if .Channel.Set}}
+    <dl><dt>Title</dt><dd>{{.Channel.Title}}</dd><dt>ID</dt><dd><code>{{.Channel.ID}}</code></dd></dl>
+  {{else}}
+    <p><em>No channel bound.</em></p>
+  {{end}}
+</section>
+
+{{if .HasMeta}}
+<section class="card">
+  <h3>Filesystem</h3>
+  <dl>
+    {{if .ChunkSize}}<dt>chunk size</dt><dd>{{humanBytes .ChunkSize}}</dd>{{end}}
+    <dt>encryption</dt><dd>{{if .Crypto.Enabled}}{{.Crypto.Mode}}{{else}}disabled{{end}}</dd>
+  </dl>
+</section>
+{{end}}
+
+<section class="card">
+  <h3>Actions</h3>
+  <p>
+    {{if ne .Name .Active}}
+    <form method="post" action="/profiles/{{.Name}}/use" style="display:inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit">Make active</button>
+    </form>
+    {{end}}
+    <a href="/profiles/{{.Name}}/export" class="btn">Export bundle</a>
+    <form method="post" action="/profiles/{{.Name}}/delete" style="display:inline" onsubmit="return confirm('Delete profile {{.Name}}? Local data only — channel data is untouched.');">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" class="danger">Delete</button>
+    </form>
+  </p>
+</section>
+{{end}}

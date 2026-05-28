@@ -1,0 +1,10 @@
+{{define "content"}}
+<h2>Create a profile</h2>
+<form method="post" action="/profiles">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Name <input type="text" name="name" required pattern="[a-zA-Z0-9_-]+" autocomplete="off"></label>
+  <button type="submit">Create</button>
+  <a href="/profiles" class="btn">Cancel</a>
+</form>
+<p><small>Allowed: letters, digits, dash, underscore. After creation you'll need to set credentials, log in, and bind a channel.</small></p>
+{{end}}

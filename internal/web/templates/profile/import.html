@@ -1,0 +1,15 @@
+{{define "content"}}
+<h2>Import a profile bundle</h2>
+<form method="post" action="/profiles/import" enctype="multipart/form-data">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Destination profile name
+    <input type="text" name="name" required pattern="[a-zA-Z0-9_-]+" autocomplete="off">
+  </label>
+  <label>Bundle file (<code>.tar.gz</code> produced by <code>telfs profile export</code>)
+    <input type="file" name="bundle" accept=".gz,.tgz,.tar.gz" required>
+  </label>
+  <button type="submit">Import</button>
+  <a href="/profiles" class="btn">Cancel</a>
+</form>
+<p><small>The bundle contains your MTProto session credentials. Treat it like a private key.</small></p>
+{{end}}
