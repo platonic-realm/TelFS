@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"syscall"
@@ -341,23 +342,47 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		<-signalCtx.Done()
 
-		// User asked to stop. Run the final snapshot synchronously
-		// BEFORE we ask gotd to shut down — uploads after callback
-		// return fail with "engine closed".
-		stopSnap()
-		<-snapDone
-		fmt.Println("Taking final snapshot…")
-		finalCtx, finalCancel := context.WithTimeout(context.Background(), 60*time.Second)
-		if err := snapMgr.Once(finalCtx); err != nil {
-			fmt.Fprintln(os.Stderr, "[snapshot] final failed:", err)
-		}
-		finalCancel()
+		// User asked to stop. Two failsafes:
+		//  1. A second ^C (or SIGTERM) force-exits via lazy unmount.
+		//     Standard Unix expectation — first signal is "stop
+		//     nicely", second is "stop now".
+		//  2. A 25-second hard watchdog: even without a second
+		//     signal, if the orderly shutdown wedges (FLOOD_WAIT
+		//     storm, gotd stuck), lazy-unmount + os.Exit so the
+		//     user's terminal returns and the kernel mount isn't
+		//     orphaned.
+		armForceExit(mountpoint)
 
-		fmt.Println("Unmounting…")
-		if uerr := server.Unmount(); uerr != nil {
-			fmt.Fprintln(os.Stderr, "unmount:", uerr)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			// Final snapshot synchronously BEFORE we ask gotd to
+			// shut down — uploads after callback return fail with
+			// "engine closed". 15-second budget; if it doesn't
+			// land we accept losing the cadence-since-last-snap
+			// delta and move on.
+			stopSnap()
+			<-snapDone
+			fmt.Println("Taking final snapshot…")
+			finalCtx, finalCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			if err := snapMgr.Once(finalCtx); err != nil {
+				fmt.Fprintln(os.Stderr, "[snapshot] final failed:", err)
+			}
+			finalCancel()
+			fmt.Println("Unmounting…")
+			if uerr := server.Unmount(); uerr != nil {
+				fmt.Fprintln(os.Stderr, "unmount:", uerr)
+			}
+			server.Wait()
+		}()
+		select {
+		case <-done:
+			// Orderly shutdown complete.
+		case <-time.After(25 * time.Second):
+			fmt.Fprintln(os.Stderr, "telfs: orderly shutdown timed out — forcing lazy unmount + exit")
+			_ = exec.Command("fusermount", "-uz", mountpoint).Run()
+			os.Exit(1)
 		}
-		server.Wait()
 		return nil
 	})
 	// Treat clean cancellation as success — the user asked for unmount.
@@ -365,6 +390,24 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return nil
 	}
 	return err
+}
+
+// armForceExit installs a signal handler that force-exits the process
+// on a SECOND SIGINT/SIGTERM. The first signal is consumed by the
+// outer signal.NotifyContext (which triggers orderly shutdown);
+// a second signal during shutdown means the user has lost patience
+// and wants out — we lazy-unmount and os.Exit so the kernel mount
+// isn't left orphaned.
+func armForceExit(mountpoint string) {
+	ch := make(chan os.Signal, 2)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ch // first one is the orderly-shutdown trigger (already in flight)
+		<-ch // second one means "I mean it"
+		fmt.Fprintln(os.Stderr, "telfs: second signal — forcing lazy unmount + exit")
+		_ = exec.Command("fusermount", "-uz", mountpoint).Run()
+		os.Exit(130)
+	}()
 }
 
 // tryRecover opens a transient MTProto session, scans the channel for
