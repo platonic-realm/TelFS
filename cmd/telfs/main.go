@@ -31,6 +31,7 @@ import (
 
 	"telfs/internal/chunk"
 	"telfs/internal/config"
+	"telfs/internal/crypto"
 	telfsfs "telfs/internal/fs"
 	"telfs/internal/meta"
 	"telfs/internal/snapshot"
@@ -420,7 +421,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// freshly-recovered DB is re-baselined) then every interval.
 		// We pass sessCtx — the goroutine exits when the gotd session
 		// tears down. The user-stop signal stops it via snapCtx below.
-		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess}
+		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher}
 		snapCtx, stopSnap := context.WithCancel(sessCtx)
 		snapDone := make(chan struct{})
 		go func() {
@@ -501,8 +502,9 @@ func armForceExit(mountpoint string) {
 
 // tryRecover opens a transient MTProto session, scans the channel for
 // the most recent snapshot message, and restores it to cfg.DBPath().
-// If no snapshot exists in the channel, returns nil (fresh DB will be
-// created by the subsequent meta.Open).
+// If the snapshot is encrypted, it prompts for the passphrase (or
+// reads TELFS_PASSPHRASE), derives the key from the salt embedded in
+// the envelope header, decrypts, and restores.
 func tryRecover(ctx context.Context, cfg *config.Config) error {
 	client, err := tg.New(cfg)
 	if err != nil {
@@ -526,12 +528,63 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 		if err != nil {
 			return err
 		}
-		if err := snapshot.Restore(ctx, data, cfg.DBPath()); err != nil {
+
+		// Encrypted envelope? Detect via magic, derive a key from the
+		// embedded KDF state + passphrase, decrypt to the plaintext
+		// gzipped DB.
+		plaintext, err := maybeUnwrapEncrypted(data)
+		if err != nil {
+			return fmt.Errorf("decrypt snapshot: %w", err)
+		}
+		if err := snapshot.Restore(ctx, plaintext, cfg.DBPath()); err != nil {
 			return err
 		}
-		fmt.Printf("Restored %d gzipped bytes → %s\n", len(data), cfg.DBPath())
+		fmt.Printf("Restored %d gzipped bytes → %s\n", len(plaintext), cfg.DBPath())
 		return nil
 	})
+}
+
+// maybeUnwrapEncrypted returns the plaintext gzipped-DB bytes given
+// what was downloaded from the channel. If the blob is a TFSE
+// envelope, prompts for the passphrase, derives the key via Argon2id
+// from the envelope's salt, verifies the canary (fail-fast on wrong
+// passphrase), and decrypts. If the blob isn't wrapped, returns it
+// as-is.
+func maybeUnwrapEncrypted(data []byte) ([]byte, error) {
+	if !snapshot.IsWrapped(data) {
+		return data, nil
+	}
+	salt, argonJSON, canary, err := snapshot.EnvelopeKDFParams(data)
+	if err != nil {
+		return nil, err
+	}
+	body, err := snapshot.UnwrapBody(data)
+	if err != nil {
+		return nil, err
+	}
+	params, err := crypto.UnmarshalArgonParams(argonJSON)
+	if err != nil {
+		return nil, err
+	}
+	pass, err := readPassphrase("Encrypted snapshot — passphrase: ")
+	if err != nil {
+		return nil, err
+	}
+	defer zero(pass)
+	key := crypto.DeriveKey(pass, salt, params)
+	defer zero(key)
+	cipher, err := crypto.NewAESGCM(key)
+	if err != nil {
+		return nil, err
+	}
+	if err := crypto.VerifyCanary(cipher, canary); err != nil {
+		return nil, err
+	}
+	plaintext, err := cipher.Open(0, -1, body)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt body: %w", err)
+	}
+	return plaintext, nil
 }
 
 // cmdGC walks the channel and removes messages that are no longer
