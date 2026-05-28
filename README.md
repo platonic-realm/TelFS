@@ -1,10 +1,25 @@
 # TelFS
 
-A FUSE filesystem that uses a private Telegram channel as its storage
-backend. Files are split into 4 MiB chunks and uploaded as channel
-messages; a local SQLite database holds the metadata. Periodic
-gzipped DB snapshots are posted to the same channel so the filesystem
-survives loss of the local DB.
+[![CI](https://github.com/platonic-realm/TelFS/actions/workflows/ci.yml/badge.svg)](https://github.com/platonic-realm/TelFS/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/platonic-realm/TelFS?display_name=tag)](https://github.com/platonic-realm/TelFS/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+A POSIX filesystem that stores its data in a private Telegram channel.
+Files are chunked, optionally encrypted with AES-256-GCM, and uploaded
+as channel messages; a local SQLite database holds the metadata and is
+periodically snapshotted back to the same channel so a fresh machine
+with the right credentials and passphrase can mount and read every
+byte. Pure-Go, single static binary, optional Alpine container.
+
+```sh
+telfs profile create main
+telfs profile use main
+telfs login                                  # phone + code + 2FA
+telfs channel set <id>
+telfs encrypt init                           # optional: AES-256-GCM
+telfs trash enable --ttl 7d                  # optional: rm safety-net
+telfs mount ~/External
+```
 
 ## What works today
 
@@ -28,58 +43,75 @@ End-to-end verified on a real Telegram account + private channel:
 | Persistent LRU chunk cache across daemon restarts | ✓ |
 | Profiles + portable tar.gz export/import bundles | ✓ |
 | Web management UI (dashboard, login, mount, browser) | ✓ (`telfs web`) |
+| Trash safety-net — `rm` reroutes to `/.trash`, TTL GC | ✓ (`telfs trash`) |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
 ## Bot vs user auth
 
-TelFS authenticates as either:
+TelFS supports both, and the data plane is identical: every chunk goes
+over MTProto via gotd, capped at 2 GB per upload, regardless of which
+identity you authenticate as. The HTTP Bot API is never used (so its
+~50 MB per-file ceiling never applies). What changes between modes is
+only the dialog/listing surface:
 
-| Mode | Setup | Limits |
+| Mode | Setup | Behavioral differences |
 |---|---|---|
-| **User** (default) | `telfs login` → phone + code + 2FA | Full dialog access, can scan channels by id, 2 GB per upload via MTProto |
-| **Bot** | `telfs login --bot <token>` (token from @BotFather) | Same 2 GB per upload (MTProto — NOT the 50 MB HTTP Bot API), but bots can't enumerate dialogs so `channel set` needs both `--access-hash` and `<id>` |
+| **User** (default) | `telfs login` → phone + code + 2FA | Full dialog access — `channel list` enumerates your channels and `channel set <id>` auto-discovers the access_hash. |
+| **Bot** | `telfs login --bot <token>` (token from @BotFather) | Bots cannot enumerate dialogs, so `channel set` requires `--access-hash` explicitly. The bot must be added to the target channel as an administrator before it can post. |
 
-Bot mode workflow:
+Bot-mode setup:
 
 ```sh
-# 1. Get the channel access_hash from a user-account TelFS, OR from your
-#    own preferred tool. With a user profile already set up:
-TELFS_PROFILE=user-acct ./bin/telfs channel info        # prints access_hash
+# 1. Get the channel access_hash from a user-account TelFS first
+#    (or any tool you prefer):
+TELFS_PROFILE=user-acct telfs channel info       # prints access_hash
 
-# 2. Talk to @BotFather, create a bot, get a token.
-# 3. In the Telegram app, add the bot to your private channel as ADMIN.
+# 2. Create a bot via @BotFather → get a token; add the bot to your
+#    private channel as an ADMIN.
 
-# 4. New profile + bot login + manual channel binding:
-./bin/telfs profile create my-bot
-TELFS_PROFILE=my-bot ./bin/telfs login --bot 123456:ABCDEF…
-TELFS_PROFILE=my-bot ./bin/telfs channel set --access-hash <H> <channel-id>
-TELFS_PROFILE=my-bot ./bin/telfs mount ~/External
+# 3. New profile + bot login + manual channel binding:
+telfs profile create my-bot
+TELFS_PROFILE=my-bot telfs login --bot 123456:ABCDEF…
+TELFS_PROFILE=my-bot telfs channel set --access-hash <H> <channel-id>
+TELFS_PROFILE=my-bot telfs mount ~/External
 ```
 
-The MTProto pipeline is identical between user and bot modes — same
-chunker, same encryption, same snapshot cadence. The only behavioral
-differences are: dialog enumeration is empty for bots, and the bot
-must be a channel admin before posting.
+Everything past auth — chunker, encryption, snapshots, GC, trash — is
+mode-agnostic.
+
+## Install
+
+Three options:
+
+```sh
+# 1. Pre-built static binary from a GitHub Release (no toolchain needed):
+curl -L https://github.com/platonic-realm/TelFS/releases/latest/download/telfs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m).tar.gz | tar xz
+sudo install telfs-*/telfs /usr/local/bin/telfs
+
+# 2. Build from source (requires Go 1.22+):
+git clone https://github.com/platonic-realm/TelFS.git && cd TelFS
+make build                                       # → bin/telfs
+
+# 3. Alpine container (headless / NAS — see Deployment below):
+docker pull ghcr.io/platonic-realm/telfs:latest
+```
+
+All three carry the same static `telfs` binary and need `fusermount`
+(`fuse3`/`fuse2` packages) in `$PATH` at unmount time. Get a Telegram
+API ID + hash from <https://my.telegram.org/apps>.
 
 ## Quick start
 
-You need Go 1.22+, FUSE (`fusermount` from your distro), and a
-Telegram API ID + hash (free, get them at
-<https://my.telegram.org/apps>).
-
 ```sh
-# Build.
-make build                                  # → bin/telfs
-
 # (Optional) pick a non-default chunk size before first mount.
 # Default is 4 MiB; valid range is 64 KiB..1.5 GiB, power of two.
 # Once any chunk lands the choice is immutable.
-./bin/telfs init --chunk-size $((16*1024*1024))   # e.g. 16 MiB
+telfs init --chunk-size $((16*1024*1024))        # e.g. 16 MiB
 
 # Pick a profile to live under. Profiles are isolated FS instances at
 # ~/.config/telfs/profiles/<name>/ holding config + session + DB + cache.
-./bin/telfs profile create main
-./bin/telfs profile use main                # sticky default
+telfs profile create main
+telfs profile use main                           # sticky default
 
 # Configure credentials (one-time). Either edit the profile's config.toml
 # directly OR set them in the environment:
@@ -88,17 +120,17 @@ export TELFS_API_HASH=...
 
 # Log in (interactive — type the SMS / Telegram code that arrives, and
 # your 2FA password if set).
-./bin/telfs login
+telfs login
 
 # Pick a channel to use as the backend. Create a *private* channel in
 # Telegram first; then:
-./bin/telfs channel list
-./bin/telfs channel set <id>
-./bin/telfs channel ping                    # smoke test: post + read back
+telfs channel list
+telfs channel set <id>
+telfs channel ping                               # smoke test: post + read back
 
 # Mount.
 mkdir mnt
-./bin/telfs mount ./mnt                     # foreground; ^C to unmount
+telfs mount ./mnt                                # foreground; ^C to unmount
 ```
 
 Then in another shell:
@@ -108,8 +140,8 @@ echo hi > mnt/hello.txt
 cat mnt/hello.txt
 mkdir mnt/notes
 mv mnt/hello.txt mnt/notes/
-ln mnt/notes/hello.txt mnt/notes/alias      # hardlink
-ln -s notes/hello.txt mnt/link              # symlink
+ln mnt/notes/hello.txt mnt/notes/alias           # hardlink
+ln -s notes/hello.txt mnt/link                   # symlink
 setfattr -n user.tag -v important mnt/notes/hello.txt
 ```
 
@@ -142,7 +174,7 @@ last snapshot cycle (cadence: every 5 minutes plus on clean unmount).
 ```sh
 PROFDIR=~/.config/telfs/profiles/main
 rm -rf $PROFDIR/db.sqlite $PROFDIR/cache
-./bin/telfs mount ./mnt
+telfs mount ./mnt
 # Local DB missing — scanning channel for snapshot…
 # Found snapshot msg=29 (ts 2026-05-28T18:03:00Z, fs_uuid=…)
 # Restored 1489 gzipped bytes → db.sqlite (TFSE envelope decrypted)
@@ -172,17 +204,17 @@ already exists; the migration path is `cp -r` from an old TelFS to a
 new encrypted one):
 
 ```sh
-./bin/telfs encrypt init                    # interactive passphrase
+telfs encrypt init                    # interactive passphrase
 # or for unattended setup:
-TELFS_PASSPHRASE='your secret' ./bin/telfs encrypt init
-./bin/telfs encrypt status
+TELFS_PASSPHRASE='your secret' telfs encrypt init
+telfs encrypt status
 ```
 
 Once enabled, every mount requires the passphrase. Set
 `TELFS_PASSPHRASE` to skip the prompt:
 
 ```sh
-TELFS_PASSPHRASE='your secret' ./bin/telfs mount ./mnt
+TELFS_PASSPHRASE='your secret' telfs mount ./mnt
 ```
 
 Wrong passphrase fails fast — a canary in `meta_kv` is decrypted
@@ -215,20 +247,74 @@ filesystems.
 
 ## Maintenance
 
+### `telfs gc` — reclaim channel storage
+
 ```sh
-./bin/telfs gc                              # dry-run report
-./bin/telfs gc --yes                        # actually delete orphans
+telfs gc                                    # dry-run report
+telfs gc --yes                              # actually delete orphans
 ```
 
-`telfs gc` walks the channel and identifies:
+Walks the channel and identifies:
 
 - **Orphan chunks** — document messages whose msg_id isn't in
-  chunk_map (created by file overwrites/unlinks, which intentionally
+  `chunk_map` (created by file overwrites/unlinks, which intentionally
   don't delete inline — see "Design choices" below).
 - **Stale snapshots** — snapshot-caption messages other than the
   current one recorded in `meta_kv`.
 
 The default is dry-run; pass `--yes` to delete.
+
+### `telfs fsck` — channel-side integrity check
+
+```sh
+telfs fsck                                  # check every chunk_map row
+telfs fsck --fix                            # also drop unreadable rows
+```
+
+Walks `chunk_map` and confirms each referenced message still exists
+on the channel and is reachable. Reports broken references; with
+`--fix`, drops them from the local DB (the corresponding file becomes
+short — see the report for which files).
+
+### `telfs trash` — rm safety-net
+
+```sh
+telfs trash enable --ttl 7d                 # turn on, retain 7 days
+telfs trash status                          # enabled / ttl / count
+telfs trash list                            # oldest first
+telfs trash empty                           # purge everything now
+telfs trash disable                         # back to immediate-delete
+```
+
+When enabled, every kernel-issued `unlink`/`rmdir` from FUSE reroutes
+into a top-level `/.trash/` directory instead of really deleting; a
+background GC unlinks entries older than the TTL. Standard tools
+restore via `mv /.trash/<unix-nano>-orig /restored`.
+
+Semantics:
+
+- The trashed dirent points at the same inode as the original — file
+  contents and chunks are untouched, so a `mv` back out is a true
+  restore.
+- Unlinks *inside* `/.trash` actually delete, so the GC and
+  `trash empty` work.
+- `rm /.trash` itself returns `EPERM` — can't be removed via FUSE.
+- `rm -rf foo/` flattens: the kernel issues per-file unlinks first,
+  then `rmdir`. Each file lands in `/.trash` with a unique prefix;
+  the empty `foo/` ends up there as a sibling. Restorable but not
+  a preserved tree (v1 limitation).
+- The TTL change takes effect on the next GC tick (~5 min) without
+  a remount.
+
+### `telfs status` — one-screen overview
+
+```sh
+telfs status
+```
+
+Active profile, channel binding, fs_uuid, chunk size, encryption
+state, last snapshot, FUSE mount table, on-disk file sizes — all on
+one screen. Useful first stop when something looks off.
 
 ## Configuration
 
@@ -264,13 +350,13 @@ Environment overrides:
 
 | What | Choice | Why |
 |---|---|---|
-| Language | Go | `hanwen/go-fuse` + `gotd/td` + `modernc.org/sqlite` (pure-Go SQLite) |
-| Telegram API | MTProto user API (gotd) | 2 GB per file; Bot API's 50 MB cap is too small for chunks |
+| Language | Go | `hanwen/go-fuse` + `gotd/td` + `modernc.org/sqlite` (pure-Go SQLite). No cgo → fully-static release binary. |
+| Telegram API | MTProto via `gotd/td` for both user *and* bot auth | One code path for the data plane; 2 GB per upload either way. The HTTP Bot API (with its ~50 MB per-file ceiling) is not used. |
 | Metadata | local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence |
 | Chunk size | 4 MiB default, **per-FS configurable** | Sequential read/write throughput vs `chunk_map` row count. Set via `telfs init --chunk-size <N>` BEFORE first mount; immutable thereafter. Power of two, [64 KiB, 1.5 GiB]. |
 | POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough to host typical workloads |
 | Encryption | AES-256-GCM, Argon2id KDF, opt-in via `telfs encrypt init` | Chunk bytes AND snapshot metadata (TFSE envelope); per-chunk AAD binds to `(ino, idx)` |
-| Inline TG deletes | none for chunks; snapshots delete the prior one | M4 trade — never destroys user data inline; orphans cleaned by `telfs gc` |
+| Inline TG deletes | none for chunks; snapshots delete the prior one | Never destroys user data inline; orphans cleaned by `telfs gc`. Trash safety-net layers on top for human-scale `rm` mistakes. |
 | Snapshot cadence | every 5 min + on clean unmount | Bounded recovery window without burning network bandwidth |
 
 ## Profiles + portable bundles
@@ -281,14 +367,14 @@ SQLite metadata, and cache. Multiple profiles coexist independently
 (each can bind to its own account and channel).
 
 ```sh
-./bin/telfs profile create work
-TELFS_PROFILE=work ./bin/telfs login            # interactive setup
-TELFS_PROFILE=work ./bin/telfs channel set <id>
-./bin/telfs profile use work                    # sticky default
+telfs profile create work
+TELFS_PROFILE=work telfs login            # interactive setup
+TELFS_PROFILE=work telfs channel set <id>
+telfs profile use work                    # sticky default
 
-./bin/telfs profile list                        # shows the active marker
-./bin/telfs profile export bundle.tar.gz        # tar.gz of config+session+db
-./bin/telfs profile import --profile work2 bundle.tar.gz   # restore elsewhere
+telfs profile list                        # shows the active marker
+telfs profile export bundle.tar.gz        # tar.gz of config+session+db
+telfs profile import --profile work2 bundle.tar.gz   # restore elsewhere
 ```
 
 A bundle contains your MTProto session credentials and (if encryption
@@ -313,8 +399,8 @@ initialization, mount supervisor with HTMX-polled live log tail, and a
 file browser that reads/writes through a chosen FUSE mountpoint.
 
 ```sh
-./bin/telfs web                                  # 127.0.0.1:8080, no auth
-./bin/telfs web --listen 0.0.0.0:8080 --token $(openssl rand -hex 32)
+telfs web                                  # 127.0.0.1:8080, no auth
+telfs web --listen 0.0.0.0:8080 --token $(openssl rand -hex 32)
 ```
 
 Defaults: loopback bind, no auth — the security perimeter is "can
@@ -399,7 +485,7 @@ chmod 600 ~/.config/telfs/profiles/work/passphrase.env
 systemctl --user enable --now telfs@work.service
 ```
 
-For interactive use, at minimum: `nohup ./bin/telfs mount ~/External &`
+For interactive use, at minimum: `nohup telfs mount ~/External &`
 and verify the daemon survives a shell exit before trusting it
 with data.
 
@@ -410,8 +496,8 @@ with data.
   coordination mechanism.
 - **Up-to-5-minute recovery window.** If the daemon crashes hard
   (kill -9, kernel panic, machine off), data written since the last
-  cadence snapshot is lost. M5 deferred meta-op posting; revisit if
-  this bites in real use.
+  cadence snapshot is lost. A future channel-side journal would close
+  this gap; see the roadmap.
 - **Encryption metadata leakage is bounded but not zero.** Snapshots
   are TFSE-wrapped ciphertext; the channel still exposes the count
   and size of chunk messages and the cadence of snapshots. File size
@@ -422,6 +508,26 @@ with data.
   snapshots as garbage until `telfs gc` reaps them.
 - **gotd default DC 2 may be firewalled.** If `telfs login` hangs at
   the handshake, try `dc = 1` in `config.toml` (or `TELFS_DC=1`).
+- **Trash is flat, not a preserved tree.** `rm -rf foo/bar/` lands as
+  N separate entries under `/.trash`, restorable individually but not
+  as a tree. Acceptable for the safety-net use case (typo undos);
+  for archival, snapshot the FS instead.
+
+## Roadmap
+
+- **Passphrase rotation** via KEK-wrapped data key so changing the
+  passphrase doesn't require re-encrypting every chunk.
+- **Channel-side journal between snapshots** to close the up-to-5-min
+  crash window.
+- **Read-ahead** for sequential FUSE reads — prefetch next-N chunks
+  so `cat`/video playback doesn't round-trip per 4 MiB.
+- **Content-addressed chunk dedup** — SHA-256 index on `chunk_map`;
+  identical chunks share one channel message.
+- **First-run wizard in the web UI** — guide a new user through
+  profile/login/channel/encryption/mount in one form.
+
+See the [issues](https://github.com/platonic-realm/TelFS/issues) tab
+for the current state.
 
 ## Architecture
 
