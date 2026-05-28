@@ -84,23 +84,24 @@ func NewRoot(b *Backend) *Node {
 }
 
 // Statfs answers `statfs(2)` / `pathconf(_PC_NAME_MAX)` / df / etc.
-// Without this, go-fuse returns a zeroed StatfsOut and tools that
-// consult NameLen think every filename is too long ("name too long"
-// errors from mkdir/touch in some file managers and shells).
 //
 // We don't know the channel's remaining capacity, so block counts
-// are large-but-fictional: report ~1 PiB free out of 1 PiB total.
-// Inode counts mirror those — Telegram doesn't impose a per-channel
-// hard cap that maps cleanly to statfs.
+// are large-but-fictional. Numbers are chosen so that downstream
+// tools (df, file managers, archivers) don't overflow or display
+// surprising values: 4 KiB block size (what most tools expect),
+// 1 PiB total, which fits cleanly in a uint64 product and renders
+// as "1P" in `df -h`. The earlier choice of 4 MiB blocks × 4 ZiB
+// total over-saturated some GUI file managers, which truncated
+// to ~6 GB and displayed "drive almost full".
 func (n *Node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 	const (
-		bsize     uint32 = 4 << 20 // 4 MiB — matches our chunk size
-		oneEB     uint64 = 1 << 50 // 1 PiB worth of blocks at 4 MiB each = a lot
+		bsize     uint32 = 4096   // 4 KiB — standard page size
+		blockCnt  uint64 = 1 << 38 // 4 KiB * 2^38 = 1 PiB total
 		fakeFiles uint64 = 1 << 32 // 4 G inodes — plenty
 	)
-	out.Blocks = oneEB
-	out.Bfree = oneEB
-	out.Bavail = oneEB
+	out.Blocks = blockCnt
+	out.Bfree = blockCnt
+	out.Bavail = blockCnt
 	out.Files = fakeFiles
 	out.Ffree = fakeFiles
 	out.Bsize = bsize
