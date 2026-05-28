@@ -16,13 +16,31 @@ import (
 // Backend bundles the dependencies every Node needs. It's shared by
 // reference among all nodes in the mounted tree. The Cache + Uploader
 // + ChunkSize fields are only needed for the write path; read-only
-// mounts can leave them zero.
+// mounts can leave them zero (or set ReadOnly = true to explicitly
+// reject all mutations regardless).
 type Backend struct {
 	Meta      *meta.Store
 	Reader    *chunk.Reader
 	Cache     *chunk.Cache
 	Uploader  chunk.Uploader
 	ChunkSize int64
+	ReadOnly  bool
+}
+
+// canWrite reports whether the backend supports mutating ops. False when
+// either the write deps aren't wired or ReadOnly was explicitly set.
+func (b *Backend) canWrite() bool {
+	return !b.ReadOnly && b.Uploader != nil && b.Cache != nil
+}
+
+// requireWrite returns EROFS if the backend is read-only and 0 otherwise.
+// Mutation entry points (Setattr, Mkdir, Create, Unlink, ...) call this
+// first so a read-only mount surfaces consistent errors.
+func (n *Node) requireWrite() syscall.Errno {
+	if !n.backend.canWrite() {
+		return syscall.EROFS
+	}
+	return 0
 }
 
 // Node is the single implementation that backs every kind of TelFS
@@ -75,6 +93,9 @@ func (n *Node) Getattr(ctx context.Context, _ gofuse.FileHandle, out *fuse.AttrO
 // Setattr handles chmod/chown/utime/truncate. FUSE batches all of these
 // into one call; we apply them via meta.SetAttrs (+ Truncate for size).
 func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	if errno := n.requireWrite(); errno != 0 {
+		return errno
+	}
 	patch := meta.SetAttrsPatch{}
 	if mode, ok := in.GetMode(); ok {
 		patch.Mode = &mode
@@ -120,7 +141,7 @@ func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAt
 // truncate is the no-open-handle path for `truncate("path", size)`.
 // Constructs a one-shot Writer just to run Truncate; no upload happens.
 func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
-	if n.backend.Uploader == nil || n.backend.Cache == nil {
+	if !n.backend.canWrite() {
 		return syscall.EROFS
 	}
 	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.ino, n.backend.chunkSize(), 0)
@@ -168,7 +189,7 @@ func (n *Node) Readdir(ctx context.Context) (gofuse.DirStream, syscall.Errno) {
 // lifetime. Handles O_TRUNC by truncating to 0 before returning the
 // handle so subsequent writes start from a clean slate.
 func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint32, syscall.Errno) {
-	if n.backend.Uploader == nil || n.backend.Cache == nil {
+	if !n.backend.canWrite() {
 		// Read-only mount: reject any open with write flags.
 		if flags&uint32(syscall.O_WRONLY) != 0 || flags&uint32(syscall.O_RDWR) != 0 {
 			return nil, 0, syscall.EROFS
@@ -216,7 +237,7 @@ func (n *Node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 // Create handles `open(path, O_CREAT, mode)` — atomic create-and-open
 // for a regular file.
 func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, gofuse.FileHandle, uint32, syscall.Errno) {
-	if n.backend.Uploader == nil || n.backend.Cache == nil {
+	if !n.backend.canWrite() {
 		return nil, nil, 0, syscall.EROFS
 	}
 	ino, err := n.backend.Meta.CreateChild(ctx, n.ino, name, meta.Inode{
@@ -244,6 +265,9 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 
 // Mkdir creates a directory child.
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
+	if errno := n.requireWrite(); errno != 0 {
+		return nil, errno
+	}
 	ino, err := n.backend.Meta.CreateChild(ctx, n.ino, name, meta.Inode{
 		Kind: meta.KindDir,
 		Mode: mode | uint32(syscall.S_IFDIR),
@@ -264,6 +288,9 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 
 // Symlink creates a symbolic link child whose contents are `target`.
 func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
+	if errno := n.requireWrite(); errno != 0 {
+		return nil, errno
+	}
 	ino, err := n.backend.Meta.CreateChild(ctx, n.ino, name, meta.Inode{
 		Kind:          meta.KindSymlink,
 		Mode:          0o777 | uint32(syscall.S_IFLNK),
@@ -286,6 +313,9 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 // Link creates a new dirent pointing at the target inode. POSIX
 // forbids hardlinking directories.
 func (n *Node) Link(ctx context.Context, target gofuse.InodeEmbedder, name string, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
+	if errno := n.requireWrite(); errno != 0 {
+		return nil, errno
+	}
 	tn, ok := target.(*Node)
 	if !ok {
 		return nil, syscall.EXDEV
@@ -307,6 +337,9 @@ func (n *Node) Link(ctx context.Context, target gofuse.InodeEmbedder, name strin
 
 // Unlink removes a non-directory child.
 func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
+	if errno := n.requireWrite(); errno != 0 {
+		return errno
+	}
 	in, err := n.backend.Meta.Lookup(ctx, n.ino, name)
 	if err != nil {
 		return syscall.ENOENT
@@ -322,6 +355,9 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 
 // Rmdir removes an empty directory child.
 func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
+	if errno := n.requireWrite(); errno != 0 {
+		return errno
+	}
 	in, err := n.backend.Meta.Lookup(ctx, n.ino, name)
 	if err != nil {
 		return syscall.ENOENT
@@ -338,6 +374,9 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 // Rename relocates oldName under n to newName under newParent. The
 // directory-overwrite-empty-dir POSIX rule is enforced by meta.Rename.
 func (n *Node) Rename(ctx context.Context, oldName string, newParent gofuse.InodeEmbedder, newName string, _ uint32) syscall.Errno {
+	if errno := n.requireWrite(); errno != 0 {
+		return errno
+	}
 	np, ok := newParent.(*Node)
 	if !ok {
 		return syscall.EXDEV
@@ -352,6 +391,9 @@ func (n *Node) Rename(ctx context.Context, oldName string, newParent gofuse.Inod
 // namespace; other namespaces (trusted.*, system.*, security.*) need
 // special privileges TelFS doesn't try to emulate.
 func (n *Node) Setxattr(ctx context.Context, attr string, data []byte, _ uint32) syscall.Errno {
+	if errno := n.requireWrite(); errno != 0 {
+		return errno
+	}
 	if !isUserXattr(attr) {
 		return syscall.EOPNOTSUPP
 	}
@@ -403,6 +445,9 @@ func (n *Node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errn
 
 // Removexattr deletes an xattr.
 func (n *Node) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	if errno := n.requireWrite(); errno != 0 {
+		return errno
+	}
 	if !isUserXattr(attr) {
 		return syscall.EOPNOTSUPP
 	}

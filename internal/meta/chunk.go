@@ -78,6 +78,26 @@ func (s *Store) DeleteChunk(ctx context.Context, ino int64, idx int32) error {
 	return nil
 }
 
+// AllChunkMessageIDs returns the distinct set of Telegram message ids
+// currently referenced by the chunk_map. Used by `telfs gc` to identify
+// orphan chunk messages in the channel.
+func (s *Store) AllChunkMessageIDs(ctx context.Context) (map[int64]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT tg_message_id FROM chunk_map`)
+	if err != nil {
+		return nil, fmt.Errorf("all chunk message ids: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[int64]struct{})
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
 // DeleteChunksAbove removes every chunk with idx >= startIdx for the
 // given inode. Used by truncate when the file shrinks past a chunk
 // boundary. Returns the number of rows deleted.

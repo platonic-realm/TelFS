@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
+	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 
@@ -46,10 +48,19 @@ func New(cfg *config.Config) (*Client, error) {
 }
 
 // newTG builds a fresh underlying gotd client honoring cfg.DC and the
-// session storage path.
+// session storage path. The FLOOD_WAIT middleware transparently retries
+// any RPC that Telegram answers with FLOOD_WAIT_N (rate limit) after
+// sleeping N seconds — without it, burst writes would surface raw
+// tgerr errors as EIO to FUSE callers.
 func (c *Client) newTG() *telegram.Client {
 	storage := &session.FileStorage{Path: c.cfg.SessionPath()}
-	opts := telegram.Options{SessionStorage: storage}
+	waiter := floodwait.NewSimpleWaiter().
+		WithMaxRetries(10).
+		WithMaxWait(2 * time.Minute)
+	opts := telegram.Options{
+		SessionStorage: storage,
+		Middlewares:    []telegram.Middleware{waiter},
+	}
 	if c.cfg.DC != 0 {
 		opts.DC = c.cfg.DC
 	}

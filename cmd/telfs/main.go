@@ -19,6 +19,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -43,7 +44,9 @@ Usage:
   telfs channel set <id>            Configure the backing channel.
   telfs channel info                Show the currently configured channel.
   telfs channel ping                Round-trip a test message (smoke test).
-  telfs mount <mountpoint>          Mount the filesystem (read-only in M3).
+  telfs mount [flags] <mountpoint>  Mount the filesystem.
+                                      Flags: --readonly --allow-other --debug
+  telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
 
 Environment:
@@ -79,10 +82,9 @@ func run() error {
 	case "channel":
 		return cmdChannel(ctx, os.Args[2:])
 	case "mount":
-		if len(os.Args) < 3 {
-			return errors.New("mount: missing mountpoint")
-		}
-		return cmdMount(ctx, os.Args[2])
+		return cmdMount(ctx, os.Args[2:])
+	case "gc":
+		return cmdGC(ctx, os.Args[2:])
 	case "debug":
 		return cmdDebug(ctx, os.Args[2:])
 	default:
@@ -231,7 +233,24 @@ func cmdChannelPing(ctx context.Context, cfg *config.Config) error {
 //
 // If we get this order wrong, an in-flight Read could call into a
 // torn-down session and panic.
-func cmdMount(signalCtx context.Context, mountpoint string) error {
+func cmdMount(signalCtx context.Context, args []string) error {
+	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
+	readonly := fs.Bool("readonly", false, "mount read-only (rejects all write ops with EROFS)")
+	allowOther := fs.Bool("allow-other", false, "allow other users to access the mount (FUSE -o allow_other; requires user_allow_other in /etc/fuse.conf)")
+	debug := fs.Bool("debug", false, "log every FUSE op")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] <mountpoint>")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return errors.New("mount: expected exactly one mountpoint argument")
+	}
+	mountpoint := fs.Arg(0)
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -274,12 +293,17 @@ func cmdMount(signalCtx context.Context, mountpoint string) error {
 		}
 		reader := chunk.NewReader(metaStore, cache, chunk.ChunkSize)
 
-		server, err := telfsfs.Mount(telfsfs.MountOptions{MountPoint: mountpoint}, &telfsfs.Backend{
+		server, err := telfsfs.Mount(telfsfs.MountOptions{
+			MountPoint: mountpoint,
+			AllowOther: *allowOther,
+			Debug:      *debug,
+		}, &telfsfs.Backend{
 			Meta:      metaStore,
 			Reader:    reader,
 			Cache:     cache,
 			Uploader:  sess,
 			ChunkSize: chunk.ChunkSize,
+			ReadOnly:  *readonly,
 		})
 		if err != nil {
 			return err
@@ -357,6 +381,113 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 			return err
 		}
 		fmt.Printf("Restored %d gzipped bytes → %s\n", len(data), cfg.DBPath())
+		return nil
+	})
+}
+
+// cmdGC walks the channel and removes messages that are no longer
+// referenced by the local meta DB. Identifies two classes of garbage:
+//
+//   - Orphan chunks: document messages with empty captions whose msg_id
+//     isn't in chunk_map. These come from M4 overwrites/unlinks (we
+//     deliberately don't delete inline) and from any crash that uploaded
+//     a chunk but didn't update chunk_map.
+//   - Stale snapshots: snapshot-caption messages other than the one
+//     recorded in meta_kv[snap_msg_id]. Each cadence cycle leaves at
+//     most one prior snapshot uncleaned in the worst case; this catches
+//     accumulated leftovers from failed delete-on-supersede calls.
+//
+// Default behavior is a dry-run report. Pass --yes to actually delete.
+func cmdGC(ctx context.Context, args []string) error {
+	gcfs := flag.NewFlagSet("gc", flag.ContinueOnError)
+	doDelete := gcfs.Bool("yes", false, "actually delete the orphans (default is dry-run)")
+	pages := gcfs.Int("pages", 50, "max history pages to scan (each page = 100 messages)")
+	if err := gcfs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if err := cfg.RequireChannel(); err != nil {
+		return err
+	}
+	metaStore, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return err
+	}
+	defer metaStore.Close()
+
+	referenced, err := metaStore.AllChunkMessageIDs(ctx)
+	if err != nil {
+		return err
+	}
+	var currentSnap int
+	if v, err := metaStore.GetKV(ctx, snapshot.KVCurrentMsgID); err == nil {
+		if id, err := strconv.Atoi(string(v)); err == nil {
+			currentSnap = id
+		}
+	}
+
+	client, err := tg.New(cfg)
+	if err != nil {
+		return err
+	}
+	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
+		var orphanChunks, staleSnaps []int
+		var totalChunks, totalSnaps int
+		fmt.Printf("Scanning channel (up to %d pages of 100 messages)…\n", *pages)
+		if err := sess.WalkChannelMessages(ctx, *pages, func(cm tg.ChannelMessage) error {
+			switch cm.Kind {
+			case tg.KindChunk:
+				totalChunks++
+				if _, ref := referenced[int64(cm.ID)]; !ref {
+					orphanChunks = append(orphanChunks, cm.ID)
+				}
+			case tg.KindSnapshot:
+				totalSnaps++
+				if cm.ID != currentSnap {
+					staleSnaps = append(staleSnaps, cm.ID)
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		fmt.Printf("\nChunks  in channel: %d   referenced in chunk_map: %d   orphan: %d\n",
+			totalChunks, len(referenced), len(orphanChunks))
+		fmt.Printf("Snapshots in channel: %d   current msg_id: %d   stale: %d\n",
+			totalSnaps, currentSnap, len(staleSnaps))
+		if len(orphanChunks)+len(staleSnaps) == 0 {
+			fmt.Println("\nNothing to do.")
+			return nil
+		}
+
+		toDelete := append([]int{}, orphanChunks...)
+		toDelete = append(toDelete, staleSnaps...)
+		fmt.Printf("\nOrphan chunk msg_ids:   %v\n", orphanChunks)
+		fmt.Printf("Stale snapshot msg_ids: %v\n", staleSnaps)
+
+		if !*doDelete {
+			fmt.Println("\nDry-run. Re-run with --yes to delete.")
+			return nil
+		}
+
+		// channels.deleteMessages accepts a batch; chunk into 100s.
+		const batch = 100
+		for i := 0; i < len(toDelete); i += batch {
+			j := i + batch
+			if j > len(toDelete) {
+				j = len(toDelete)
+			}
+			if err := sess.DeleteChannelMessages(ctx, toDelete[i:j]...); err != nil {
+				return err
+			}
+			fmt.Printf("Deleted %d/%d…\n", j, len(toDelete))
+		}
+		fmt.Printf("\nDone — %d messages deleted.\n", len(toDelete))
 		return nil
 	})
 }
