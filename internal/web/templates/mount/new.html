@@ -1,0 +1,32 @@
+{{define "content"}}
+<h2>Start a mount</h2>
+<form method="post" action="/mount/start" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Profile
+    {{if .Profiles}}
+    <select name="profile" required>
+      {{range .Profiles}}<option value="{{.}}"{{if eq . $.DefaultProfile}} selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    {{else}}
+    <input type="text" name="profile" value="{{.DefaultProfile}}" required>
+    <small>No saved profiles. <a href="/profiles/new">Create one first</a> or type a profile name.</small>
+    {{end}}
+  </label>
+  <label>Mountpoint (absolute path to an existing empty dir)
+    <input type="text" name="mountpoint" placeholder="/home/you/External" required>
+  </label>
+  <label>Passphrase (only if this FS is encrypted)
+    <input type="password" name="passphrase">
+    <small>Pass-through via <code>TELFS_PASSPHRASE</code>. Skipped for plaintext FSes.</small>
+  </label>
+  <fieldset>
+    <legend>Flags</legend>
+    <label><input type="checkbox" name="readonly"> read-only</label>
+    <label><input type="checkbox" name="allow_other"> allow_other</label>
+    <label><input type="checkbox" name="debug"> debug</label>
+  </fieldset>
+  <button type="submit">Start mount</button>
+  <a href="/mount" class="btn">Cancel</a>
+</form>
+<p><small>The web server detaches the child into its own session. Stop it via the mount list to trigger a graceful shutdown (SIGTERM, then lazy unmount as a fallback after 25 s).</small></p>
+{{end}}

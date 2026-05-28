@@ -1,0 +1,42 @@
+{{define "content"}}
+<h2>Mounts</h2>
+
+<section class="card">
+  <h3>Supervised by this web server</h3>
+  {{if .Supervised}}
+  <table>
+    <thead><tr><th>Profile</th><th>Mountpoint</th><th>Status</th><th>Started</th><th></th></tr></thead>
+    <tbody>
+      {{range .Supervised}}
+      <tr>
+        <td><a href="/mount/{{.Profile}}">{{.Profile}}</a></td>
+        <td><code>{{.Mountpoint}}</code></td>
+        <td>{{.Status}}</td>
+        <td>{{.Started}}</td>
+        <td>
+          <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <button type="submit">Stop</button>
+          </form>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p><em>No supervised mounts. <a href="/mount/new">Start one</a>.</em></p>
+  {{end}}
+</section>
+
+{{if .External}}
+<section class="card">
+  <h3>External (not started by web)</h3>
+  <p><small>These were mounted from a separate terminal. Not stoppable from here.</small></p>
+  <ul>
+    {{range .External}}<li><code>{{.}}</code></li>{{end}}
+  </ul>
+</section>
+{{end}}
+
+<p><a href="/mount/new" class="btn">Start a mount</a></p>
+{{end}}

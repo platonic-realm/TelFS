@@ -50,6 +50,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /encrypt", s.encryptShow)
 	s.mux.HandleFunc("GET /encrypt/init", s.encryptInitForm)
 	s.mux.HandleFunc("POST /encrypt/init", s.encryptInitSubmit)
+
+	// Mount supervisor.
+	s.mux.HandleFunc("GET /mount", s.mountList)
+	s.mux.HandleFunc("GET /mount/new", s.mountNewForm)
+	s.mux.HandleFunc("POST /mount/start", s.mountStart)
+	s.mux.HandleFunc("GET /mount/{profile}", s.mountDetail)
+	s.mux.HandleFunc("POST /mount/{profile}/stop", s.mountStop)
+	s.mux.HandleFunc("GET /mount/{profile}/log", s.mountLog)
 }
 
 // renderTemplate parses + executes a template set (always including

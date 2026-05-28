@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -26,6 +27,10 @@ type Options struct {
 	TLSKey  string
 	// Logger: defaults to log.Default.
 	Logger *log.Logger
+	// SelfPath: filesystem path to the running telfs binary. The mount
+	// supervisor re-execs it to spawn `telfs mount` children. Defaults
+	// to os.Args[0] when empty.
+	SelfPath string
 }
 
 // Server bundles the HTTP server, state, and lifecycle handles.
@@ -33,6 +38,7 @@ type Server struct {
 	opts   Options
 	state  *State
 	logins *loginRegistry
+	sup    *Supervisor
 	mux    *http.ServeMux
 	srv    *http.Server
 }
@@ -50,10 +56,19 @@ func New(opts Options) (*Server, error) {
 			return nil, err
 		}
 	}
+	selfPath := opts.SelfPath
+	if selfPath == "" {
+		selfPath = os.Args[0]
+	}
+	sup, err := NewSupervisor(selfPath)
+	if err != nil {
+		return nil, fmt.Errorf("supervisor: %w", err)
+	}
 	s := &Server{
 		opts:   opts,
 		state:  NewState(),
 		logins: newLoginRegistry(),
+		sup:    sup,
 		mux:    http.NewServeMux(),
 	}
 	s.registerRoutes()
