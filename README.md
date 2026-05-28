@@ -12,7 +12,8 @@ End-to-end verified on a real Telegram account + private channel:
 
 | Capability | Status |
 |---|---|
-| Login (MTProto, phone + code + 2FA) | ✓ |
+| Login — phone + code + 2FA (user account) | ✓ |
+| Login — bot token via `auth.ImportBotAuthorization` | ✓ |
 | Read/write mount (POSIX surface incl. hardlinks, symlinks, xattrs) | ✓ |
 | Multi-chunk files up to ~2 GiB per file | ✓ |
 | Cross-chunk-boundary reads/writes | ✓ verified by integration test |
@@ -20,7 +21,13 @@ End-to-end verified on a real Telegram account + private channel:
 | Read-only mode (`--readonly`) | ✓ |
 | FLOOD_WAIT rate-limit handling | ✓ (gotd middleware) |
 | Orphan chunk + stale snapshot GC | ✓ (`telfs gc`) |
-| Encryption at rest (AES-256-GCM, Argon2id KDF) | ✓ — chunk bytes only; metadata still plaintext |
+| Channel-side integrity check | ✓ (`telfs fsck`) |
+| One-screen profile / FS / channel status | ✓ (`telfs status`) |
+| AES-256-GCM chunk encryption, Argon2id KDF | ✓ |
+| AES-256-GCM snapshot envelope (metadata-at-rest) | ✓ |
+| Persistent LRU chunk cache across daemon restarts | ✓ |
+| Profiles + portable tar.gz export/import bundles | ✓ |
+| Web management UI (dashboard, login, mount, browser) | ✓ (`telfs web`) |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
 ## Bot vs user auth
@@ -69,10 +76,13 @@ make build                                  # → bin/telfs
 # Once any chunk lands the choice is immutable.
 ./bin/telfs init --chunk-size $((16*1024*1024))   # e.g. 16 MiB
 
-# Configure credentials (one-time). The .telfs/ directory is created
-# in the current working directory and holds the session + local DB +
-# config. Add api_id / api_hash to .telfs/config.toml, OR set them in
-# the environment:
+# Pick a profile to live under. Profiles are isolated FS instances at
+# ~/.config/telfs/profiles/<name>/ holding config + session + DB + cache.
+./bin/telfs profile create main
+./bin/telfs profile use main                # sticky default
+
+# Configure credentials (one-time). Either edit the profile's config.toml
+# directly OR set them in the environment:
 export TELFS_API_ID=12345678
 export TELFS_API_HASH=...
 
@@ -124,17 +134,18 @@ telfs mount [--readonly] [--allow-other] [--debug] <mountpoint>
 
 ## Recovery
 
-If you lose `.telfs/db.sqlite`, the next `telfs mount` automatically
-scans the channel for the most-recent snapshot and restores from it.
-At worst you lose whatever was written between the last snapshot
-cycle (cadence: every 5 minutes plus on clean unmount).
+If you lose the profile's `db.sqlite`, the next `telfs mount`
+automatically scans the channel for the most-recent snapshot and
+restores from it. At worst you lose whatever was written between the
+last snapshot cycle (cadence: every 5 minutes plus on clean unmount).
 
 ```sh
-rm -rf .telfs/db.sqlite .telfs/cache
+PROFDIR=~/.config/telfs/profiles/main
+rm -rf $PROFDIR/db.sqlite $PROFDIR/cache
 ./bin/telfs mount ./mnt
 # Local DB missing — scanning channel for snapshot…
 # Found snapshot msg=29 (ts 2026-05-28T18:03:00Z, fs_uuid=…)
-# Restored 1489 gzipped bytes → ./.telfs/db.sqlite
+# Restored 1489 gzipped bytes → db.sqlite (TFSE envelope decrypted)
 # Mounted at ./mnt. Press ^C to unmount.
 ```
 
@@ -143,12 +154,18 @@ and TelFS starts with an empty filesystem.
 
 ## Encryption
 
-TelFS supports AES-256-GCM encryption for chunk contents. **Only chunk
-bytes are encrypted; filenames, directory structure, sizes, and
-timestamps are visible to anyone with channel access** because the
-snapshot blob in the channel contains the SQLite metadata in the
-clear. Plan accordingly — if metadata privacy matters, don't use
-TelFS today.
+TelFS supports AES-256-GCM encryption for both chunk contents AND the
+metadata snapshot envelope. With encryption enabled:
+
+- Every chunk's bytes are AES-GCM ciphertext, AAD-bound to `(ino, idx)`.
+- Every snapshot posted to the channel is wrapped in a **TFSE envelope**
+  — `["TFSE"][ver][hdr_len][hdr_json][ciphertext]` — so the SQLite
+  metadata (filenames, directory tree, sizes, timestamps) lands as
+  ciphertext too, not plaintext.
+
+What an attacker with channel access still learns: the number of chunks,
+their approximate sizes (4 MiB rounded), the cadence of mutations, and
+the snapshot rhythm. Sizes can leak file lengths to within one chunk.
 
 Enable encryption on a **fresh** filesystem (it refuses if any chunk
 already exists; the migration path is `cp -r` from an old TelFS to a
@@ -177,8 +194,8 @@ of as cryptic EIOs.
 | Threat | Protected? |
 |---|---|
 | Telegram operator reading file contents | ✓ (chunks are ciphertext) |
-| Telegram operator reading file *names* and tree structure | ✗ (snapshot blob is plaintext metadata) |
-| Channel members reading file contents | ✓ |
+| Telegram operator reading file *names* and tree structure | ✓ (snapshot blob is TFSE-wrapped ciphertext) |
+| Channel members reading file contents or metadata | ✓ |
 | Someone with channel-WRITE access substituting an old ciphertext for the same `(ino, idx)` slot | ✗ (per-chunk replay; single-mounter assumption — you're the only legitimate poster) |
 | Someone splicing ciphertexts between files | ✓ (AAD binds ciphertext to `(ino, idx)`) |
 | Tampering with chunk bytes | ✓ (GCM tag fails) |
@@ -215,11 +232,14 @@ The default is dry-run; pass `--yes` to delete.
 
 ## Configuration
 
-`.telfs/config.toml` (gitignored — never commit it):
+The active profile's `config.toml` (created at `~/.config/telfs/profiles/<name>/config.toml`,
+mode 0600 — never commit it):
 
 ```toml
 api_id = 12345678
 api_hash = "..."
+auth_mode = "user"            # or "bot"
+bot_token = ""                # set when auth_mode = "bot"
 phone = "+15551234567"        # optional — prompted if missing
 dc = 1                        # optional — starting datacenter; default 2
 
@@ -233,11 +253,12 @@ Environment overrides:
 
 | Var | Effect |
 |---|---|
-| `TELFS_DIR` | data directory (default `./.telfs`) |
+| `TELFS_PROFILE` | profile to load (beats `~/.config/telfs/active`) |
 | `TELFS_API_ID` | overrides config |
 | `TELFS_API_HASH` | overrides config |
 | `TELFS_PHONE` | skip the phone prompt at login |
 | `TELFS_DC` | override starting datacenter |
+| `TELFS_PASSPHRASE` | FS encryption passphrase (skip prompt at mount) |
 
 ## Design choices
 
@@ -248,7 +269,7 @@ Environment overrides:
 | Metadata | local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence |
 | Chunk size | 4 MiB default, **per-FS configurable** | Sequential read/write throughput vs `chunk_map` row count. Set via `telfs init --chunk-size <N>` BEFORE first mount; immutable thereafter. Power of two, [64 KiB, 1.5 GiB]. |
 | POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough to host typical workloads |
-| Encryption | AES-256-GCM, Argon2id KDF, opt-in via `telfs encrypt init` | Chunk bytes only; metadata still plaintext in the channel |
+| Encryption | AES-256-GCM, Argon2id KDF, opt-in via `telfs encrypt init` | Chunk bytes AND snapshot metadata (TFSE envelope); per-chunk AAD binds to `(ino, idx)` |
 | Inline TG deletes | none for chunks; snapshots delete the prior one | M4 trade — never destroys user data inline; orphans cleaned by `telfs gc` |
 | Snapshot cadence | every 5 min + on clean unmount | Bounded recovery window without burning network bandwidth |
 
@@ -282,6 +303,64 @@ your passphrase. Treat it like an SSH private key.
   mount time on the destination; the workaround is to redo
   `telfs login` on that machine. `config.toml` and `db.sqlite`
   from the bundle still apply — just the session bits may not.
+
+## Web management UI
+
+`telfs web` boots a self-contained HTTP UI that covers the entire CLI
+surface — dashboard, profile CRUD + tar.gz export/import, multi-step
+phone login + bot-token login, channel binding, encryption
+initialization, mount supervisor with HTMX-polled live log tail, and a
+file browser that reads/writes through a chosen FUSE mountpoint.
+
+```sh
+./bin/telfs web                                  # 127.0.0.1:8080, no auth
+./bin/telfs web --listen 0.0.0.0:8080 --token $(openssl rand -hex 32)
+```
+
+Defaults: loopback bind, no auth — the security perimeter is "can
+reach loopback on this host." Non-loopback bind **requires** `--token`;
+the server refuses to start otherwise. Token comparison uses
+`crypto/subtle.ConstantTimeCompare`. Every POST form carries a
+per-session CSRF token (random, in cookie + hidden field).
+
+For HTTPS, terminate TLS in a reverse proxy in front of localhost.
+The `--tls-cert` / `--tls-key` flags exist for in-process termination
+but aren't the recommended path.
+
+## Deployment
+
+### Static binary (recommended for desktop / laptop)
+
+```sh
+make release                                     # → dist/telfs-vX.Y.Z-linux-amd64.tar.gz
+```
+
+The release target uses `CGO_ENABLED=0 -trimpath -ldflags '-s -w'` so
+the resulting binary is fully static — copies straight to any Linux
+host without runtime dependencies (except the kernel FUSE module and
+`fusermount` in `$PATH` for unmount).
+
+### Alpine container (recommended for headless / NAS / server)
+
+```sh
+docker build -t telfs:latest .
+docker run --rm -it \
+  --cap-add SYS_ADMIN --device /dev/fuse \
+  -v ~/.config/telfs:/profiles \
+  --mount type=bind,source=/srv/external,target=/mnt/telfs,bind-propagation=rshared \
+  telfs:latest mount /mnt/telfs
+```
+
+The container ships only the static `telfs` binary plus `fuse3` and
+`ca-certificates` (~18 MB compressed). FUSE inside a container needs
+`--cap-add SYS_ADMIN --device /dev/fuse` and the host mountpoint must
+be bind-mounted with `rshared` propagation so the FUSE mount is
+visible to host processes.
+
+Why both deployment paths? Static binary wins on a desktop where the
+mount and the UI live alongside other native tools. Container wins on
+headless servers / NAS appliances where the FUSE module is shared but
+the userland is locked or distro-mismatched.
 
 ## Running unattended
 
@@ -333,10 +412,10 @@ with data.
   (kill -9, kernel panic, machine off), data written since the last
   cadence snapshot is lost. M5 deferred meta-op posting; revisit if
   this bites in real use.
-- **Encryption protects chunk bytes only.** Filenames, sizes, and
-  directory structure are visible to anyone with channel access
-  (the snapshot blob carries the SQLite metadata in the clear). A
-  future milestone could wrap the snapshot too.
+- **Encryption metadata leakage is bounded but not zero.** Snapshots
+  are TFSE-wrapped ciphertext; the channel still exposes the count
+  and size of chunk messages and the cadence of snapshots. File size
+  to ~4 MiB resolution can be inferred from the chunk count.
 - **One channel = one TelFS.** `fs_uuid` is stored in `meta_kv` and
   baked into every snapshot caption; recovery filters by it, so
   reusing a channel for a fresh TelFS instance will leave old
