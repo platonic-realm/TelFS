@@ -25,7 +25,7 @@
 #     telfs:latest web --listen 0.0.0.0:8080 --token $YOUR_TOKEN
 
 # ── builder ──────────────────────────────────────────────────────────
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 ARG VERSION=dev
 ARG COMMIT=none

@@ -428,20 +428,157 @@ host without runtime dependencies (except the kernel FUSE module and
 
 ### Alpine container (recommended for headless / NAS / server)
 
+The container ships only the static `telfs` binary plus `fuse3`,
+`ca-certificates`, and `tini` (~20 MB compressed). It runs every
+TelFS subcommand — `mount`, `web`, `login`, `status`, `gc`, `fsck`,
+`trash`, etc. — just like the static binary.
+
+#### Pull or build
+
 ```sh
-docker build -t telfs:latest .
-docker run --rm -it \
-  --cap-add SYS_ADMIN --device /dev/fuse \
-  -v ~/.config/telfs:/profiles \
-  --mount type=bind,source=/srv/external,target=/mnt/telfs,bind-propagation=rshared \
-  telfs:latest mount /mnt/telfs
+# Published image, multi-arch (amd64 + arm64):
+docker pull ghcr.io/platonic-realm/telfs:latest
+# Or pin a specific release:
+docker pull ghcr.io/platonic-realm/telfs:v0.5
+
+# Build locally:
+make docker                                       # → telfs:<git-describe>
 ```
 
-The container ships only the static `telfs` binary plus `fuse3` and
-`ca-certificates` (~18 MB compressed). FUSE inside a container needs
-`--cap-add SYS_ADMIN --device /dev/fuse` and the host mountpoint must
-be bind-mounted with `rshared` propagation so the FUSE mount is
-visible to host processes.
+#### Required runtime flags (FUSE)
+
+Three things are non-negotiable for FUSE inside a container:
+
+| Flag | Why |
+|---|---|
+| `--cap-add SYS_ADMIN` | FUSE mounts need this capability. |
+| `--device /dev/fuse` | The kernel character device must be passed through. |
+| `--security-opt apparmor:unconfined` | On distros with strict AppArmor profiles (Ubuntu, Debian), the default profile blocks FUSE. Drop it for the TelFS container. |
+
+#### Required bind mounts
+
+| Container path | Host path | Purpose |
+|---|---|---|
+| `/root/.config/telfs` | `~/.config/telfs` | Profiles directory: session, db.sqlite, cache, config.toml. Read-write. |
+| `/mnt/telfs` | wherever you want the FS to appear | Mountpoint. **Must use `bind-propagation=rshared`** so the FUSE mount inside the container is visible to host processes. |
+
+#### First-time setup (inside the container)
+
+```sh
+# Spawn an interactive shell to walk through profile/login/channel.
+# The same bind mounts as above — anything we write to /root/.config
+# lands on the host's ~/.config/telfs.
+docker run --rm -it \
+  --cap-add SYS_ADMIN --device /dev/fuse \
+  --security-opt apparmor:unconfined \
+  -v $HOME/.config/telfs:/root/.config/telfs \
+  --entrypoint sh \
+  ghcr.io/platonic-realm/telfs:latest
+
+# Inside the container:
+telfs profile create main
+telfs profile use main
+telfs login                                       # interactive phone+code+2FA
+telfs channel set <id>
+telfs encrypt init                                # optional
+telfs trash enable --ttl 7d                       # optional
+exit
+```
+
+After that, the profile exists on the host; subsequent `mount` / `web`
+runs reuse it.
+
+#### Mount
+
+```sh
+mkdir -p /srv/external
+docker run -d --name telfs-main \
+  --restart unless-stopped \
+  --cap-add SYS_ADMIN --device /dev/fuse \
+  --security-opt apparmor:unconfined \
+  -v $HOME/.config/telfs:/root/.config/telfs \
+  --mount type=bind,source=/srv/external,target=/mnt/telfs,bind-propagation=rshared \
+  -e TELFS_PROFILE=main \
+  -e TELFS_PASSPHRASE=secret \
+  ghcr.io/platonic-realm/telfs:latest mount /mnt/telfs
+```
+
+- `/srv/external` on the host is where files appear (your `ls /srv/external` from the host shows the channel contents).
+- `-e TELFS_PASSPHRASE` is only needed for encrypted FSes. Omit otherwise.
+- `tini` is the container PID 1; SIGTERM (`docker stop telfs-main`)
+  triggers the in-mount watchdog and a clean final snapshot.
+
+#### Web management UI
+
+```sh
+docker run -d --name telfs-web \
+  -p 127.0.0.1:8080:8080 \
+  -v $HOME/.config/telfs:/root/.config/telfs \
+  ghcr.io/platonic-realm/telfs:latest \
+  web --listen 0.0.0.0:8080
+```
+
+Or, with token auth for non-loopback exposure:
+
+```sh
+docker run -d --name telfs-web \
+  -p 8080:8080 \
+  -v $HOME/.config/telfs:/root/.config/telfs \
+  ghcr.io/platonic-realm/telfs:latest \
+  web --listen 0.0.0.0:8080 --token $(openssl rand -hex 32)
+```
+
+The web container does **not** need the FUSE capability/device — those
+are only required if it itself runs a `mount` subcommand. To control
+mounts from the web UI inside a container, give the same FUSE flags as
+above; otherwise use the web container for setup/inspection and run
+`mount` in a sibling container.
+
+#### Docker Compose
+
+```yaml
+services:
+  telfs-mount:
+    image: ghcr.io/platonic-realm/telfs:latest
+    command: ["mount", "/mnt/telfs"]
+    restart: unless-stopped
+    cap_add: [SYS_ADMIN]
+    devices: ["/dev/fuse"]
+    security_opt: ["apparmor:unconfined"]
+    environment:
+      TELFS_PROFILE: main
+      TELFS_PASSPHRASE: secret
+    volumes:
+      - ${HOME}/.config/telfs:/root/.config/telfs
+      - type: bind
+        source: /srv/external
+        target: /mnt/telfs
+        bind:
+          propagation: rshared
+
+  telfs-web:
+    image: ghcr.io/platonic-realm/telfs:latest
+    command: ["web", "--listen", "0.0.0.0:8080"]
+    restart: unless-stopped
+    ports: ["127.0.0.1:8080:8080"]
+    volumes:
+      - ${HOME}/.config/telfs:/root/.config/telfs
+```
+
+#### Troubleshooting
+
+- **`fuse: device not found, try 'modprobe fuse'`** — the kernel FUSE
+  module isn't loaded on the host. `sudo modprobe fuse`. Persist via
+  `/etc/modules-load.d/`.
+- **`fusermount: mount failed: Operation not permitted`** — missing
+  `--cap-add SYS_ADMIN` or AppArmor is blocking. Add `--security-opt
+  apparmor:unconfined`.
+- **The mount works inside the container but `ls /srv/external` on
+  the host shows nothing** — your bind mount didn't use `rshared`.
+  Re-run with the propagation flag.
+- **`failed to drop capability cap_sys_admin`** — Docker daemon
+  configured with `--no-new-privileges` globally. Lift it for this
+  container.
 
 Why both deployment paths? Static binary wins on a desktop where the
 mount and the UI live alongside other native tools. Container wins on
