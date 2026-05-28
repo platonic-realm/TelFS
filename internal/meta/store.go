@@ -137,12 +137,14 @@ func (s *Store) initSchema(ctx context.Context) error {
 		}
 	}
 	// Seed root inode if missing. Using explicit ino=1 ensures auto-increment
-	// will hand out 2,3,... thereafter.
+	// will hand out 2,3,... thereafter. Owner is the mounting user; a 0:0
+	// root + mode 0755 would deny writes to anyone but root, which is the
+	// wrong default for a personal FS. The user can chown later if needed.
 	const rootMode = 0o40755 // dir | rwxr-xr-x
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO inodes(ino, kind, mode, nlink, mtime, ctime)
-		   VALUES (?, 'dir', ?, 1, strftime('%s','now'), strftime('%s','now'))`,
-		RootIno, rootMode,
+		`INSERT OR IGNORE INTO inodes(ino, kind, mode, uid, gid, nlink, mtime, ctime)
+		   VALUES (?, 'dir', ?, ?, ?, 1, strftime('%s','now'), strftime('%s','now'))`,
+		RootIno, rootMode, uint32(os.Getuid()), uint32(os.Getgid()),
 	); err != nil {
 		return err
 	}
