@@ -74,7 +74,7 @@ func cmdProfileList() error {
 		fmt.Println(mark + n)
 	}
 	if active == "" {
-		fmt.Println("\nNo active profile selected (using legacy ./.telfs/ or $TELFS_DIR).")
+		fmt.Println("\nNo active profile selected. Run `telfs profile use <name>` or set TELFS_PROFILE.")
 	}
 	return nil
 }

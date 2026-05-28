@@ -38,49 +38,32 @@ func TestValidateProfileNameAcceptsReasonable(t *testing.T) {
 //
 //	1. $TELFS_PROFILE → profile dir
 //	2. ~/.config/telfs/active file → profile dir
-//	3. $TELFS_DIR → that exact path
-//	4. ./.telfs → legacy fallback
+//	none of the above → ErrNoActiveProfile
 func TestDefaultDirResolutionOrder(t *testing.T) {
 	// Isolate from the real user's environment.
 	xdg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
-	cwd := t.TempDir()
-	if err := os.Chdir(cwd); err != nil {
-		t.Fatal(err)
-	}
 
-	// 4. Default fallback: $TELFS_DIR unset, no profile, no active file.
+	// No env, no active file → ErrNoActiveProfile.
 	t.Setenv("TELFS_PROFILE", "")
-	t.Setenv("TELFS_DIR", "")
-	got, err := DefaultDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasSuffix(got, "/.telfs") {
-		t.Errorf("fallback: got %q, want suffix /.telfs", got)
+	if _, err := DefaultDir(); err == nil {
+		t.Fatalf("expected ErrNoActiveProfile when nothing is set, got nil")
 	}
 
-	// 3. TELFS_DIR override.
-	t.Setenv("TELFS_DIR", "/tmp/explicit")
-	got, _ = DefaultDir()
-	if got != "/tmp/explicit" {
-		t.Errorf("TELFS_DIR: got %q, want /tmp/explicit", got)
-	}
-
-	// 2. active file beats TELFS_DIR.
+	// active file resolves.
 	if err := os.MkdirAll(filepath.Join(xdg, "telfs"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(xdg, "telfs", "active"), []byte("work\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = DefaultDir()
+	got, _ := DefaultDir()
 	wantSuffix := "/telfs/profiles/work"
 	if !strings.HasSuffix(got, wantSuffix) {
 		t.Errorf("active file: got %q, want suffix %s", got, wantSuffix)
 	}
 
-	// 1. TELFS_PROFILE beats active file.
+	// TELFS_PROFILE beats active file.
 	t.Setenv("TELFS_PROFILE", "explicit-env")
 	got, _ = DefaultDir()
 	wantSuffix = "/telfs/profiles/explicit-env"

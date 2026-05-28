@@ -354,24 +354,7 @@ func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
 // the global resolution order so we can show OTHER profiles than the
 // active one).
 func readProfileConfig(dir string) (*config.Config, bool) {
-	// config.Load resolves via the env/active-file precedence; to read
-	// a specific profile, point TELFS_DIR at it for the duration of
-	// the load. Save/restore the env to avoid leaking to siblings.
-	saved, set := os.LookupEnv(config.EnvDir)
-	prevProf := os.Getenv(config.EnvProfile)
-	os.Setenv(config.EnvDir, dir)
-	os.Unsetenv(config.EnvProfile)
-	defer func() {
-		if set {
-			os.Setenv(config.EnvDir, saved)
-		} else {
-			os.Unsetenv(config.EnvDir)
-		}
-		if prevProf != "" {
-			os.Setenv(config.EnvProfile, prevProf)
-		}
-	}()
-	cfg, err := config.Load()
+	cfg, err := config.LoadFromDir(dir)
 	if err != nil {
 		return nil, false
 	}

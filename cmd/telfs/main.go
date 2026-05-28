@@ -69,7 +69,6 @@ Usage:
 
 Environment:
   TELFS_PROFILE    Active profile name (overrides ~/.config/telfs/active)
-  TELFS_DIR        Data directory (legacy; ignored when TELFS_PROFILE is set)
   TELFS_API_ID     Telegram API ID (https://my.telegram.org/apps)
   TELFS_API_HASH   Telegram API hash
   TELFS_PHONE      Phone number for login (prompted if unset)
