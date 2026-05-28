@@ -258,8 +258,11 @@ func cmdMount(ctx context.Context, mountpoint string) error {
 		reader := chunk.NewReader(metaStore, cache, chunk.ChunkSize)
 
 		server, err := telfsfs.Mount(telfsfs.MountOptions{MountPoint: mountpoint}, &telfsfs.Backend{
-			Meta:   metaStore,
-			Reader: reader,
+			Meta:      metaStore,
+			Reader:    reader,
+			Cache:     cache,
+			Uploader:  sess,
+			ChunkSize: chunk.ChunkSize,
 		})
 		if err != nil {
 			return err
