@@ -47,6 +47,8 @@ Usage:
   telfs mount [flags] <mountpoint>  Mount the filesystem.
                                       Flags: --readonly --allow-other --debug
   telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
+  telfs encrypt init                Enable AES-256-GCM for this filesystem.
+  telfs encrypt status              Show whether encryption is enabled.
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
 
 Environment:
@@ -83,6 +85,8 @@ func run() error {
 		return cmdChannel(ctx, os.Args[2:])
 	case "mount":
 		return cmdMount(ctx, os.Args[2:])
+	case "encrypt":
+		return cmdEncrypt(ctx, os.Args[2:])
 	case "gc":
 		return cmdGC(ctx, os.Args[2:])
 	case "debug":
@@ -238,6 +242,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	readonly := fs.Bool("readonly", false, "mount read-only (rejects all write ops with EROFS)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access the mount (FUSE -o allow_other; requires user_allow_other in /etc/fuse.conf)")
 	debug := fs.Bool("debug", false, "log every FUSE op")
+	noRecover := fs.Bool("no-recover", false, "skip cold-mount recovery from channel snapshot (starts with an empty DB if local DB is missing)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] <mountpoint>")
 		fs.PrintDefaults()
@@ -264,7 +269,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// If there's no snapshot in the channel either, we'll proceed with
 	// a fresh empty DB (first-ever mount).
 	if _, err := os.Stat(cfg.DBPath()); errors.Is(err, os.ErrNotExist) {
-		if err := tryRecover(signalCtx, cfg); err != nil {
+		if *noRecover {
+			fmt.Println("--no-recover: skipping channel snapshot recovery; starting with an empty DB.")
+		} else if err := tryRecover(signalCtx, cfg); err != nil {
 			return fmt.Errorf("recovery: %w", err)
 		}
 	}
@@ -285,9 +292,18 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// Background-derived context and let our callback drive shutdown
 	// in the correct order (final snapshot → unmount FUSE → return →
 	// gotd shuts down).
+	// Resolve the cipher up front: plaintext (NoopCipher) unless this
+	// FS was set up with `telfs encrypt init` (crypto_mode set in
+	// meta_kv). For the encrypted case we prompt for the passphrase
+	// here and refuse to mount if the canary doesn't decrypt.
+	cipher, err := loadCipher(signalCtx, metaStore)
+	if err != nil {
+		return err
+	}
+
 	err = client.RunSession(context.Background(), func(sessCtx context.Context, sess *tg.Session) error {
 		fetcher := &chunk.TGFetcher{Session: sess}
-		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher)
+		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher, cipher)
 		if err != nil {
 			return err
 		}
@@ -302,6 +318,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			Reader:    reader,
 			Cache:     cache,
 			Uploader:  sess,
+			Cipher:    cipher,
 			ChunkSize: chunk.ChunkSize,
 			ReadOnly:  *readonly,
 		})
@@ -494,7 +511,7 @@ func cmdGC(ctx context.Context, args []string) error {
 
 func cmdDebug(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("debug: missing subcommand (seed-file)")
+		return errors.New("debug: missing subcommand (seed-file, dump-msg)")
 	}
 	switch args[0] {
 	case "seed-file":
@@ -506,9 +523,40 @@ func cmdDebug(ctx context.Context, args []string) error {
 			return fmt.Errorf("debug seed-file: invalid length %q", args[2])
 		}
 		return cmdDebugSeedFile(ctx, args[1], n)
+	case "dump-msg":
+		if len(args) < 2 {
+			return errors.New("debug dump-msg: usage: dump-msg <message-id>")
+		}
+		msgID, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("debug dump-msg: invalid id %q", args[1])
+		}
+		return cmdDebugDumpMsg(ctx, msgID)
 	default:
 		return fmt.Errorf("debug: unknown subcommand %q", args[0])
 	}
+}
+
+// cmdDebugDumpMsg downloads the document attached to a channel
+// message and writes its raw bytes to stdout. Used in the M7 smoke
+// test to assert that a chunk's on-the-wire bytes don't equal the
+// plaintext source.
+func cmdDebugDumpMsg(ctx context.Context, msgID int) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if err := cfg.RequireChannel(); err != nil {
+		return err
+	}
+	client, err := tg.New(cfg)
+	if err != nil {
+		return err
+	}
+	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
+		_, err := sess.DownloadDocument(ctx, msgID, os.Stdout)
+		return err
+	})
 }
 
 // cmdDebugSeedFile generates a deterministic-pattern file of n bytes,

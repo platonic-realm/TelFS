@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"telfs/internal/crypto"
 )
 
 // ChunkSize is TelFS's fixed chunk size in bytes (4 MiB). Every file is
@@ -50,6 +52,7 @@ type Cache struct {
 	dir      string
 	capBytes int64
 	fetcher  Fetcher
+	cipher   crypto.Cipher // never nil; defaults to NoopCipher
 
 	mu        sync.Mutex
 	entries   map[Key]*entry
@@ -62,11 +65,19 @@ type Cache struct {
 // any existing files on disk are NOT indexed in v1 (they'll be silently
 // overwritten on re-fetch, or evicted naturally as new chunks are added).
 //
+// cipher may be nil — in that case we wire NoopCipher and the cache
+// stores raw bytes. When non-nil, the Cache assumes the upstream
+// Fetcher returns CIPHERTEXT and the cache stores PLAINTEXT (so reads
+// don't pay decrypt cost on cache hits).
+//
 // TODO(M6): scan dir on startup and seed the LRU from existing files so
 // chunk caches survive daemon restarts.
-func NewCache(dir string, capBytes int64, fetcher Fetcher) (*Cache, error) {
+func NewCache(dir string, capBytes int64, fetcher Fetcher, cipher crypto.Cipher) (*Cache, error) {
 	if capBytes <= 0 {
 		capBytes = DefaultCacheCapBytes
+	}
+	if cipher == nil {
+		cipher = crypto.NoopCipher{}
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("chunk: mkdir cache %s: %w", dir, err)
@@ -75,6 +86,7 @@ func NewCache(dir string, capBytes int64, fetcher Fetcher) (*Cache, error) {
 		dir:      dir,
 		capBytes: capBytes,
 		fetcher:  fetcher,
+		cipher:   cipher,
 		entries:  make(map[Key]*entry),
 		order:    list.New(),
 	}, nil
@@ -100,10 +112,17 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64) ([]byte, er
 	}
 	c.mu.Unlock()
 
-	// Miss path: fetch outside the lock.
-	data, err := c.fetcher.Fetch(ctx, key, tgMessageID)
+	// Miss path: fetch outside the lock. Fetcher returns the bytes
+	// stored in TG (ciphertext if encryption is enabled, plaintext
+	// otherwise). We decrypt before storing so cache hits skip the
+	// decrypt cost.
+	ciphertext, err := c.fetcher.Fetch(ctx, key, tgMessageID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
+	}
+	data, err := c.cipher.Open(key.Ino, key.Idx, ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt chunk %d/%d: %w", key.Ino, key.Idx, err)
 	}
 	// Persist to disk, then insert into the LRU.
 	path := filepath.Join(c.dir, key.fileName())

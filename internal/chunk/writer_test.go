@@ -88,7 +88,7 @@ func setupWriter(t *testing.T, chunkSize int64) (*Writer, *meta.Store, *fakeUplo
 	}
 	up := newFakeUploader()
 	cache := newTestCache(t, writerFetcher{uploader: up})
-	w, err := NewWriter(ctx, m, cache, up, ino, chunkSize, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, ino, chunkSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

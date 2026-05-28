@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 
+	"telfs/internal/crypto"
 	"telfs/internal/meta"
 )
 
@@ -44,6 +45,7 @@ type Writer struct {
 	meta     *meta.Store
 	cache    *Cache
 	uploader Uploader
+	cipher   crypto.Cipher // never nil; defaults to NoopCipher
 	chunkSz  int64
 	dirtyCap int64
 	ino      int64
@@ -61,13 +63,17 @@ type dirtyChunk struct {
 }
 
 // NewWriter constructs a Writer for an open file handle. chunkSize and
-// dirtyCap may be zero, in which case the package defaults apply.
-func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, ino int64, chunkSize, dirtyCap int64) (*Writer, error) {
+// dirtyCap may be zero, in which case the package defaults apply. If
+// cipher is nil, NoopCipher is used (plaintext on the wire).
+func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher crypto.Cipher, ino int64, chunkSize, dirtyCap int64) (*Writer, error) {
 	if chunkSize <= 0 {
 		chunkSize = ChunkSize
 	}
 	if dirtyCap <= 0 {
 		dirtyCap = DefaultDirtyCapBytes
+	}
+	if cipher == nil {
+		cipher = crypto.NoopCipher{}
 	}
 	in, err := m.GetInode(ctx, ino)
 	if err != nil {
@@ -77,6 +83,7 @@ func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, ino int
 		meta:     m,
 		cache:    c,
 		uploader: u,
+		cipher:   cipher,
 		chunkSz:  chunkSize,
 		dirtyCap: dirtyCap,
 		ino:      ino,
@@ -342,8 +349,13 @@ func (w *Writer) flushChunkLocked(ctx context.Context, idx int32) error {
 	if !ok {
 		return nil
 	}
+	// Encrypt before upload. With NoopCipher the bytes pass through.
+	wire, err := w.cipher.Seal(w.ino, idx, dc.data)
+	if err != nil {
+		return fmt.Errorf("encrypt chunk %d: %w", idx, err)
+	}
 	name := fmt.Sprintf("ino%d-idx%d", w.ino, idx)
-	msgID, err := w.uploader.UploadDocument(ctx, bytes.NewReader(dc.data), name, "")
+	msgID, err := w.uploader.UploadDocument(ctx, bytes.NewReader(wire), name, "")
 	if err != nil {
 		return fmt.Errorf("upload chunk %d: %w", idx, err)
 	}

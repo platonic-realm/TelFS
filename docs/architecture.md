@@ -58,7 +58,7 @@ journal unused.
 | `internal/chunk` | Fixed 4 MiB chunker. `Cache` is the disk-backed LRU read path. `Reader` stitches chunks for arbitrary `ReadAt`. `Writer` buffers dirty chunks per-handle and flushes on close. |
 | `internal/tg` | gotd wrapper. `Client.RunSession` holds one MTProto connection for the daemon's lifetime. `Session` exposes channel ops, document upload/download, snapshot helpers, history walk. Uses `gotd/contrib/middleware/floodwait` so FLOOD_WAIT_N retries are transparent. |
 | `internal/snapshot` | `Take` runs SQLite `VACUUM INTO` to produce a read-consistent copy, then gzips. `Restore` is the inverse. `Manager.Run` is the cadence goroutine (5-min ticker). |
-| `internal/crypto` | `Cipher` interface; `NoopCipher` is the v1 implementation. M7 will plug in AES-256-GCM here without rewriting the chunk pipeline. |
+| `internal/crypto` | `Cipher` interface, `NoopCipher` (plaintext), `AESGCM` (AES-256-GCM with per-chunk random nonce + AAD binding to `(ino, idx)`). `DeriveKey` runs Argon2id over the user passphrase. Canary primitive (`SealCanary`/`VerifyCanary`) detects wrong-passphrase mounts before any user IO flows. |
 | `internal/config` | TOML config + env overrides; data-dir resolution. |
 
 ## Storage model (SQLite)
@@ -231,11 +231,36 @@ teardown and failed with "engine closed".
 - `chunk.Writer` is per-handle, lock-guarded. Two handles writing
   the same file race at flush time (last-flush-wins).
 
-## What's deliberately not in v1
+## Encryption
 
-- **Encryption.** Interface is in place (`internal/crypto.Cipher`);
-  M7 will plug in AES-256-GCM. Today's bytes go to Telegram in the
-  clear.
+Opt-in via `telfs encrypt init`. Once enabled (the choice is
+one-way; refuses to flip on a non-empty filesystem), every chunk
+upload is `cipher.Seal(ino, idx, plaintext)` and every Cache miss
+calls `cipher.Open(ino, idx, ciphertext)` before storing in the
+disk LRU. The Reader/Writer code stays unchanged structurally;
+only their construction takes a Cipher.
+
+State stored in `meta_kv`:
+
+| Key | Contents |
+|---|---|
+| `crypto_mode` | `"aes-gcm-v1"` |
+| `crypto_salt` | 16 random bytes |
+| `crypto_argon_params` | JSON `{time, memory_kib, threads}` |
+| `crypto_canary` | AES-GCM ciphertext of `"telfs-canary-v1"` under the FS key |
+
+Mount reads `crypto_mode`; if set, prompts for the passphrase (or
+reads `TELFS_PASSPHRASE`), derives the key via Argon2id with the
+stored salt/params, and **verifies the canary before any user IO
+runs**. A wrong passphrase surfaces a clear "wrong passphrase"
+error instead of a stream of EIOs.
+
+Snapshot blobs are NOT encrypted in M7 — filenames, sizes, and
+directory structure are visible in the channel. Documented as a
+known limit; a future milestone could wrap the gzipped DB in
+AES-GCM with the same key.
+
+## What's deliberately not in v1
 - **Inline TG deletes.** Chunk overwrites and unlinks do NOT delete
   the backing channel messages; old chunks become orphans, reclaimed
   by `telfs gc`. This trade keeps every "delete" code path local

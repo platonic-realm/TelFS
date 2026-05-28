@@ -10,6 +10,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"telfs/internal/chunk"
+	"telfs/internal/crypto"
 	"telfs/internal/meta"
 )
 
@@ -23,6 +24,7 @@ type Backend struct {
 	Reader    *chunk.Reader
 	Cache     *chunk.Cache
 	Uploader  chunk.Uploader
+	Cipher    crypto.Cipher // nil → NoopCipher (plaintext mode)
 	ChunkSize int64
 	ReadOnly  bool
 }
@@ -144,7 +146,7 @@ func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
 	if !n.backend.canWrite() {
 		return syscall.EROFS
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -196,7 +198,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 		}
 		return nil, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
@@ -254,7 +256,7 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 		return nil, nil, 0, syscall.EIO
 	}
 	childInode := n.newChildInode(ctx, child)
-	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, ino, n.backend.chunkSize(), 0)
+	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, ino, n.backend.chunkSize(), 0)
 	if werr != nil {
 		return nil, nil, 0, syscall.EIO
 	}

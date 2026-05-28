@@ -20,7 +20,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Read-only mode (`--readonly`) | ✓ |
 | FLOOD_WAIT rate-limit handling | ✓ (gotd middleware) |
 | Orphan chunk + stale snapshot GC | ✓ (`telfs gc`) |
-| Encryption at rest | ✗ deferred to M7 |
+| Encryption at rest (AES-256-GCM, Argon2id KDF) | ✓ — chunk bytes only; metadata still plaintext |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
 ## Quick start
@@ -105,6 +105,61 @@ rm -rf .telfs/db.sqlite .telfs/cache
 If the channel has no snapshot (first-ever use), recovery is a no-op
 and TelFS starts with an empty filesystem.
 
+## Encryption
+
+TelFS supports AES-256-GCM encryption for chunk contents. **Only chunk
+bytes are encrypted; filenames, directory structure, sizes, and
+timestamps are visible to anyone with channel access** because the
+snapshot blob in the channel contains the SQLite metadata in the
+clear. Plan accordingly — if metadata privacy matters, don't use
+TelFS today.
+
+Enable encryption on a **fresh** filesystem (it refuses if any chunk
+already exists; the migration path is `cp -r` from an old TelFS to a
+new encrypted one):
+
+```sh
+./bin/telfs encrypt init                    # interactive passphrase
+# or for unattended setup:
+TELFS_PASSPHRASE='your secret' ./bin/telfs encrypt init
+./bin/telfs encrypt status
+```
+
+Once enabled, every mount requires the passphrase. Set
+`TELFS_PASSPHRASE` to skip the prompt:
+
+```sh
+TELFS_PASSPHRASE='your secret' ./bin/telfs mount ./mnt
+```
+
+Wrong passphrase fails fast — a canary in `meta_kv` is decrypted
+before any user data flows, so a typo surfaces immediately instead
+of as cryptic EIOs.
+
+### What encryption protects against
+
+| Threat | Protected? |
+|---|---|
+| Telegram operator reading file contents | ✓ (chunks are ciphertext) |
+| Telegram operator reading file *names* and tree structure | ✗ (snapshot blob is plaintext metadata) |
+| Channel members reading file contents | ✓ |
+| Someone with channel-WRITE access substituting an old ciphertext for the same `(ino, idx)` slot | ✗ (per-chunk replay; single-mounter assumption — you're the only legitimate poster) |
+| Someone splicing ciphertexts between files | ✓ (AAD binds ciphertext to `(ino, idx)`) |
+| Tampering with chunk bytes | ✓ (GCM tag fails) |
+| Local-disk theft on a machine where you mount unattended via `TELFS_PASSPHRASE` env | partial (passphrase is in the shell env; key never persists to disk) |
+
+### Crypto parameters
+
+- Cipher: AES-256-GCM, 12-byte random nonce per chunk, 16-byte tag
+- AAD: `(ino, idx)` packed big-endian (12 bytes)
+- KDF: Argon2id (time=3, memory=64 MiB, threads=4)
+- Salt: 16 random bytes per filesystem, stored in `meta_kv`
+- Canary: encrypted `"telfs-canary-v1"` in `meta_kv`, verified at mount
+
+The KDF parameters are stored in `meta_kv['crypto_argon_params']`,
+so a future TelFS with stronger defaults can still mount older
+filesystems.
+
 ## Maintenance
 
 ```sh
@@ -157,7 +212,7 @@ Environment overrides:
 | Metadata | local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence |
 | Chunk size | 4 MiB | Sequential read/write throughput vs `chunk_map` row count |
 | POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough to host typical workloads |
-| Encryption | deferred to M7 | Pipeline hook in place (`internal/crypto.Cipher` is a no-op identity) |
+| Encryption | AES-256-GCM, Argon2id KDF, opt-in via `telfs encrypt init` | Chunk bytes only; metadata still plaintext in the channel |
 | Inline TG deletes | none for chunks; snapshots delete the prior one | M4 trade — never destroys user data inline; orphans cleaned by `telfs gc` |
 | Snapshot cadence | every 5 min + on clean unmount | Bounded recovery window without burning network bandwidth |
 
@@ -170,8 +225,10 @@ Environment overrides:
   (kill -9, kernel panic, machine off), data written since the last
   cadence snapshot is lost. M5 deferred meta-op posting; revisit if
   this bites in real use.
-- **No encryption yet.** Anyone with access to the channel (or
-  Telegram itself) sees your chunk bytes. M7.
+- **Encryption protects chunk bytes only.** Filenames, sizes, and
+  directory structure are visible to anyone with channel access
+  (the snapshot blob carries the SQLite metadata in the clear). A
+  future milestone could wrap the snapshot too.
 - **One channel = one TelFS.** `fs_uuid` is stored in `meta_kv` and
   baked into every snapshot caption; recovery filters by it, so
   reusing a channel for a fresh TelFS instance will leave old

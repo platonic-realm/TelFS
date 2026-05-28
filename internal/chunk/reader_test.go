@@ -67,7 +67,7 @@ func newTestMeta(t *testing.T) *meta.Store {
 
 func newTestCache(t *testing.T, fetcher Fetcher) *Cache {
 	t.Helper()
-	c, err := NewCache(filepath.Join(t.TempDir(), "cache"), 100<<10, fetcher)
+	c, err := NewCache(filepath.Join(t.TempDir(), "cache"), 100<<10, fetcher, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
