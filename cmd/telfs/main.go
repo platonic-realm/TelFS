@@ -31,6 +31,7 @@ import (
 	"telfs/internal/config"
 	telfsfs "telfs/internal/fs"
 	"telfs/internal/meta"
+	"telfs/internal/snapshot"
 	"telfs/internal/tg"
 )
 
@@ -230,7 +231,7 @@ func cmdChannelPing(ctx context.Context, cfg *config.Config) error {
 //
 // If we get this order wrong, an in-flight Read could call into a
 // torn-down session and panic.
-func cmdMount(ctx context.Context, mountpoint string) error {
+func cmdMount(signalCtx context.Context, mountpoint string) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -238,6 +239,17 @@ func cmdMount(ctx context.Context, mountpoint string) error {
 	if err := cfg.RequireChannel(); err != nil {
 		return err
 	}
+
+	// Cold-mount recovery: if the local DB is missing, try to pull the
+	// latest snapshot from the backing channel before opening meta.
+	// If there's no snapshot in the channel either, we'll proceed with
+	// a fresh empty DB (first-ever mount).
+	if _, err := os.Stat(cfg.DBPath()); errors.Is(err, os.ErrNotExist) {
+		if err := tryRecover(signalCtx, cfg); err != nil {
+			return fmt.Errorf("recovery: %w", err)
+		}
+	}
+
 	metaStore, err := meta.Open(cfg.DBPath())
 	if err != nil {
 		return err
@@ -249,7 +261,12 @@ func cmdMount(ctx context.Context, mountpoint string) error {
 		return err
 	}
 
-	err = client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
+	// The gotd session must stay alive past signalCtx cancellation so
+	// the final snapshot can post. We give RunSession its own
+	// Background-derived context and let our callback drive shutdown
+	// in the correct order (final snapshot → unmount FUSE → return →
+	// gotd shuts down).
+	err = client.RunSession(context.Background(), func(sessCtx context.Context, sess *tg.Session) error {
 		fetcher := &chunk.TGFetcher{Session: sess}
 		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher)
 		if err != nil {
@@ -268,8 +285,33 @@ func cmdMount(ctx context.Context, mountpoint string) error {
 			return err
 		}
 
+		// Snapshot cadence: takes one snapshot immediately (so a
+		// freshly-recovered DB is re-baselined) then every interval.
+		// We pass sessCtx — the goroutine exits when the gotd session
+		// tears down. The user-stop signal stops it via snapCtx below.
+		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess}
+		snapCtx, stopSnap := context.WithCancel(sessCtx)
+		snapDone := make(chan struct{})
+		go func() {
+			_ = snapMgr.Run(snapCtx)
+			close(snapDone)
+		}()
+
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
-		<-ctx.Done()
+		<-signalCtx.Done()
+
+		// User asked to stop. Run the final snapshot synchronously
+		// BEFORE we ask gotd to shut down — uploads after callback
+		// return fail with "engine closed".
+		stopSnap()
+		<-snapDone
+		fmt.Println("Taking final snapshot…")
+		finalCtx, finalCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if err := snapMgr.Once(finalCtx); err != nil {
+			fmt.Fprintln(os.Stderr, "[snapshot] final failed:", err)
+		}
+		finalCancel()
+
 		fmt.Println("Unmounting…")
 		if uerr := server.Unmount(); uerr != nil {
 			fmt.Fprintln(os.Stderr, "unmount:", uerr)
@@ -282,6 +324,41 @@ func cmdMount(ctx context.Context, mountpoint string) error {
 		return nil
 	}
 	return err
+}
+
+// tryRecover opens a transient MTProto session, scans the channel for
+// the most recent snapshot message, and restores it to cfg.DBPath().
+// If no snapshot exists in the channel, returns nil (fresh DB will be
+// created by the subsequent meta.Open).
+func tryRecover(ctx context.Context, cfg *config.Config) error {
+	client, err := tg.New(cfg)
+	if err != nil {
+		return err
+	}
+	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
+		fmt.Println("Local DB missing — scanning channel for snapshot…")
+		latest, err := sess.FindLatestSnapshot(ctx, "", 50)
+		if err != nil {
+			return err
+		}
+		if latest == nil {
+			fmt.Println("No snapshot in channel; starting with an empty DB.")
+			return nil
+		}
+		fmt.Printf("Found snapshot msg=%d (ts %s, fs_uuid=%s)\n",
+			latest.MessageID,
+			time.Unix(latest.Caption.TSUnix, 0).UTC().Format(time.RFC3339),
+			latest.Caption.FSUUID)
+		data, err := sess.DownloadSnapshot(ctx, latest.MessageID)
+		if err != nil {
+			return err
+		}
+		if err := snapshot.Restore(ctx, data, cfg.DBPath()); err != nil {
+			return err
+		}
+		fmt.Printf("Restored %d gzipped bytes → %s\n", len(data), cfg.DBPath())
+		return nil
+	})
 }
 
 func cmdDebug(ctx context.Context, args []string) error {

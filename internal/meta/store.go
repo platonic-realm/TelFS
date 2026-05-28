@@ -2,6 +2,7 @@ package meta
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -122,6 +123,12 @@ CREATE TABLE IF NOT EXISTS meta_kv (
 );
 `
 
+// Key in meta_kv that holds this filesystem's UUID. Set once on first
+// Open and never changes. Used by M5 snapshot/recovery to make sure a
+// channel containing messages from a prior TelFS instance can't poison
+// the recovery of a new one.
+const KVFSUUID = "fs_uuid"
+
 // initSchema creates tables and seeds the root inode if it doesn't exist.
 func (s *Store) initSchema(ctx context.Context) error {
 	for _, stmt := range splitStmts(schemaSQL) {
@@ -132,12 +139,50 @@ func (s *Store) initSchema(ctx context.Context) error {
 	// Seed root inode if missing. Using explicit ino=1 ensures auto-increment
 	// will hand out 2,3,... thereafter.
 	const rootMode = 0o40755 // dir | rwxr-xr-x
-	_, err := s.db.ExecContext(ctx,
+	if _, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO inodes(ino, kind, mode, nlink, mtime, ctime)
 		   VALUES (?, 'dir', ?, 1, strftime('%s','now'), strftime('%s','now'))`,
 		RootIno, rootMode,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	// Bootstrap fs_uuid on first ever open. INSERT OR IGNORE keeps it
+	// idempotent.
+	if _, err := s.GetKV(ctx, KVFSUUID); err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		uuid, err := randomUUID()
+		if err != nil {
+			return fmt.Errorf("generate fs_uuid: %w", err)
+		}
+		if err := s.PutKV(ctx, KVFSUUID, []byte(uuid)); err != nil {
+			return fmt.Errorf("seed fs_uuid: %w", err)
+		}
+	}
+	return nil
+}
+
+// FSUUID returns this filesystem's UUID, set when the DB was first
+// created. Stable across reopens.
+func (s *Store) FSUUID(ctx context.Context) (string, error) {
+	v, err := s.GetKV(ctx, KVFSUUID)
+	if err != nil {
+		return "", err
+	}
+	return string(v), nil
+}
+
+// randomUUID returns a RFC-4122 v4 hex UUID.
+func randomUUID() (string, error) {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return "", err
+	}
+	// version 4, variant 10
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
 // splitStmts splits a multi-statement SQL string on semicolons followed by
