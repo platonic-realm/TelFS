@@ -54,6 +54,8 @@ Usage:
   telfs profile {list,show,create,delete,use,export,import}
                                     Manage multiple profiles (accounts/channels).
   telfs status                      One-screen summary of the active profile.
+  telfs fsck [--fix] [--stop-after N]
+                                    Verify every chunk_map row against the channel.
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
 
 Environment:
@@ -100,6 +102,8 @@ func run() error {
 		return cmdProfile(ctx, os.Args[2:])
 	case "status":
 		return cmdStatus(ctx, os.Args[2:])
+	case "fsck":
+		return cmdFsck(ctx, os.Args[2:])
 	case "gc":
 		return cmdGC(ctx, os.Args[2:])
 	case "debug":

@@ -78,6 +78,28 @@ func (s *Store) DeleteChunk(ctx context.Context, ino int64, idx int32) error {
 	return nil
 }
 
+// AllChunks returns every row of chunk_map in (ino, idx) order. Used
+// by `telfs fsck` to walk the full chunk set and verify each one's
+// channel reachability. Cost is O(N) in chunk count — small DBs even
+// for multi-GB filesystems.
+func (s *Store) AllChunks(ctx context.Context) ([]Chunk, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ino, idx, tg_message_id, size FROM chunk_map ORDER BY ino, idx`)
+	if err != nil {
+		return nil, fmt.Errorf("all chunks: %w", err)
+	}
+	defer rows.Close()
+	var out []Chunk
+	for rows.Next() {
+		var c Chunk
+		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // AllChunkMessageIDs returns the distinct set of Telegram message ids
 // currently referenced by the chunk_map. Used by `telfs gc` to identify
 // orphan chunk messages in the channel.
