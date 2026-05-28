@@ -17,6 +17,7 @@ const (
 	EnvAPIID   = "TELFS_API_ID"
 	EnvAPIHash = "TELFS_API_HASH"
 	EnvPhone   = "TELFS_PHONE"
+	EnvDC      = "TELFS_DC"
 )
 
 // File names within the data directory.
@@ -33,6 +34,11 @@ type Config struct {
 	APIID   int    `toml:"api_id"`
 	APIHash string `toml:"api_hash"`
 	Phone   string `toml:"phone,omitempty"`
+	// DC overrides gotd's default starting datacenter (which is 2). Useful in
+	// environments where DC 2's primary IP is firewalled. Telegram will
+	// migrate the connection to the user's home DC after auth regardless of
+	// the starting DC.
+	DC int `toml:"dc,omitempty"`
 
 	Channel ChannelConfig `toml:"channel"`
 
@@ -111,6 +117,13 @@ func Load() (*Config, error) {
 	}
 	if v := strings.TrimSpace(os.Getenv(EnvPhone)); v != "" {
 		c.Phone = v
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvDC)); v != "" {
+		dc, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s=%q: %w", EnvDC, v, err)
+		}
+		c.DC = dc
 	}
 
 	return c, nil

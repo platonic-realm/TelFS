@@ -26,12 +26,13 @@ func (c *Client) Login(ctx context.Context) error {
 		}
 	}
 
-	return c.tg.Run(ctx, func(ctx context.Context) error {
+	tgc := c.newTG()
+	return tgc.Run(ctx, func(ctx context.Context) error {
 		flow := auth.NewFlow(termAuth{phone: phone}, auth.SendCodeOptions{})
-		if err := c.tg.Auth().IfNecessary(ctx, flow); err != nil {
+		if err := tgc.Auth().IfNecessary(ctx, flow); err != nil {
 			return fmt.Errorf("auth: %w", err)
 		}
-		self, err := c.tg.Self(ctx)
+		self, err := tgc.Self(ctx)
 		if err != nil {
 			return fmt.Errorf("self: %w", err)
 		}
@@ -65,13 +66,19 @@ func (a termAuth) Code(_ context.Context, _ *tg.AuthSentCode) (string, error) {
 }
 
 func (a termAuth) Password(_ context.Context) (string, error) {
-	fmt.Print("2FA password: ")
-	b, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Println()
-	if err != nil {
-		return "", fmt.Errorf("read password: %w", err)
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		fmt.Print("2FA password: ")
+		b, err := term.ReadPassword(fd)
+		fmt.Println()
+		if err != nil {
+			return "", fmt.Errorf("read password: %w", err)
+		}
+		return string(b), nil
 	}
-	return string(b), nil
+	// Non-tty stdin (e.g. piped from a FIFO): read a line normally.
+	// No echo suppression is possible without a tty.
+	return promptLine("2FA password: ")
 }
 
 func (a termAuth) AcceptTermsOfService(_ context.Context, tos tg.HelpTermsOfService) error {
