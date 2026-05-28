@@ -1,0 +1,11 @@
+.git
+.github
+.gitignore
+.dockerignore
+bin
+dist
+mnt
+CLAUDE.md
+notes
+.telfs
+*.log

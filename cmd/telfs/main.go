@@ -39,6 +39,15 @@ import (
 	"telfs/internal/tg"
 )
 
+// Build-time metadata. Overridden via -ldflags at release:
+//
+//	-X main.version=v0.4 -X main.commit=<sha> -X main.buildDate=<iso8601>
+var (
+	version   = "dev"
+	commit    = "none"
+	buildDate = "unknown"
+)
+
 const usage = `telfs — FUSE filesystem backed by a Telegram channel
 
 Usage:
@@ -95,6 +104,9 @@ func run() error {
 	switch os.Args[1] {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
+		return nil
+	case "version", "-v", "--version":
+		fmt.Printf("telfs %s (commit %s, built %s)\n", version, commit, buildDate)
 		return nil
 	case "login":
 		return cmdLogin(ctx, os.Args[2:])
