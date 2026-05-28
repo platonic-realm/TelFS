@@ -252,6 +252,78 @@ Environment overrides:
 | Inline TG deletes | none for chunks; snapshots delete the prior one | M4 trade — never destroys user data inline; orphans cleaned by `telfs gc` |
 | Snapshot cadence | every 5 min + on clean unmount | Bounded recovery window without burning network bandwidth |
 
+## Profiles + portable bundles
+
+A profile is a named directory under `~/.config/telfs/profiles/<name>/`
+holding one filesystem's full local state — config, MTProto session,
+SQLite metadata, and cache. Multiple profiles coexist independently
+(each can bind to its own account and channel).
+
+```sh
+./bin/telfs profile create work
+TELFS_PROFILE=work ./bin/telfs login            # interactive setup
+TELFS_PROFILE=work ./bin/telfs channel set <id>
+./bin/telfs profile use work                    # sticky default
+
+./bin/telfs profile list                        # shows the active marker
+./bin/telfs profile export bundle.tar.gz        # tar.gz of config+session+db
+./bin/telfs profile import --profile work2 bundle.tar.gz   # restore elsewhere
+```
+
+A bundle contains your MTProto session credentials and (if encryption
+is enabled) the salt + canary needed to derive the data key from
+your passphrase. Treat it like an SSH private key.
+
+- **Same-machine roundtrip is verified.** Exporting and re-importing
+  into a sibling profile on the same host works end to end.
+- **Cross-device use is the design intent, but is unverified.**
+  Telegram may flag or invalidate a `session.json` reused from a
+  different device/IP. If that happens you'll see auth errors at
+  mount time on the destination; the workaround is to redo
+  `telfs login` on that machine. `config.toml` and `db.sqlite`
+  from the bundle still apply — just the session bits may not.
+
+## Running unattended
+
+The mount command is a foreground daemon. Backgrounding it with
+`&` in an interactive shell is fine for testing, but if that shell
+exits with `huponexit` on (or anything else terminates the daemon
+abruptly), the kernel mount stays in `/proc/mounts` but `~/External`
+silently reverts to writing through to the *local* filesystem
+underneath. Files dropped in during that window land on disk
+locally, not in the channel — and become invisible the moment
+TelFS remounts.
+
+For production use, run it under a supervisor that owns the
+process lifecycle:
+
+```ini
+# ~/.config/systemd/user/telfs@.service
+[Unit]
+Description=TelFS mount (profile %i)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=TELFS_PROFILE=%i
+EnvironmentFile=%h/.config/telfs/profiles/%i/passphrase.env
+ExecStart=%h/Projects/TelFS/bin/telfs mount %h/External-%i
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+echo 'TELFS_PASSPHRASE=your-secret' > ~/.config/telfs/profiles/work/passphrase.env
+chmod 600 ~/.config/telfs/profiles/work/passphrase.env
+systemctl --user enable --now telfs@work.service
+```
+
+For interactive use, at minimum: `nohup ./bin/telfs mount ~/External &`
+and verify the daemon survives a shell exit before trusting it
+with data.
+
 ## Known limits
 
 - **Single mounter per channel.** Two concurrent mounts will race; no
