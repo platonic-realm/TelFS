@@ -53,6 +53,7 @@ Usage:
   telfs encrypt status              Show whether encryption is enabled.
   telfs profile {list,show,create,delete,use,export,import}
                                     Manage multiple profiles (accounts/channels).
+  telfs status                      One-screen summary of the active profile.
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
 
 Environment:
@@ -97,6 +98,8 @@ func run() error {
 		return cmdEncrypt(ctx, os.Args[2:])
 	case "profile":
 		return cmdProfile(ctx, os.Args[2:])
+	case "status":
+		return cmdStatus(ctx, os.Args[2:])
 	case "gc":
 		return cmdGC(ctx, os.Args[2:])
 	case "debug":
