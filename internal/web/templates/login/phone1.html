@@ -1,0 +1,12 @@
+{{define "content"}}
+<h2>Phone login · step 1 of 3</h2>
+<form method="post" action="/login/phone/start" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Phone number (international, e.g. +14155552671)
+    <input type="text" name="phone" required pattern="\+[0-9]+" placeholder="+...">
+  </label>
+  <button type="submit">Send code</button>
+  <a href="/login" class="btn">Cancel</a>
+</form>
+<p><small>Telegram will send a 5-digit code via SMS or via the Telegram app's notifications.</small></p>
+{{end}}

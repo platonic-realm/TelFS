@@ -1,0 +1,23 @@
+{{define "content"}}
+<h2>Enable encryption</h2>
+{{if .HasChunks}}
+<div class="flash error">
+  This filesystem already has chunks. Encryption can only be enabled on a fresh
+  TelFS. Create a new profile and <code>cp -r</code> your data over.
+</div>
+<p><a href="/encrypt" class="btn">Back</a></p>
+{{else}}
+<form method="post" action="/encrypt/init" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Passphrase
+    <input type="password" name="passphrase" required autofocus>
+  </label>
+  <label>Confirm
+    <input type="password" name="passphrase_confirm" required>
+  </label>
+  <button type="submit">Enable</button>
+  <a href="/encrypt" class="btn">Cancel</a>
+</form>
+<p><small><strong>There is no recovery for a lost passphrase.</strong> Argon2id (time=3, memory=64 MiB, threads=4) — derivation takes about half a second on commodity hardware.</small></p>
+{{end}}
+{{end}}

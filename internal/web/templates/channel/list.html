@@ -1,0 +1,24 @@
+{{define "content"}}
+<h2>Your channels</h2>
+{{if .IsBot}}
+<p><em>Bot mode: dialog enumeration is not available. Use the <a href="/channel/set">manual set</a> form instead.</em></p>
+{{else if .Error}}
+<div class="flash error">{{.Error}}</div>
+{{else if not .Channels}}
+<p><em>No channels found. Create a private channel in Telegram first, then re-load.</em></p>
+{{else}}
+<p>Click a row to pre-fill the set form with that channel's id and access_hash.</p>
+<table>
+<tr><th>ID</th><th>Title</th><th>Post permission</th><th>Owner</th></tr>
+{{range .Channels}}
+<tr>
+  <td><code>{{.ID}}</code></td>
+  <td>{{.Title}}{{if .Username}} <small>(@{{.Username}})</small>{{end}}</td>
+  <td>{{if .CanPost}}yes{{else}}no{{end}}</td>
+  <td>{{if .IsCreator}}you{{else}}—{{end}}</td>
+</tr>
+{{end}}
+</table>
+{{end}}
+<p><a href="/channel" class="btn">Back</a></p>
+{{end}}

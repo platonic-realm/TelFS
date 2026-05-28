@@ -28,6 +28,28 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /profiles/{name}/export", s.profilesExport)
 	s.mux.HandleFunc("GET /profiles/import", s.profilesImportForm)
 	s.mux.HandleFunc("POST /profiles/import", s.profilesImport)
+
+	// Login.
+	s.mux.HandleFunc("GET /login", s.loginChoice)
+	s.mux.HandleFunc("GET /login/phone", s.loginPhoneForm)
+	s.mux.HandleFunc("POST /login/phone/start", s.loginPhoneStart)
+	s.mux.HandleFunc("GET /login/phone/code", s.loginPhoneCodeForm)
+	s.mux.HandleFunc("POST /login/phone/code", s.loginPhoneCodeSubmit)
+	s.mux.HandleFunc("GET /login/phone/password", s.loginPhonePasswordForm)
+	s.mux.HandleFunc("POST /login/phone/password", s.loginPhonePasswordSubmit)
+	s.mux.HandleFunc("GET /login/bot", s.loginBotForm)
+	s.mux.HandleFunc("POST /login/bot", s.loginBotSubmit)
+
+	// Channel.
+	s.mux.HandleFunc("GET /channel", s.channelShow)
+	s.mux.HandleFunc("GET /channel/list", s.channelList)
+	s.mux.HandleFunc("GET /channel/set", s.channelSetForm)
+	s.mux.HandleFunc("POST /channel/set", s.channelSetSubmit)
+
+	// Encryption.
+	s.mux.HandleFunc("GET /encrypt", s.encryptShow)
+	s.mux.HandleFunc("GET /encrypt/init", s.encryptInitForm)
+	s.mux.HandleFunc("POST /encrypt/init", s.encryptInitSubmit)
 }
 
 // renderTemplate parses + executes a template set (always including

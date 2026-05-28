@@ -1,0 +1,13 @@
+{{define "content"}}
+<h2>Phone login · step 2 of 3</h2>
+<p>Telegram has sent a login code. Enter it below.</p>
+<form method="post" action="/login/phone/code" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Code
+    <input type="text" name="code" required pattern="[0-9]+" inputmode="numeric" autofocus>
+  </label>
+  <button type="submit">Submit code</button>
+  <a href="/login" class="btn">Cancel</a>
+</form>
+<p><small>If you've enabled two-factor authentication, you'll be prompted for your password next.</small></p>
+{{end}}

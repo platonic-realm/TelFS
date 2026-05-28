@@ -1,0 +1,22 @@
+{{define "content"}}
+<h2>Encryption</h2>
+{{if not .HasMeta}}
+<p><em>No metadata DB yet for this profile.</em></p>
+{{else if .Enabled}}
+<section class="card">
+  <h3>Enabled</h3>
+  <dl>
+    <dt>Mode</dt><dd><code>{{.Mode}}</code></dd>
+    <dt>KDF</dt><dd><code>{{.Argon}}</code></dd>
+  </dl>
+  <p>Chunks are AES-GCM ciphertext; snapshots are wrapped in a TFSE envelope.</p>
+</section>
+<p><small>The choice is one-way. To rotate the passphrase, set up a new profile with `cp -r` from old to new.</small></p>
+{{else}}
+<section class="card">
+  <h3>Disabled</h3>
+  <p>Chunks upload as plaintext. Anyone with channel access sees file content.</p>
+  <p><a href="/encrypt/init" class="btn">Enable encryption</a></p>
+</section>
+{{end}}
+{{end}}

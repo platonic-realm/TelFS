@@ -1,0 +1,17 @@
+{{define "content"}}
+<h2>Log in</h2>
+{{if not .HasAPI}}
+<div class="flash error">{{.Note}}</div>
+{{end}}
+<section class="card">
+  <h3>User account (phone)</h3>
+  <p>Interactive: phone → SMS/Telegram code → 2FA password (if set).</p>
+  <p><a href="/login/phone" class="btn">Start phone login</a></p>
+</section>
+<section class="card">
+  <h3>Bot account (token)</h3>
+  <p>One-shot login using a token from <a href="https://t.me/BotFather">@BotFather</a>. The bot must be added to your channel as <strong>admin</strong>.</p>
+  <p><a href="/login/bot" class="btn">Start bot login</a></p>
+</section>
+<p><small>Active profile: <code>{{.Profile}}</code>. Login writes to that profile's <code>session.json</code>.</small></p>
+{{end}}

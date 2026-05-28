@@ -40,10 +40,18 @@ func (c *Client) loginUser(ctx context.Context) error {
 			return err
 		}
 	}
+	return c.LoginWith(ctx, termAuth{phone: phone})
+}
 
+// LoginWith runs the MTProto user auth flow against the given
+// authenticator. The authenticator (the gotd `auth.UserAuthenticator`
+// interface) supplies phone / code / 2FA password when gotd asks. The
+// CLI uses a terminal-reading implementation; the web layer uses a
+// channel-based one. Blocks until auth completes or ctx is canceled.
+func (c *Client) LoginWith(ctx context.Context, ua auth.UserAuthenticator) error {
 	tgc := c.newTG()
 	return tgc.Run(ctx, func(ctx context.Context) error {
-		flow := auth.NewFlow(termAuth{phone: phone}, auth.SendCodeOptions{})
+		flow := auth.NewFlow(ua, auth.SendCodeOptions{})
 		if err := tgc.Auth().IfNecessary(ctx, flow); err != nil {
 			return fmt.Errorf("auth: %w", err)
 		}

@@ -1,0 +1,12 @@
+{{define "content"}}
+<h2>Bot login</h2>
+<form method="post" action="/login/bot" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Bot token (from <a href="https://t.me/BotFather">@BotFather</a>)
+    <input type="text" name="token" required autofocus placeholder="123456:ABCxyz…">
+  </label>
+  <button type="submit">Log in</button>
+  <a href="/login" class="btn">Cancel</a>
+</form>
+<p><small>The bot must be a member of your channel <strong>as admin</strong> before you can post chunks to it. Add it via your Telegram app first.</small></p>
+{{end}}

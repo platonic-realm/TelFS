@@ -1,0 +1,15 @@
+{{define "content"}}
+<h2>Set channel</h2>
+<form method="post" action="/channel/set" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Channel ID
+    <input type="text" name="id" required pattern="-?[0-9]+" inputmode="numeric" placeholder="3930934278 or -1003930934278">
+  </label>
+  <label>access_hash {{if .IsBot}}<strong>(required in bot mode)</strong>{{else}}(optional — auto-discovered for user accounts){{end}}
+    <input type="text" name="access_hash" pattern="-?[0-9]+" inputmode="numeric" {{if .IsBot}}required{{end}}>
+  </label>
+  <button type="submit">Set</button>
+  <a href="/channel" class="btn">Cancel</a>
+</form>
+<p><small>The id accepts either the raw positive form or the <code>-100…</code> bot-API form (both decode to the same channel).</small></p>
+{{end}}

@@ -1,0 +1,28 @@
+{{define "content"}}
+<h2>Channel</h2>
+{{if .Bound}}
+<section class="card">
+  <h3>Current binding</h3>
+  <dl>
+    <dt>Title</dt><dd>{{.Channel.Title}}</dd>
+    <dt>ID</dt><dd><code>{{.Channel.ID}}</code></dd>
+  </dl>
+</section>
+{{else}}
+<p><em>No channel bound to this profile yet.</em></p>
+{{end}}
+
+<p>
+  {{if and .HasAPI .HasAuth (not .IsBot)}}
+  <a href="/channel/list" class="btn">List my channels</a>
+  {{end}}
+  <a href="/channel/set" class="btn">Set channel manually</a>
+</p>
+
+{{if .IsBot}}
+<section class="card">
+  <h3>Bot mode</h3>
+  <p>Bot accounts cannot enumerate dialogs. To bind a channel you need its <strong>id</strong> and <strong>access_hash</strong> from a user-account TelFS that already has the channel set, or from another tool.</p>
+</section>
+{{end}}
+{{end}}

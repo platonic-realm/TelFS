@@ -30,10 +30,11 @@ type Options struct {
 
 // Server bundles the HTTP server, state, and lifecycle handles.
 type Server struct {
-	opts  Options
-	state *State
-	mux   *http.ServeMux
-	srv   *http.Server
+	opts   Options
+	state  *State
+	logins *loginRegistry
+	mux    *http.ServeMux
+	srv    *http.Server
 }
 
 // New returns a configured but not-yet-running Server.
@@ -50,9 +51,10 @@ func New(opts Options) (*Server, error) {
 		}
 	}
 	s := &Server{
-		opts:  opts,
-		state: NewState(),
-		mux:   http.NewServeMux(),
+		opts:   opts,
+		state:  NewState(),
+		logins: newLoginRegistry(),
+		mux:    http.NewServeMux(),
 	}
 	s.registerRoutes()
 	s.srv = &http.Server{

@@ -1,0 +1,12 @@
+{{define "content"}}
+<h2>Phone login · step 3 of 3 (2FA)</h2>
+<p>Your account has two-factor authentication enabled. Enter the cloud password.</p>
+<form method="post" action="/login/phone/password" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Cloud password
+    <input type="password" name="password" required autofocus>
+  </label>
+  <button type="submit">Submit password</button>
+  <a href="/login" class="btn">Cancel</a>
+</form>
+{{end}}
