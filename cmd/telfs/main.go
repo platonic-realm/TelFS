@@ -46,7 +46,8 @@ Usage:
   telfs channel info                Show the currently configured channel.
   telfs channel ping                Round-trip a test message (smoke test).
   telfs mount [flags] <mountpoint>  Mount the filesystem.
-                                      Flags: --readonly --allow-other --debug
+                                      Flags: --readonly --allow-other --debug --no-recover
+  telfs init [--chunk-size N]       Initialize FS settings before first mount.
   telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
   telfs encrypt init                Enable AES-256-GCM for this filesystem.
   telfs encrypt status              Show whether encryption is enabled.
@@ -86,6 +87,8 @@ func run() error {
 		return cmdChannel(ctx, os.Args[2:])
 	case "mount":
 		return cmdMount(ctx, os.Args[2:])
+	case "init":
+		return cmdInit(ctx, os.Args[2:])
 	case "encrypt":
 		return cmdEncrypt(ctx, os.Args[2:])
 	case "gc":
@@ -227,6 +230,72 @@ func cmdChannelPing(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
+// cmdInit creates the local meta DB (if missing) and applies FS-wide
+// settings — currently just the per-FS chunk size. Idempotent for the
+// same value; refuses to change chunk_size when chunks already exist
+// because (ino, idx) → offset arithmetic depends on it.
+func cmdInit(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	chunkSize := fs.Int64("chunk-size", meta.DefaultChunkSize, "chunk size in bytes (power of 2, 64KiB..1.5GiB)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: telfs init [--chunk-size BYTES]")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := meta.ValidateChunkSize(*chunkSize); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	metaStore, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return err
+	}
+	defer metaStore.Close()
+
+	current, err := metaStore.ChunkSize(ctx)
+	if err != nil {
+		return err
+	}
+	if current == *chunkSize {
+		fmt.Printf("chunk_size already set to %d bytes (%s). No change.\n", current, humanBytes(current))
+		return nil
+	}
+	refs, err := metaStore.AllChunkMessageIDs(ctx)
+	if err != nil {
+		return err
+	}
+	if len(refs) > 0 {
+		return fmt.Errorf("init: refuses to change chunk_size from %d to %d while %d chunk(s) exist; "+
+			"start a fresh TelFS instance with a new channel to use a different chunk size",
+			current, *chunkSize, len(refs))
+	}
+	if err := metaStore.SetChunkSize(ctx, *chunkSize); err != nil {
+		return err
+	}
+	fmt.Printf("chunk_size set to %d bytes (%s)\n", *chunkSize, humanBytes(*chunkSize))
+	return nil
+}
+
+// humanBytes renders a byte count as KiB / MiB / GiB. Only powers of
+// 1024 — chunk sizes are always powers of two so no fractions.
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%d GiB", n>>30)
+	case n >= 1<<20:
+		return fmt.Sprintf("%d MiB", n>>20)
+	case n >= 1<<10:
+		return fmt.Sprintf("%d KiB", n>>10)
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
 // cmdMount mounts the filesystem and blocks until ctx is canceled.
 //
 // Teardown order (advisor-mandated, tested via ^C):
@@ -302,13 +371,20 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return err
 	}
 
+	// Per-FS chunk size — was committed at first init (or defaulted to
+	// chunk.ChunkSize on legacy filesystems that predate this kv).
+	chunkSize, err := metaStore.ChunkSize(signalCtx)
+	if err != nil {
+		return err
+	}
+
 	err = client.RunSession(context.Background(), func(sessCtx context.Context, sess *tg.Session) error {
 		fetcher := &chunk.TGFetcher{Session: sess}
 		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher, cipher)
 		if err != nil {
 			return err
 		}
-		reader := chunk.NewReader(metaStore, cache, chunk.ChunkSize)
+		reader := chunk.NewReader(metaStore, cache, chunkSize)
 
 		server, err := telfsfs.Mount(telfsfs.MountOptions{
 			MountPoint: mountpoint,
@@ -320,7 +396,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			Cache:     cache,
 			Uploader:  sess,
 			Cipher:    cipher,
-			ChunkSize: chunk.ChunkSize,
+			ChunkSize: chunkSize,
 			ReadOnly:  *readonly,
 		})
 		if err != nil {
@@ -644,7 +720,11 @@ func cmdDebugSeedFile(ctx context.Context, name string, n int64) error {
 			return fmt.Errorf("create inode: %w", err)
 		}
 
-		chunker := chunk.NewChunker(bytes.NewReader(data), int(chunk.ChunkSize))
+		chunkSize, err := metaStore.ChunkSize(ctx)
+		if err != nil {
+			return err
+		}
+		chunker := chunk.NewChunker(bytes.NewReader(data), int(chunkSize))
 		var idx int32
 		var uploaded int64
 		for {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -129,6 +130,28 @@ CREATE TABLE IF NOT EXISTS meta_kv (
 // the recovery of a new one.
 const KVFSUUID = "fs_uuid"
 
+// KVChunkSize records the chunk size (in bytes, decimal string) this
+// filesystem was committed to. Set once on first Open if missing and
+// IMMUTABLE thereafter once any chunk exists — every chunk_map row's
+// (ino, idx) tuple is computed from offset/chunk_size, so changing the
+// size would silently un-map every existing file.
+const KVChunkSize = "chunk_size"
+
+// DefaultChunkSize is the fallback when a fresh filesystem doesn't
+// specify a chunk size — 4 MiB, the same value used since M0.
+const DefaultChunkSize int64 = 4 << 20
+
+// MinChunkSize and MaxChunkSize bound what `telfs init` will accept.
+// Below 64 KiB per-message overhead dominates and chunk_map row count
+// balloons; above ~1.5 GiB and you risk Telegram's 2 GB per-document
+// hard cap. Within these bounds, only powers of two are allowed —
+// makes the (off / size) and (off % size) arithmetic exact and the
+// schema-validation logic trivial.
+const (
+	MinChunkSize int64 = 64 << 10   // 64 KiB
+	MaxChunkSize int64 = 1536 << 20 // 1.5 GiB
+)
+
 // initSchema creates tables and seeds the root inode if it doesn't exist.
 func (s *Store) initSchema(ctx context.Context) error {
 	for _, stmt := range splitStmts(schemaSQL) {
@@ -162,6 +185,19 @@ func (s *Store) initSchema(ctx context.Context) error {
 			return fmt.Errorf("seed fs_uuid: %w", err)
 		}
 	}
+	// Bootstrap chunk_size if missing. Existing filesystems (created
+	// before this kv was introduced) get the default, which is also
+	// what they were already using — so a no-op semantically.
+	if _, err := s.GetKV(ctx, KVChunkSize); err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		if err := s.PutKV(ctx, KVChunkSize,
+			[]byte(strconv.FormatInt(DefaultChunkSize, 10)),
+		); err != nil {
+			return fmt.Errorf("seed chunk_size: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -173,6 +209,46 @@ func (s *Store) FSUUID(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return string(v), nil
+}
+
+// ChunkSize returns the chunk size this filesystem was committed to,
+// or DefaultChunkSize if the kv is missing (filesystems initialized
+// before this column was introduced).
+func (s *Store) ChunkSize(ctx context.Context) (int64, error) {
+	v, err := s.GetKV(ctx, KVChunkSize)
+	if errors.Is(err, ErrNotFound) {
+		return DefaultChunkSize, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(string(v), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("chunk_size kv malformed (%q): %w", string(v), err)
+	}
+	return n, nil
+}
+
+// SetChunkSize writes the chunk size kv. Caller is responsible for
+// refusing the change when chunks already exist — this method just
+// stores the value.
+func (s *Store) SetChunkSize(ctx context.Context, n int64) error {
+	if err := ValidateChunkSize(n); err != nil {
+		return err
+	}
+	return s.PutKV(ctx, KVChunkSize, []byte(strconv.FormatInt(n, 10)))
+}
+
+// ValidateChunkSize enforces the [MinChunkSize, MaxChunkSize]
+// power-of-two range. Returns nil if n is acceptable.
+func ValidateChunkSize(n int64) error {
+	if n < MinChunkSize || n > MaxChunkSize {
+		return fmt.Errorf("chunk_size %d out of range [%d, %d]", n, MinChunkSize, MaxChunkSize)
+	}
+	if n&(n-1) != 0 {
+		return fmt.Errorf("chunk_size %d must be a power of two", n)
+	}
+	return nil
 }
 
 // randomUUID returns a RFC-4122 v4 hex UUID.

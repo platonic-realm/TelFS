@@ -33,6 +33,11 @@ Telegram API ID + hash (free, get them at
 # Build.
 make build                                  # → bin/telfs
 
+# (Optional) pick a non-default chunk size before first mount.
+# Default is 4 MiB; valid range is 64 KiB..1.5 GiB, power of two.
+# Once any chunk lands the choice is immutable.
+./bin/telfs init --chunk-size $((16*1024*1024))   # e.g. 16 MiB
+
 # Configure credentials (one-time). The .telfs/ directory is created
 # in the current working directory and holds the session + local DB +
 # config. Add api_id / api_hash to .telfs/config.toml, OR set them in
@@ -210,7 +215,7 @@ Environment overrides:
 | Language | Go | `hanwen/go-fuse` + `gotd/td` + `modernc.org/sqlite` (pure-Go SQLite) |
 | Telegram API | MTProto user API (gotd) | 2 GB per file; Bot API's 50 MB cap is too small for chunks |
 | Metadata | local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence |
-| Chunk size | 4 MiB | Sequential read/write throughput vs `chunk_map` row count |
+| Chunk size | 4 MiB default, **per-FS configurable** | Sequential read/write throughput vs `chunk_map` row count. Set via `telfs init --chunk-size <N>` BEFORE first mount; immutable thereafter. Power of two, [64 KiB, 1.5 GiB]. |
 | POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough to host typical workloads |
 | Encryption | AES-256-GCM, Argon2id KDF, opt-in via `telfs encrypt init` | Chunk bytes only; metadata still plaintext in the channel |
 | Inline TG deletes | none for chunks; snapshots delete the prior one | M4 trade — never destroys user data inline; orphans cleaned by `telfs gc` |
