@@ -61,17 +61,17 @@ type Cache struct {
 }
 
 // NewCache creates (or reopens) a Cache rooted at dir. The directory is
-// created if missing. On startup we start with an empty in-memory LRU;
-// any existing files on disk are NOT indexed in v1 (they'll be silently
-// overwritten on re-fetch, or evicted naturally as new chunks are added).
+// created if missing. On startup we scan the directory and adopt any
+// `<ino>-<idx>.bin` files we find as cache entries — they become hits
+// on next access, so the cache survives daemon restarts. The LRU
+// order of inherited files is "uniform LRU" (all at the back),
+// because we can't recover the original access order; chunks fetched
+// after startup move to MRU normally.
 //
 // cipher may be nil — in that case we wire NoopCipher and the cache
 // stores raw bytes. When non-nil, the Cache assumes the upstream
 // Fetcher returns CIPHERTEXT and the cache stores PLAINTEXT (so reads
 // don't pay decrypt cost on cache hits).
-//
-// TODO(M6): scan dir on startup and seed the LRU from existing files so
-// chunk caches survive daemon restarts.
 func NewCache(dir string, capBytes int64, fetcher Fetcher, cipher crypto.Cipher) (*Cache, error) {
 	if capBytes <= 0 {
 		capBytes = DefaultCacheCapBytes
@@ -82,14 +82,51 @@ func NewCache(dir string, capBytes int64, fetcher Fetcher, cipher crypto.Cipher)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("chunk: mkdir cache %s: %w", dir, err)
 	}
-	return &Cache{
+	c := &Cache{
 		dir:      dir,
 		capBytes: capBytes,
 		fetcher:  fetcher,
 		cipher:   cipher,
 		entries:  make(map[Key]*entry),
 		order:    list.New(),
-	}, nil
+	}
+	c.adoptExisting()
+	return c, nil
+}
+
+// adoptExisting walks the cache directory and registers any
+// `<ino>-<idx>.bin` files as cache entries. Files with unparseable
+// names or zero size are skipped (a zero-byte file usually means a
+// previous crash mid-write). If the inherited footprint exceeds
+// capBytes, we evict immediately to bring it back in line.
+func (c *Cache) adoptExisting() {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		var ino int64
+		var idx int32
+		if _, err := fmt.Sscanf(e.Name(), "%d-%d.bin", &ino, &idx); err != nil {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.Size() == 0 {
+			continue
+		}
+		key := Key{Ino: ino, Idx: idx}
+		ent := &entry{key: key, size: info.Size()}
+		ent.el = c.order.PushBack(ent) // back = LRU since we don't know real recency
+		c.entries[key] = ent
+		c.totalSize += info.Size()
+	}
+	// If the inherited footprint already exceeds the cap, evict.
+	c.mu.Lock()
+	c.evictLocked()
+	c.mu.Unlock()
 }
 
 // Dir returns the on-disk cache directory.

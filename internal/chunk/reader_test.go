@@ -165,6 +165,40 @@ func TestReadAtFullChunkAligned(t *testing.T) {
 	}
 }
 
+// TestCacheAdoptsExistingFilesOnRestart proves the cache survives a
+// daemon restart: chunks fetched into cache before "restart" remain
+// hits on the new cache instance pointing at the same directory.
+func TestCacheAdoptsExistingFilesOnRestart(t *testing.T) {
+	m := newTestMeta(t)
+	ino, ff := seedFile(t, m, "x", [][]byte{[]byte("HelloWorld")}, 1)
+	dir := t.TempDir()
+	cache1, err := NewCache(dir, 100<<10, ff, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewReader(m, cache1, 10)
+	// Populate cache via a read.
+	dest := make([]byte, 10)
+	if _, err := r.ReadAt(context.Background(), ino, dest, 0); err != nil {
+		t.Fatal(err)
+	}
+	if ff.calls.Load() != 1 {
+		t.Fatalf("warm-up fetch count = %d, want 1", ff.calls.Load())
+	}
+	// Simulate restart: spin up a fresh cache on the same dir.
+	cache2, err := NewCache(dir, 100<<10, ff, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2 := NewReader(m, cache2, 10)
+	if _, err := r2.ReadAt(context.Background(), ino, dest, 0); err != nil {
+		t.Fatal(err)
+	}
+	if ff.calls.Load() != 1 {
+		t.Fatalf("post-restart fetch count = %d, want 1 (cache should have adopted the existing file)", ff.calls.Load())
+	}
+}
+
 func TestCacheInvalidateRemovesEntry(t *testing.T) {
 	m := newTestMeta(t)
 	ino, ff := seedFile(t, m, "x", [][]byte{[]byte("HelloWorld")}, 1)
