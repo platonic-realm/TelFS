@@ -75,11 +75,38 @@ var (
 	_ gofuse.NodeSetxattrer    = (*Node)(nil)
 	_ gofuse.NodeRemovexattrer = (*Node)(nil)
 	_ gofuse.NodeListxattrer   = (*Node)(nil)
+	_ gofuse.NodeStatfser      = (*Node)(nil)
 )
 
 // NewRoot returns the root Node for a TelFS mount.
 func NewRoot(b *Backend) *Node {
 	return &Node{backend: b, ino: meta.RootIno}
+}
+
+// Statfs answers `statfs(2)` / `pathconf(_PC_NAME_MAX)` / df / etc.
+// Without this, go-fuse returns a zeroed StatfsOut and tools that
+// consult NameLen think every filename is too long ("name too long"
+// errors from mkdir/touch in some file managers and shells).
+//
+// We don't know the channel's remaining capacity, so block counts
+// are large-but-fictional: report ~1 PiB free out of 1 PiB total.
+// Inode counts mirror those — Telegram doesn't impose a per-channel
+// hard cap that maps cleanly to statfs.
+func (n *Node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
+	const (
+		bsize     uint32 = 4 << 20 // 4 MiB — matches our chunk size
+		oneEB     uint64 = 1 << 50 // 1 PiB worth of blocks at 4 MiB each = a lot
+		fakeFiles uint64 = 1 << 32 // 4 G inodes — plenty
+	)
+	out.Blocks = oneEB
+	out.Bfree = oneEB
+	out.Bavail = oneEB
+	out.Files = fakeFiles
+	out.Ffree = fakeFiles
+	out.Bsize = bsize
+	out.Frsize = bsize
+	out.NameLen = 255
+	return 0
 }
 
 // Getattr fills *fuse.AttrOut from the meta store.
