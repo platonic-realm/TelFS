@@ -1,27 +1,29 @@
 {{define "content"}}
 <h2>Profiles</h2>
-<p>
+<div class="row">
   <a href="/profiles/new" class="btn">Create</a>
-  <a href="/profiles/import" class="btn">Import bundle</a>
-</p>
+  <a href="/profiles/import" class="btn secondary">Import bundle</a>
+</div>
 {{if .Profiles}}
 <table>
-<tr><th>Name</th><th>Active</th><th></th></tr>
+<thead><tr><th>Name</th><th>Status</th><th class="actions"></th></tr></thead>
+<tbody>
 {{range .Profiles}}
 <tr>
-  <td><a href="/profiles/{{.}}">{{.}}</a></td>
-  <td>{{if eq . $.Active}}<strong>yes</strong>{{end}}</td>
-  <td>
+  <td><a href="/profiles/{{.}}"><strong>{{.}}</strong></a></td>
+  <td>{{if eq . $.Active}}<span class="pill acc">active</span>{{end}}</td>
+  <td class="actions">
     {{if ne . $.Active}}
     <form method="post" action="/profiles/{{.}}/use" style="display:inline">
       <input type="hidden" name="csrf" value="{{$.CSRF}}">
-      <button type="submit">Use</button>
+      <button type="submit" class="secondary">Use</button>
     </form>
     {{end}}
-    <a href="/profiles/{{.}}/export" class="btn">Export</a>
+    <a href="/profiles/{{.}}/export" class="btn secondary">Export</a>
   </td>
 </tr>
 {{end}}
+</tbody>
 </table>
 {{else}}
 <p><em>No profiles yet.</em></p>

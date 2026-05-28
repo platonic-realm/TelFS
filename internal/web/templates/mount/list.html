@@ -9,14 +9,14 @@
     <tbody>
       {{range .Supervised}}
       <tr>
-        <td><a href="/mount/{{.Profile}}">{{.Profile}}</a></td>
+        <td><a href="/mount/{{.Profile}}"><strong>{{.Profile}}</strong></a></td>
         <td><code>{{.Mountpoint}}</code></td>
-        <td>{{.Status}}</td>
-        <td>{{.Started}}</td>
-        <td>
+        <td><span class="pill {{.StatusKind}}">{{.Status}}</span></td>
+        <td><small>{{.Started}}</small></td>
+        <td class="actions">
           <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
-            <button type="submit">Stop</button>
+            <button type="submit" class="danger">Stop</button>
           </form>
         </td>
       </tr>
@@ -30,9 +30,9 @@
 
 {{if .External}}
 <section class="card">
-  <h3>External (not started by web)</h3>
-  <p><small>These were mounted from a separate terminal. Not stoppable from here.</small></p>
-  <ul>
+  <h3>External <span class="pill muted">not started by web</span></h3>
+  <p><small>Mounted from a separate terminal. Not stoppable from here.</small></p>
+  <ul class="plain">
     {{range .External}}<li><code>{{.}}</code></li>{{end}}
   </ul>
 </section>

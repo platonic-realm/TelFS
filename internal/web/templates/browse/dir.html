@@ -1,28 +1,30 @@
 {{define "content"}}
-<h2>{{.At}}{{if .P}}/{{.P}}{{end}}</h2>
-<p>
-  <a href="/browse">⌂ all mounts</a>
-  {{if not .IsRoot}} · <a href="{{.UpURL}}">↑ parent</a>{{end}}
-</p>
+<nav class="crumbs" aria-label="path">
+  <a href="/browse">all mounts</a>
+  <span class="sep">/</span>
+  <span><code>{{.At}}</code></span>
+  {{if .P}}<span class="sep">/</span><span><code>{{.P}}</code></span>{{end}}
+  {{if not .IsRoot}}<span class="sep">·</span><a href="{{.UpURL}}">↑ parent</a>{{end}}
+</nav>
 
 <table>
-  <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>
+  <thead><tr><th>Name</th><th class="num">Size</th><th>Modified</th><th></th></tr></thead>
   <tbody>
     {{range .Entries}}
-    <tr>
+    <tr class="{{if .IsDir}}dir{{else if .IsLink}}link{{else}}file{{end}}">
       <td>
         {{if .IsDir}}📁 <a href="{{.HrefDir}}">{{.Name}}/</a>
-        {{else if .IsLink}}🔗 {{.Name}}
+        {{else if .IsLink}}🔗 <span>{{.Name}}</span>
         {{else}}📄 <a href="{{.HrefFile}}">{{.Name}}</a>{{end}}
       </td>
-      <td>{{if not .IsDir}}{{humanBytes .Size}}{{end}}</td>
+      <td class="num">{{if not .IsDir}}{{humanBytes .Size}}{{end}}</td>
       <td><small>{{.Mtime}}</small></td>
-      <td>
+      <td class="actions">
         <form method="post" action="/browse/delete" style="display:inline" onsubmit="return confirm('Delete {{.Name}}?')">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <input type="hidden" name="at" value="{{$.At}}">
           <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
-          <button type="submit">Delete</button>
+          <button type="submit" class="danger">Delete</button>
         </form>
       </td>
     </tr>
@@ -38,8 +40,10 @@
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <input type="hidden" name="at" value="{{.At}}">
     <input type="hidden" name="p" value="{{.P}}">
-    <input type="file" name="file" required>
-    <button type="submit">Upload</button>
+    <div class="row">
+      <input type="file" name="file" required>
+      <button type="submit">Upload</button>
+    </div>
   </form>
   <p><small>Up to 2 GiB per file. Writes go through FUSE → chunk pipeline → channel.</small></p>
 </section>
@@ -50,8 +54,10 @@
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <input type="hidden" name="at" value="{{.At}}">
     <input type="hidden" name="p" value="{{.P}}">
-    <label>Name <input type="text" name="name" required></label>
-    <button type="submit">Create</button>
+    <div class="row">
+      <input type="text" name="name" placeholder="new-directory" required>
+      <button type="submit">Create</button>
+    </div>
   </form>
 </section>
 {{end}}

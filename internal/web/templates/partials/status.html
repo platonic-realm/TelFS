@@ -1,8 +1,8 @@
 {{define "content"}}
 <section class="card" hx-get="/partials/status" hx-trigger="every 10s" hx-swap="outerHTML">
-  <h2>Active Mounts <small>(auto-refresh 10s)</small></h2>
+  <h3>Active mounts <small>(auto-refresh 10s)</small></h3>
   {{if .Mounts}}
-    <ul>{{range .Mounts}}<li><code>{{.}}</code></li>{{end}}</ul>
+    <ul class="plain">{{range .Mounts}}<li><code>{{.}}</code></li>{{end}}</ul>
   {{else}}
     <p><em>No telfs mounts found.</em></p>
   {{end}}

@@ -23,6 +23,7 @@ type mountRow struct {
 	Profile    string
 	Mountpoint string
 	Status     string
+	StatusKind string // ok | err | muted — drives the .pill class
 	Started    string
 	AgeSeconds int64
 }
@@ -30,10 +31,12 @@ type mountRow struct {
 func (s *Server) mountList(w http.ResponseWriter, r *http.Request) {
 	d := mountListData{pageBase: s.basePage(w, r)}
 	for _, mp := range s.sup.List() {
+		st := mp.Status()
 		d.Supervised = append(d.Supervised, mountRow{
 			Profile:    mp.Profile,
 			Mountpoint: mp.Mountpoint,
-			Status:     mp.Status(),
+			Status:     st,
+			StatusKind: statusPillKind(st),
 			Started:    mp.Started.Format(time.RFC3339),
 			AgeSeconds: int64(time.Since(mp.Started).Seconds()),
 		})
@@ -41,6 +44,18 @@ func (s *Server) mountList(w http.ResponseWriter, r *http.Request) {
 	d.External = s.sup.ExternalMounts()
 	d.Profiles = listProfileNames()
 	s.renderTemplate(w, "mount/list.html", d)
+}
+
+func statusPillKind(s string) string {
+	switch {
+	case s == "running":
+		return "ok"
+	case strings.HasPrefix(s, "exited: ") && s != "exited":
+		return "err"
+	case s == "exited":
+		return "muted"
+	}
+	return "muted"
 }
 
 // ── /mount/new (form) ─────────────────────────────────────────────

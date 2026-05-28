@@ -1,85 +1,86 @@
 {{define "content"}}
+<h2>Dashboard</h2>
+
 <section class="card">
-  <h2>Profile</h2>
+  <h3>Profile</h3>
   <dl>
-    <dt>Active</dt><dd>{{.Profile}}</dd>
+    <dt>Active</dt><dd><strong>{{.Profile}}</strong></dd>
     <dt>Data dir</dt><dd><code>{{.DataDir}}</code></dd>
   </dl>
 </section>
 
 <section class="card">
-  <h2>Files</h2>
-  <table>
-    <tr><th>File</th><th>Size</th><th>Modified</th></tr>
-    {{range .Files}}
-    <tr>
-      <td><code>{{.Label}}</code></td>
-      <td>{{if eq .Size 0}}<em>missing</em>{{else}}{{humanBytes .Size}}{{end}}</td>
-      <td><small>{{.Mtime}}</small></td>
-    </tr>
-    {{end}}
-    <tr><td><code>cache/</code></td><td>{{humanBytes .CacheSize}}</td><td><small>{{.CacheN}} file(s)</small></td></tr>
-  </table>
-</section>
-
-<section class="card">
-  <h2>Channel</h2>
+  <h3>Channel</h3>
   {{if .Channel.Set}}
     <dl>
       <dt>Title</dt><dd>{{.Channel.Title}}</dd>
       <dt>ID</dt><dd><code>{{.Channel.ID}}</code></dd>
     </dl>
   {{else}}
-    <p><em>No channel bound.</em></p>
+    <p><em>No channel bound.</em> <a href="/channel/set">Bind one</a>.</p>
   {{end}}
 </section>
 
 {{if .HasMeta}}
 <section class="card">
-  <h2>Filesystem</h2>
+  <h3>Filesystem</h3>
   <dl>
     <dt>fs_uuid</dt><dd><code>{{.FSUUID}}</code></dd>
     <dt>chunk size</dt><dd>{{humanBytes .ChunkSize}}</dd>
+    <dt>encryption</dt><dd>
+      {{if .Crypto.Enabled}}
+        <span class="pill ok">enabled</span> <code>{{.Crypto.Mode}}</code>
+      {{else}}
+        <span class="pill muted">plaintext</span>
+      {{end}}
+    </dd>
+    {{if .LastSnap}}<dt>last snapshot</dt><dd>channel msg_id <code>{{.LastSnap}}</code></dd>{{end}}
   </dl>
-</section>
-
-<section class="card">
-  <h2>Encryption</h2>
-  {{if .Crypto.Enabled}}
-    <p>Enabled (<code>{{.Crypto.Mode}}</code>)</p>
-    <pre>{{.Crypto.Argon}}</pre>
-  {{else}}
-    <p><em>Plaintext — chunks uploaded as-is.</em></p>
-  {{end}}
-</section>
-
-<section class="card">
-  <h2>Last Snapshot</h2>
-  {{if .LastSnap}}
-    <p>channel msg_id: <code>{{.LastSnap}}</code></p>
-  {{else}}
-    <p><em>None recorded.</em></p>
-  {{end}}
+  {{if .Crypto.Enabled}}<pre>{{.Crypto.Argon}}</pre>{{end}}
 </section>
 {{end}}
 
+<section class="card">
+  <h3>Files</h3>
+  <table>
+    <thead><tr><th>File</th><th class="num">Size</th><th>Modified</th></tr></thead>
+    <tbody>
+    {{range .Files}}
+    <tr>
+      <td><code>{{.Label}}</code></td>
+      <td class="num">{{if eq .Size 0}}<em>missing</em>{{else}}{{humanBytes .Size}}{{end}}</td>
+      <td><small>{{.Mtime}}</small></td>
+    </tr>
+    {{end}}
+    <tr>
+      <td><code>cache/</code></td>
+      <td class="num">{{humanBytes .CacheSize}}</td>
+      <td><small>{{.CacheN}} file(s)</small></td>
+    </tr>
+    </tbody>
+  </table>
+</section>
+
 <section class="card" hx-get="/partials/status" hx-trigger="every 10s" hx-swap="outerHTML">
-  <h2>Active Mounts <small>(auto-refresh 10s)</small></h2>
+  <h3>Active mounts <small>(auto-refresh 10s)</small></h3>
   {{if .Mounts}}
-    <ul>{{range .Mounts}}<li><code>{{.}}</code></li>{{end}}</ul>
+    <ul class="plain">{{range .Mounts}}<li><code>{{.}}</code></li>{{end}}</ul>
   {{else}}
     <p><em>No telfs mounts found.</em></p>
   {{end}}
 </section>
 
 <section class="card">
-  <h2>Profiles</h2>
+  <h3>Profiles</h3>
   {{if .Profiles}}
-    <ul>
-    {{range .Profiles}}<li><a href="/profiles/{{.}}">{{.}}</a>{{if eq . $.Active}} <strong>(active)</strong>{{end}}</li>{{end}}
+    <ul class="plain">
+    {{range .Profiles}}<li>
+      <a href="/profiles/{{.}}">{{.}}</a>
+      {{if eq . $.Active}}<span class="pill acc">active</span>{{end}}
+    </li>{{end}}
     </ul>
   {{else}}
-    <p><em>No profiles. <a href="/profiles/new">Create one</a>.</em></p>
+    <p><em>No profiles.</em> <a href="/profiles/new">Create one</a>.</p>
   {{end}}
 </section>
 {{end}}

@@ -2,23 +2,29 @@
 <h2>Mount: {{.Profile}}</h2>
 {{if not .Found}}
 <p><em>No supervised mount for this profile.</em></p>
-<p><a href="/mount" class="btn">Back</a> <a href="/mount/new" class="btn">Start one</a></p>
+<div class="row">
+  <a href="/mount" class="btn secondary">Back</a>
+  <a href="/mount/new" class="btn">Start one</a>
+</div>
 {{else}}
 <section class="card">
   <dl>
     <dt>Mountpoint</dt><dd><code>{{.Mountpoint}}</code></dd>
-    <dt>Started</dt><dd>{{.Started}}</dd>
+    <dt>Started</dt><dd><small>{{.Started}}</small></dd>
+    <dt>Status</dt><dd><code>{{.Status}}</code></dd>
   </dl>
-  <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <button type="submit">Stop</button>
-  </form>
-  <a href="/mount" class="btn">Back to list</a>
+  <div class="row">
+    <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" class="danger">Stop</button>
+    </form>
+    <a href="/mount" class="btn secondary">Back to list</a>
+    <a href="/browse/dir?at={{.Mountpoint}}" class="btn secondary">Browse files</a>
+  </div>
 </section>
 
 <section class="card">
-  <h3>Live log</h3>
-  <p><small>Polled every 2 s — last 16 KB shown.</small></p>
+  <h3>Live log <small>polled every 2 s — last 16 KB</small></h3>
   <div id="log" hx-get="/mount/{{.Profile}}/log" hx-trigger="load, every 2s" hx-swap="innerHTML">
     <em>loading…</em>
   </div>
