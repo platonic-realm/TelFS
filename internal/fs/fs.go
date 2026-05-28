@@ -12,6 +12,7 @@ import (
 	"telfs/internal/chunk"
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
+	"telfs/internal/trash"
 )
 
 // Backend bundles the dependencies every Node needs. It's shared by
@@ -27,6 +28,12 @@ type Backend struct {
 	Cipher    crypto.Cipher // nil → NoopCipher (plaintext mode)
 	ChunkSize int64
 	ReadOnly  bool
+
+	// Trash safety-net. When TrashIno != 0, Unlink and Rmdir reroute
+	// the dirent into /.trash/ instead of really deleting. A TTL GC
+	// running outside the FS layer reaps aged entries. TrashIno == 0
+	// (the default) means the FS layer behaves as if trash is off.
+	TrashIno int64
 }
 
 // canWrite reports whether the backend supports mutating ops. False when
@@ -377,6 +384,20 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if in.Kind == meta.KindDir {
 		return syscall.EISDIR
 	}
+	// Refuse to remove the trash dir itself — `rm /.trash` would orphan
+	// every parked entry. The user can `telfs trash empty` instead.
+	if n.ino == meta.RootIno && in.Ino == n.backend.TrashIno {
+		return syscall.EPERM
+	}
+	// Trash intercept: reroute the unlink to /.trash unless we're
+	// already inside /.trash (where unlinks really delete, so the GC
+	// and `telfs trash empty` can clean up).
+	if n.backend.TrashIno != 0 && n.ino != n.backend.TrashIno {
+		if err := trashRename(ctx, n.backend, n.ino, name); err != nil {
+			return mapMetaErr(err)
+		}
+		return 0
+	}
 	if err := n.backend.Meta.Unlink(ctx, n.ino, name); err != nil {
 		return mapMetaErr(err)
 	}
@@ -395,10 +416,32 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if in.Kind != meta.KindDir {
 		return syscall.ENOTDIR
 	}
+	// Never let anyone rmdir the trash root via FUSE.
+	if n.ino == meta.RootIno && in.Ino == n.backend.TrashIno {
+		return syscall.EPERM
+	}
+	// Trash intercept for empty dirs. The kernel issues per-file
+	// unlinks before rmdir, so a `rm -rf foo/` reaches us as N file
+	// unlinks (each moved into trash) followed by rmdir of the now-
+	// empty foo. The dir itself ends up in trash as a sibling of those
+	// files — a flat layout that's slightly less ergonomic than a
+	// preserved tree but bounded scope for v1.
+	if n.backend.TrashIno != 0 && n.ino != n.backend.TrashIno {
+		if err := trashRename(ctx, n.backend, n.ino, name); err != nil {
+			return mapMetaErr(err)
+		}
+		return 0
+	}
 	if err := n.backend.Meta.Unlink(ctx, n.ino, name); err != nil {
 		return mapMetaErr(err)
 	}
 	return 0
+}
+
+// trashRename is the shared move-to-trash helper used by Unlink and
+// Rmdir.
+func trashRename(ctx context.Context, b *Backend, parentIno int64, name string) error {
+	return trash.MoveToTrash(ctx, b.Meta, b.TrashIno, parentIno, name)
 }
 
 // Rename relocates oldName under n to newName under newParent. The

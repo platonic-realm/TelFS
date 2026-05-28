@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -152,6 +153,19 @@ const (
 	MaxChunkSize int64 = 1536 << 20 // 1.5 GiB
 )
 
+// Trash safety-net KV keys. When KVTrashEnabled is set to "1", every
+// kernel-issued unlink/rmdir from FUSE is rerouted to a top-level
+// `.trash/` directory; a TTL GC unlinks them for real after
+// KVTrashTTLSecs seconds.
+const (
+	KVTrashEnabled = "trash_enabled"
+	KVTrashTTLSecs = "trash_ttl_secs"
+)
+
+// DefaultTrashTTLSecs is the fallback TTL when trash is enabled
+// without an explicit duration — one week.
+const DefaultTrashTTLSecs int64 = 7 * 24 * 60 * 60
+
 // initSchema creates tables and seeds the root inode if it doesn't exist.
 func (s *Store) initSchema(ctx context.Context) error {
 	for _, stmt := range splitStmts(schemaSQL) {
@@ -237,6 +251,58 @@ func (s *Store) SetChunkSize(ctx context.Context, n int64) error {
 		return err
 	}
 	return s.PutKV(ctx, KVChunkSize, []byte(strconv.FormatInt(n, 10)))
+}
+
+// TrashEnabled reports whether the trash safety-net is active for this
+// FS. Default: false.
+func (s *Store) TrashEnabled(ctx context.Context) (bool, error) {
+	v, err := s.GetKV(ctx, KVTrashEnabled)
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return string(v) == "1", nil
+}
+
+// SetTrashEnabled toggles the trash safety-net. The caller is
+// responsible for any one-time bootstrap (e.g., creating /.trash).
+func (s *Store) SetTrashEnabled(ctx context.Context, on bool) error {
+	if on {
+		return s.PutKV(ctx, KVTrashEnabled, []byte("1"))
+	}
+	return s.DeleteKV(ctx, KVTrashEnabled)
+}
+
+// TrashTTL returns the configured retention as a duration, or the
+// default (7 days) if the kv is missing.
+func (s *Store) TrashTTL(ctx context.Context) (time.Duration, error) {
+	v, err := s.GetKV(ctx, KVTrashTTLSecs)
+	if errors.Is(err, ErrNotFound) {
+		return time.Duration(DefaultTrashTTLSecs) * time.Second, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(string(v), 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("trash_ttl_secs kv malformed (%q)", string(v))
+	}
+	return time.Duration(n) * time.Second, nil
+}
+
+// SetTrashTTL writes the retention. A zero duration is treated as the
+// default. Negative durations are rejected.
+func (s *Store) SetTrashTTL(ctx context.Context, d time.Duration) error {
+	if d < 0 {
+		return fmt.Errorf("trash ttl must be non-negative")
+	}
+	secs := int64(d / time.Second)
+	if secs == 0 {
+		secs = DefaultTrashTTLSecs
+	}
+	return s.PutKV(ctx, KVTrashTTLSecs, []byte(strconv.FormatInt(secs, 10)))
 }
 
 // ValidateChunkSize enforces the [MinChunkSize, MaxChunkSize]

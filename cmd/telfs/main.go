@@ -37,6 +37,7 @@ import (
 	"telfs/internal/meta"
 	"telfs/internal/snapshot"
 	"telfs/internal/tg"
+	"telfs/internal/trash"
 )
 
 // Build-time metadata. Overridden via -ldflags at release:
@@ -74,6 +75,8 @@ Usage:
                                     HTTP management UI (default 127.0.0.1:8080).
   telfs fsck [--fix] [--stop-after N]
                                     Verify every chunk_map row against the channel.
+  telfs trash {enable [--ttl D], disable, status, list, empty}
+                                    Manage the rm safety-net at /.trash.
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
 
 Environment:
@@ -128,6 +131,8 @@ func run() error {
 		return cmdFsck(ctx, os.Args[2:])
 	case "gc":
 		return cmdGC(ctx, os.Args[2:])
+	case "trash":
+		return cmdTrash(ctx, os.Args[2:])
 	case "debug":
 		return cmdDebug(ctx, os.Args[2:])
 	default:
@@ -441,6 +446,22 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return err
 	}
 
+	// Trash safety-net. Bootstrap /.trash if enabled; the inode is
+	// passed to the FUSE backend so Unlink/Rmdir reroute into it. The
+	// GC goroutine is spawned inside RunSession below so its ctx ties
+	// to the session lifetime.
+	trashEnabled, err := metaStore.TrashEnabled(signalCtx)
+	if err != nil {
+		return err
+	}
+	var trashIno int64
+	if trashEnabled && !*readonly {
+		trashIno, err = trash.EnsureRootDir(signalCtx, metaStore)
+		if err != nil {
+			return fmt.Errorf("trash: %w", err)
+		}
+	}
+
 	err = client.RunSession(context.Background(), func(sessCtx context.Context, sess *tg.Session) error {
 		fetcher := &chunk.TGFetcher{Session: sess}
 		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher, cipher)
@@ -461,6 +482,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			Cipher:    cipher,
 			ChunkSize: chunkSize,
 			ReadOnly:  *readonly,
+			TrashIno:  trashIno,
 		})
 		if err != nil {
 			return err
@@ -477,6 +499,19 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			_ = snapMgr.Run(snapCtx)
 			close(snapDone)
 		}()
+
+		// Trash GC: reads ttl on every tick so changes via
+		// `telfs trash enable --ttl <D>` take effect without remount.
+		if trashIno != 0 {
+			go trash.Run(sessCtx, metaStore, trashIno,
+				func() time.Duration {
+					d, err := metaStore.TrashTTL(sessCtx)
+					if err != nil {
+						return time.Duration(meta.DefaultTrashTTLSecs) * time.Second
+					}
+					return d
+				}, trash.DefaultGCInterval)
+		}
 
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		<-signalCtx.Done()
