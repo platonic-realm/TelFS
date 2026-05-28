@@ -108,11 +108,11 @@ func (c *Client) ListChannels(ctx context.Context) ([]ChannelInfo, error) {
 }
 
 // SetChannel is a one-shot wrapper around Session.SetChannel.
-func (c *Client) SetChannel(ctx context.Context, id int64) (ChannelInfo, error) {
+func (c *Client) SetChannel(ctx context.Context, id, accessHash int64) (ChannelInfo, error) {
 	var out ChannelInfo
 	err := c.RunSession(ctx, func(ctx context.Context, s *Session) error {
 		var err error
-		out, err = s.SetChannel(ctx, id)
+		out, err = s.SetChannel(ctx, id, accessHash)
 		return err
 	})
 	return out, err

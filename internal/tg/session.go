@@ -115,7 +115,37 @@ func (s *Session) ResolveChannel(ctx context.Context, id int64) (ChannelInfo, er
 
 // SetChannel resolves the channel id, validates it can be posted to, and
 // persists it to the config. Mutates s.cfg in-place.
-func (s *Session) SetChannel(ctx context.Context, id int64) (ChannelInfo, error) {
+//
+// For user accounts (dialogs accessible) the normal path is to look the
+// channel up by id and harvest its access_hash from the dialog list.
+// For bot accounts, dialogs return nothing — pass the access_hash
+// explicitly (non-zero) and we'll trust it, skipping the scan.
+func (s *Session) SetChannel(ctx context.Context, id int64, accessHash int64) (ChannelInfo, error) {
+	if accessHash != 0 {
+		// Trust-the-caller path. Used by `channel set --access-hash` and
+		// is the only way bots can bind a channel.
+		nid, err := NormalizeChannelID(id)
+		if err != nil {
+			return ChannelInfo{}, err
+		}
+		info := ChannelInfo{
+			ID:         nid,
+			AccessHash: accessHash,
+			Title:      fmt.Sprintf("channel-%d", nid),
+			CanPost:    true,
+		}
+		s.cfg.Channel = config.ChannelConfig{
+			ID:         info.ID,
+			AccessHash: info.AccessHash,
+			Title:      info.Title,
+			Username:   info.Username,
+		}
+		if err := s.cfg.Save(); err != nil {
+			return ChannelInfo{}, fmt.Errorf("save config: %w", err)
+		}
+		return info, nil
+	}
+
 	info, err := s.ResolveChannel(ctx, id)
 	if err != nil {
 		return ChannelInfo{}, err

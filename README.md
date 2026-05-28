@@ -23,6 +23,37 @@ End-to-end verified on a real Telegram account + private channel:
 | Encryption at rest (AES-256-GCM, Argon2id KDF) | ✓ — chunk bytes only; metadata still plaintext |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
+## Bot vs user auth
+
+TelFS authenticates as either:
+
+| Mode | Setup | Limits |
+|---|---|---|
+| **User** (default) | `telfs login` → phone + code + 2FA | Full dialog access, can scan channels by id, 2 GB per upload via MTProto |
+| **Bot** | `telfs login --bot <token>` (token from @BotFather) | Same 2 GB per upload (MTProto — NOT the 50 MB HTTP Bot API), but bots can't enumerate dialogs so `channel set` needs both `--access-hash` and `<id>` |
+
+Bot mode workflow:
+
+```sh
+# 1. Get the channel access_hash from a user-account TelFS, OR from your
+#    own preferred tool. With a user profile already set up:
+TELFS_PROFILE=user-acct ./bin/telfs channel info        # prints access_hash
+
+# 2. Talk to @BotFather, create a bot, get a token.
+# 3. In the Telegram app, add the bot to your private channel as ADMIN.
+
+# 4. New profile + bot login + manual channel binding:
+./bin/telfs profile create my-bot
+TELFS_PROFILE=my-bot ./bin/telfs login --bot 123456:ABCDEF…
+TELFS_PROFILE=my-bot ./bin/telfs channel set --access-hash <H> <channel-id>
+TELFS_PROFILE=my-bot ./bin/telfs mount ~/External
+```
+
+The MTProto pipeline is identical between user and bot modes — same
+chunker, same encryption, same snapshot cadence. The only behavioral
+differences are: dialog enumeration is empty for bots, and the bot
+must be a channel admin before posting.
+
 ## Quick start
 
 You need Go 1.22+, FUSE (`fusermount` from your distro), and a

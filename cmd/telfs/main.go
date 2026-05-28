@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,9 +42,14 @@ import (
 const usage = `telfs — FUSE filesystem backed by a Telegram channel
 
 Usage:
-  telfs login                       Authenticate against Telegram (MTProto).
+  telfs login [--bot <token>]       Authenticate against Telegram (MTProto user
+                                      auth by default; --bot uses a BotFather
+                                      token via auth.ImportBotAuthorization).
   telfs channel list                List your channels (id, title, post permission).
-  telfs channel set <id>            Configure the backing channel.
+  telfs channel set [--access-hash N] <id>
+                                    Configure the backing channel. In bot mode
+                                    --access-hash is required (bots can't
+                                    auto-discover it from the dialog list).
   telfs channel info                Show the currently configured channel.
   telfs channel ping                Round-trip a test message (smoke test).
   telfs mount [flags] <mountpoint>  Mount the filesystem.
@@ -90,7 +96,7 @@ func run() error {
 		fmt.Print(usage)
 		return nil
 	case "login":
-		return cmdLogin(ctx)
+		return cmdLogin(ctx, os.Args[2:])
 	case "channel":
 		return cmdChannel(ctx, os.Args[2:])
 	case "mount":
@@ -116,10 +122,25 @@ func run() error {
 	}
 }
 
-func cmdLogin(ctx context.Context) error {
+func cmdLogin(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("login", flag.ContinueOnError)
+	botToken := fs.String("bot", "", "log in as a bot using the given @BotFather token (overrides any phone-auth state)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	// --bot promotes the profile to bot mode and persists the token.
+	// Subsequent `telfs login` (without --bot) on this profile picks
+	// the same mode automatically because cfg.AuthMode is now "bot".
+	if *botToken != "" {
+		cfg.AuthMode = config.AuthModeBot
+		cfg.BotToken = strings.TrimSpace(*botToken)
+		if err := cfg.Save(); err != nil {
+			return err
+		}
 	}
 	client, err := tg.New(cfg)
 	if err != nil {
@@ -141,14 +162,7 @@ func cmdChannel(ctx context.Context, args []string) error {
 	case "list":
 		return cmdChannelList(ctx, cfg)
 	case "set":
-		if len(args) < 2 {
-			return errors.New("channel set: missing channel id")
-		}
-		id, err := strconv.ParseInt(args[1], 10, 64)
-		if err != nil {
-			return fmt.Errorf("channel set: invalid id %q: %w", args[1], err)
-		}
-		return cmdChannelSet(ctx, cfg, id)
+		return cmdChannelSet(ctx, cfg, args[1:])
 	case "info":
 		return cmdChannelInfo(cfg)
 	case "ping":
@@ -190,12 +204,32 @@ func cmdChannelList(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
-func cmdChannelSet(ctx context.Context, cfg *config.Config, id int64) error {
+func cmdChannelSet(ctx context.Context, cfg *config.Config, args []string) error {
+	fs := flag.NewFlagSet("channel set", flag.ContinueOnError)
+	accessHash := fs.Int64("access-hash", 0, "channel access_hash (REQUIRED in bot mode — bots cannot enumerate dialogs to discover it)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: telfs channel set [--access-hash N] <channel-id>")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return errors.New("channel set: expected exactly one <channel-id>")
+	}
+	id, err := strconv.ParseInt(fs.Arg(0), 10, 64)
+	if err != nil {
+		return fmt.Errorf("channel set: invalid id %q: %w", fs.Arg(0), err)
+	}
+	if cfg.EffectiveAuthMode() == config.AuthModeBot && *accessHash == 0 {
+		return errors.New("channel set: --access-hash is required in bot mode (bots can't auto-discover it; copy it from a user-account profile or from another tool)")
+	}
 	client, err := tg.New(cfg)
 	if err != nil {
 		return err
 	}
-	info, err := client.SetChannel(ctx, id)
+	info, err := client.SetChannel(ctx, id, *accessHash)
 	if err != nil {
 		return err
 	}

@@ -39,11 +39,28 @@ const (
 	activeFile = "active"
 )
 
+// AuthMode picks the authentication style. Default ("" / "user") is
+// interactive phone+code+2FA against a real Telegram user account.
+// "bot" auths via auth.ImportBotAuthorization using a bot token from
+// @BotFather — same MTProto pipeline, same 2 GB per upload limit.
+type AuthMode string
+
+const (
+	AuthModeUser AuthMode = "user"
+	AuthModeBot  AuthMode = "bot"
+)
+
 // Config is the persistent TelFS configuration.
 type Config struct {
 	APIID   int    `toml:"api_id"`
 	APIHash string `toml:"api_hash"`
 	Phone   string `toml:"phone,omitempty"`
+	// AuthMode selects user (default) or bot login style. When "bot",
+	// BotToken must be set and Phone is ignored.
+	AuthMode AuthMode `toml:"auth_mode,omitempty"`
+	// BotToken is the @BotFather token used for bot auth. Sensitive —
+	// possession of this string gives full bot control.
+	BotToken string `toml:"bot_token,omitempty"`
 	// DC overrides gotd's default starting datacenter (which is 2). Useful in
 	// environments where DC 2's primary IP is firewalled. Telegram will
 	// migrate the connection to the user's home DC after auth regardless of
@@ -54,6 +71,15 @@ type Config struct {
 
 	// DataDir is the resolved location of the .telfs/ directory. Not serialized.
 	DataDir string `toml:"-"`
+}
+
+// EffectiveAuthMode returns User unless explicitly set to Bot — handles
+// the empty-string-from-old-configs case.
+func (c *Config) EffectiveAuthMode() AuthMode {
+	if c.AuthMode == AuthModeBot {
+		return AuthModeBot
+	}
+	return AuthModeUser
 }
 
 // ChannelConfig stores the resolved peer reference for the backing channel.
