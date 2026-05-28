@@ -14,6 +14,7 @@ import (
 // Environment variables. Set any of these to override the on-disk config.
 const (
 	EnvDir     = "TELFS_DIR"
+	EnvProfile = "TELFS_PROFILE"
 	EnvAPIID   = "TELFS_API_ID"
 	EnvAPIHash = "TELFS_API_HASH"
 	EnvPhone   = "TELFS_PHONE"
@@ -27,6 +28,15 @@ const (
 	SessionFile    = "session.json"
 	DBFile         = "db.sqlite"
 	CacheDir       = "cache"
+)
+
+// Profile-related paths.
+const (
+	// DefaultProfileName is what we use when no profile is selected.
+	DefaultProfileName = "default"
+	// activeFile holds the name of the currently-active profile,
+	// updated by `telfs profile use <name>`. Located in xdgConfigHome().
+	activeFile = "active"
 )
 
 // Config is the persistent TelFS configuration.
@@ -68,10 +78,23 @@ func (c *Config) DBPath() string { return filepath.Join(c.DataDir, DBFile) }
 // CachePath returns the path of the on-disk chunk cache.
 func (c *Config) CachePath() string { return filepath.Join(c.DataDir, CacheDir) }
 
-// DefaultDir returns the data-dir path, honoring $TELFS_DIR; default is
-// `$PWD/.telfs`. Mounting from a fresh directory yields a fresh filesystem,
-// which is useful during development.
+// DefaultDir resolves the data-dir path. Lookup order:
+//
+//  1. $TELFS_PROFILE set     → ~/.config/telfs/profiles/<value>/
+//  2. activeFile exists       → ~/.config/telfs/profiles/<contents>/
+//  3. $TELFS_DIR set          → that exact path (legacy)
+//  4. fallback                → $PWD/.telfs (legacy)
+//
+// The legacy paths keep pre-profile workflows working unchanged —
+// users who never run `telfs profile use` see the same behavior as
+// before this feature landed.
 func DefaultDir() (string, error) {
+	if name := strings.TrimSpace(os.Getenv(EnvProfile)); name != "" {
+		return ProfileDir(name)
+	}
+	if name, ok := readActiveProfile(); ok {
+		return ProfileDir(name)
+	}
 	if d := os.Getenv(EnvDir); d != "" {
 		return d, nil
 	}
@@ -80,6 +103,106 @@ func DefaultDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(cwd, DefaultDirName), nil
+}
+
+// xdgConfigHome returns the canonical TelFS config root —
+// $XDG_CONFIG_HOME/telfs if XDG_CONFIG_HOME is set, otherwise
+// ~/.config/telfs.
+func xdgConfigHome() (string, error) {
+	if x := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); x != "" {
+		return filepath.Join(x, "telfs"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "telfs"), nil
+}
+
+// ProfilesRoot returns the directory containing all named profiles.
+func ProfilesRoot() (string, error) {
+	root, err := xdgConfigHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "profiles"), nil
+}
+
+// ProfileDir returns the data-dir for the named profile. Name is
+// validated to prevent path traversal.
+func ProfileDir(name string) (string, error) {
+	if err := ValidateProfileName(name); err != nil {
+		return "", err
+	}
+	root, err := ProfilesRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, name), nil
+}
+
+// ValidateProfileName ensures the name is a single safe identifier —
+// letters, digits, dash, underscore — and not empty.
+func ValidateProfileName(name string) error {
+	if name == "" {
+		return fmt.Errorf("profile name must not be empty")
+	}
+	for _, r := range name {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_'
+		if !ok {
+			return fmt.Errorf("profile name %q contains invalid character %q (allowed: a-z A-Z 0-9 - _)", name, r)
+		}
+	}
+	return nil
+}
+
+// readActiveProfile reads the profile name written by `telfs profile use`.
+// Returns (name, true) on success, (",", false) if the file doesn't exist
+// or is empty/invalid (callers should fall back to the next resolution step).
+func readActiveProfile() (string, bool) {
+	root, err := xdgConfigHome()
+	if err != nil {
+		return "", false
+	}
+	b, err := os.ReadFile(filepath.Join(root, activeFile))
+	if err != nil {
+		return "", false
+	}
+	name := strings.TrimSpace(string(b))
+	if name == "" || ValidateProfileName(name) != nil {
+		return "", false
+	}
+	return name, true
+}
+
+// SetActiveProfile writes the named profile to ~/.config/telfs/active so
+// it becomes the default for subsequent commands.
+func SetActiveProfile(name string) error {
+	if err := ValidateProfileName(name); err != nil {
+		return err
+	}
+	root, err := xdgConfigHome()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, activeFile), []byte(name+"\n"), 0o600)
+}
+
+// ActiveProfile returns the currently-active profile name. Returns
+// DefaultProfileName when no profile selection is in effect, or "" if
+// the resolution falls back to a legacy ./.telfs / $TELFS_DIR layout.
+func ActiveProfile() string {
+	if name := strings.TrimSpace(os.Getenv(EnvProfile)); name != "" {
+		return name
+	}
+	if name, ok := readActiveProfile(); ok {
+		return name
+	}
+	return ""
 }
 
 // Load reads the on-disk config (if any) and applies env-variable overrides.

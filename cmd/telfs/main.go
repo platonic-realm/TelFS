@@ -51,14 +51,18 @@ Usage:
   telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
   telfs encrypt init                Enable AES-256-GCM for this filesystem.
   telfs encrypt status              Show whether encryption is enabled.
+  telfs profile {list,show,create,delete,use,export,import}
+                                    Manage multiple profiles (accounts/channels).
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
 
 Environment:
-  TELFS_DIR        Data directory (default: ./.telfs)
+  TELFS_PROFILE    Active profile name (overrides ~/.config/telfs/active)
+  TELFS_DIR        Data directory (legacy; ignored when TELFS_PROFILE is set)
   TELFS_API_ID     Telegram API ID (https://my.telegram.org/apps)
   TELFS_API_HASH   Telegram API hash
   TELFS_PHONE      Phone number for login (prompted if unset)
   TELFS_DC         Starting datacenter override (default: gotd's DC 2)
+  TELFS_PASSPHRASE FS encryption passphrase (skip the prompt)
 `
 
 func main() {
@@ -91,6 +95,8 @@ func run() error {
 		return cmdInit(ctx, os.Args[2:])
 	case "encrypt":
 		return cmdEncrypt(ctx, os.Args[2:])
+	case "profile":
+		return cmdProfile(ctx, os.Args[2:])
 	case "gc":
 		return cmdGC(ctx, os.Args[2:])
 	case "debug":
