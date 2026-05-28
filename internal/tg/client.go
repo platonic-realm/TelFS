@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
@@ -45,11 +46,18 @@ func New(cfg *config.Config) (*Client, error) {
 	return &Client{cfg: cfg, tg: tgc}, nil
 }
 
-// Run executes fn within an authenticated MTProto session. If the local
-// session is missing or expired, fn is not invoked and ErrNotAuthorized is
-// returned.
+// Run executes fn within an authenticated MTProto session. If no session
+// file exists, fn is not invoked and ErrNotAuthorized is returned without
+// any network round-trip.
+//
+// gotd's telegram.Client.Run swallows context.Canceled to nil; we
+// re-surface it via ctx.Err() so callers can distinguish a clean cancel
+// from "the work succeeded with empty results."
 func (c *Client) Run(ctx context.Context, fn func(ctx context.Context, api *tg.Client) error) error {
-	return c.tg.Run(ctx, func(ctx context.Context) error {
+	if _, err := os.Stat(c.cfg.SessionPath()); errors.Is(err, os.ErrNotExist) {
+		return ErrNotAuthorized
+	}
+	err := c.tg.Run(ctx, func(ctx context.Context) error {
 		status, err := c.tg.Auth().Status(ctx)
 		if err != nil {
 			return fmt.Errorf("auth status: %w", err)
@@ -59,4 +67,8 @@ func (c *Client) Run(ctx context.Context, fn func(ctx context.Context, api *tg.C
 		}
 		return fn(ctx, c.tg.API())
 	})
+	if err == nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
