@@ -18,6 +18,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /{$}", s.dashboardIndex)
 	s.mux.HandleFunc("GET /partials/status", s.statusPartial)
 
+	// First-run setup wizard.
+	s.mux.HandleFunc("GET /setup", s.setupWizard)
+	s.mux.HandleFunc("POST /setup/skip", s.setupSkip)
+
 	// Profile CRUD.
 	s.mux.HandleFunc("GET /profiles", s.profilesList)
 	s.mux.HandleFunc("GET /profiles/new", s.profilesNewForm)
@@ -74,6 +78,7 @@ func (s *Server) registerRoutes() {
 func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 	t, err := template.New("").Funcs(template.FuncMap{
 		"humanBytes": humanBytesTpl,
+		"add1":       func(i int) int { return i + 1 },
 	}).ParseFS(templatesFS, "templates/layout.html", "templates/"+name)
 	if err != nil {
 		s.opts.Logger.Printf("template parse %s: %v", name, err)

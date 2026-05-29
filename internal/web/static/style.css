@@ -479,3 +479,48 @@ ul.plain li:last-child { border-bottom: none; }
   margin-top: .15rem;
   color: var(--fg-muted);
 }
+
+/* ─── /setup wizard ──────────────────────────────────────────────── */
+ol.wizard-stepper {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.wizard-step {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  padding: .35rem 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.wizard-step:last-child { border-bottom: none; }
+.wizard-step.done .wizard-step-label   { color: var(--fg-muted); text-decoration: line-through; }
+.wizard-step.skipped .wizard-step-label { color: var(--fg-muted); font-style: italic; }
+.wizard-step.current .wizard-step-label { font-weight: 600; }
+.wizard-current {
+  border-color: var(--acc);
+}
+.wizard-current h3 { margin-top: 0; }
+.wizard-current h4 {
+  margin-top: 1rem;
+  margin-bottom: .15rem;
+  font-size: .85rem;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--fg-muted);
+}
+.wizard-actions {
+  display: flex;
+  gap: .5rem;
+  align-items: center;
+  margin-top: 1rem;
+}
+.btn.muted, button.muted {
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px solid var(--border-soft);
+}
+.btn.muted:hover, button.muted:hover {
+  background: var(--bg-elev);
+  color: var(--fg);
+}

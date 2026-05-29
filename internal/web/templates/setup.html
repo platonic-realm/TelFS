@@ -1,0 +1,68 @@
+{{define "content"}}
+<h2>Setup</h2>
+
+{{if .Complete}}
+  <section class="card">
+    <h3><span class="pill ok">all set</span> You're ready to use TelFS.</h3>
+    <p>Every onboarding step is complete. <a href="/">Open the dashboard</a> or <a href="/browse">browse your files</a>.</p>
+  </section>
+{{else}}
+  <section class="card" id="wizard-stepper">
+    <h3>Progress</h3>
+    <ol class="wizard-stepper">
+      {{range $i, $step := .Steps}}
+        <li class="wizard-step
+          {{if $step.Done}}done{{end}}
+          {{if eq $i $.CurrentIdx}}current{{end}}
+          {{if index $.Skipped $i}}skipped{{end}}">
+          {{if $step.Done}}
+            <span class="pill ok">done</span>
+          {{else if eq $i $.CurrentIdx}}
+            <span class="pill acc">step {{add1 $i}}</span>
+          {{else if index $.Skipped $i}}
+            <span class="pill muted">skipped</span>
+          {{else}}
+            <span class="pill muted">step {{add1 $i}}</span>
+          {{end}}
+          <span class="wizard-step-label">{{$step.Label}}</span>
+        </li>
+      {{end}}
+    </ol>
+  </section>
+
+  {{if ge .CurrentIdx 0}}
+    {{with index .Steps .CurrentIdx}}
+      <section class="card wizard-current">
+        <h3>Step {{add1 $.CurrentIdx}} of {{len $.Steps}} — {{.Label}}</h3>
+        {{if .Optional}}<p><span class="pill muted">optional</span> You can skip this step. <em>{{.Why}}</em></p>{{end}}
+        <p>{{.Detail}}</p>
+        <h4>Expected outcome</h4>
+        <p><small>{{.Outcome}}</small></p>
+        <div class="wizard-actions">
+          <a href="{{.Href}}" class="btn primary">{{if .CTA}}{{.CTA}}{{else}}Open this step{{end}} →</a>
+          {{if .Optional}}
+            <form method="post" action="/setup/skip" style="display:inline">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="idx" value="{{$.CurrentIdx}}">
+              <button type="submit" class="btn muted">Skip for now</button>
+            </form>
+          {{end}}
+        </div>
+      </section>
+    {{end}}
+  {{end}}
+
+  <section class="card">
+    <h4>What this wizard does</h4>
+    <p><small>
+      The setup wizard tracks five onboarding steps and points you at
+      the right form for whichever one comes next. It does not perform
+      any actions on its own — every step links to the same dedicated
+      form the navigation bar exposes, so power users can ignore the
+      wizard entirely. State (done / skipped) is derived from the
+      filesystem each time you load this page, so refreshing always
+      shows the current truth.
+    </small></p>
+  </section>
+{{end}}
+{{end}}

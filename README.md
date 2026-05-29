@@ -498,6 +498,13 @@ phone login + bot-token login, channel binding, encryption
 initialization, mount supervisor with HTMX-polled live log tail, and a
 file browser that reads/writes through a chosen FUSE mountpoint.
 
+First-time users get a guided onboarding flow at `/setup`. The wizard
+tracks five conceptual steps (API credentials → login → channel →
+optional encryption → first mount), surfaces only the current step in
+detail, and explains what each step accomplishes and what success
+looks like. State is derived from the filesystem on every page load —
+there's no separate "wizard progress" to keep in sync.
+
 ```sh
 telfs web                                  # 127.0.0.1:8080, no auth
 telfs web --listen 0.0.0.0:8080 --token $(openssl rand -hex 32)
@@ -760,8 +767,6 @@ with data.
   FSes via deterministic per-content nonces (opt-in; the standard
   random-nonce mode stays the default since convergent encryption
   enables a confirmation-of-file attack on the channel observer).
-- **First-run wizard in the web UI** — guide a new user through
-  profile/login/channel/encryption/mount in one form.
 
 See the [issues](https://github.com/platonic-realm/TelFS/issues) tab
 for the current state.

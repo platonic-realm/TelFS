@@ -58,6 +58,14 @@ type setupStep struct {
 	Done  bool
 	Href  string
 	Why   string // optional helper text shown for the current pending step
+	// Optional — populated only by the wizard. Empty for the dashboard
+	// checklist render. Detail is the longer explanation, Outcome is
+	// what the user can expect to see after completing the step, and
+	// Optional flags steps the user is allowed to skip.
+	Detail   string
+	Outcome  string
+	Optional bool
+	CTA      string // call-to-action label on the wizard page; default "Open this step"
 }
 
 type channelView struct {
@@ -88,6 +96,128 @@ func (s *Server) dashboardIndex(w http.ResponseWriter, r *http.Request) {
 func (s *Server) statusPartial(w http.ResponseWriter, r *http.Request) {
 	d := s.loadDashboard(r.Context(), w, r)
 	s.renderPartial(w, "partials/status.html", d)
+}
+
+// setupWizardData drives the /setup page. CurrentIdx is the 0-based
+// index of the first not-done (and not-skipped) step; -1 when all
+// steps are done.
+type setupWizardData struct {
+	pageBase
+	Steps      []setupStep
+	CurrentIdx int
+	Complete   bool
+	// Skipped is the set of step indices the user has chosen to skip
+	// (currently used only for the optional encryption step). Tracked
+	// in a cookie so a refresh doesn't lose state.
+	Skipped map[int]bool
+}
+
+const setupSkipCookie = "telfs_setup_skip"
+
+// setupWizard is the guided first-run flow. It computes the same
+// setupChecklist the dashboard uses, but renders only the first
+// not-done step in detail — with prerequisites, expected outcome, and
+// a clear "Open this step" CTA pointing at the existing form route.
+//
+// Why a separate page rather than a multi-step form-of-forms: every
+// step's existing handler (login, channel/set, encrypt/init,
+// mount/start) already has its own form, redirect logic, and flash
+// machinery. Folding them into one page would require rewiring all of
+// them to honor a return URL and would duplicate template work.
+// Instead, the wizard is a clear narrative landing page that points
+// at each step's existing page in turn; on return, the wizard
+// advances. This is a thin shell — the work that matters happens in
+// the dedicated handlers.
+func (s *Server) setupWizard(w http.ResponseWriter, r *http.Request) {
+	d := s.loadDashboard(r.Context(), w, r)
+	skipped := readSkipCookie(r)
+	currentIdx := -1
+	for i, step := range d.Setup.Steps {
+		if step.Done {
+			continue
+		}
+		if skipped[i] && step.Optional {
+			continue
+		}
+		currentIdx = i
+		break
+	}
+	pageData := setupWizardData{
+		pageBase:   s.basePage(w, r),
+		Steps:      d.Setup.Steps,
+		CurrentIdx: currentIdx,
+		Complete:   currentIdx == -1,
+		Skipped:    skipped,
+	}
+	s.renderTemplate(w, "setup.html", pageData)
+}
+
+// setupSkip toggles a step into the skipped set (currently only the
+// optional encryption step). Redirects back to /setup so the wizard
+// re-evaluates and surfaces the next step. The skip is persisted in a
+// session cookie — the user can un-skip by clicking the step in the
+// stepper.
+func (s *Server) setupSkip(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	idx := r.FormValue("idx")
+	skipped := readSkipCookie(r)
+	if v, ok := skipped[atoiSafe(idx)]; ok && v {
+		delete(skipped, atoiSafe(idx))
+	} else {
+		skipped[atoiSafe(idx)] = true
+	}
+	writeSkipCookie(w, skipped)
+	http.Redirect(w, r, "/setup", http.StatusSeeOther)
+}
+
+func readSkipCookie(r *http.Request) map[int]bool {
+	out := map[int]bool{}
+	c, err := r.Cookie(setupSkipCookie)
+	if err != nil || c.Value == "" {
+		return out
+	}
+	for _, part := range strings.Split(c.Value, ",") {
+		if part == "" {
+			continue
+		}
+		out[atoiSafe(part)] = true
+	}
+	return out
+}
+
+func writeSkipCookie(w http.ResponseWriter, m map[int]bool) {
+	parts := make([]string, 0, len(m))
+	for k, v := range m {
+		if v {
+			parts = append(parts, fmt.Sprintf("%d", k))
+		}
+	}
+	sort.Strings(parts)
+	http.SetCookie(w, &http.Cookie{
+		Name:     setupSkipCookie,
+		Value:    strings.Join(parts, ","),
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func atoiSafe(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *http.Request) dashboardData {
@@ -168,40 +298,60 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 	// Encryption is OPTIONAL — mark as "done" if the FS is either
 	// explicitly encrypted OR has chunks already (so opting in later
 	// is no longer possible).
-	encryptionOK := d.Crypto.Enabled || (d.HasMeta && fileExists(cfg.DBPath()))
-	// "Mounted" is best-effort: any fuse.telfs entry counts.
-	mountedOK := len(d.Mounts) > 0
+	encryptionOK := d.Crypto.Enabled || hasChunksFor(cfg)
+	// "Mount it" is done when THIS profile has written chunks — a
+	// reliable signal that the FS has been mounted at some point.
+	// (Checking active /proc/mounts entries is unreliable because
+	// fuse.telfs entries don't reveal which profile they belong to,
+	// and another profile's mount would falsely mark this one done.)
+	mountedOK := hasChunksFor(cfg)
 
 	steps := []setupStep{
 		{
-			Label: "Telegram API ID + hash",
-			Done:  apiOK,
-			Href:  "/profiles",
-			Why:   "Get them at https://my.telegram.org/apps and put them in the active profile's config.toml.",
+			Label:   "Telegram API ID + hash",
+			Done:    apiOK,
+			Href:    "/profiles",
+			Why:     "Get them at https://my.telegram.org/apps and put them in the active profile's config.toml.",
+			Detail:  "TelFS uses the MTProto user/bot API directly (never the HTTP Bot API). That requires a personal API ID + hash, free to obtain at my.telegram.org/apps after logging in with your phone number. The credentials are written to your profile's config.toml at chmod 0600.",
+			Outcome: "config.toml in the active profile has non-zero api_id and a non-empty api_hash.",
+			CTA:     "Open profile settings",
 		},
 		{
-			Label: "Authenticate (phone or bot token)",
-			Done:  sessionOK,
-			Href:  "/login",
-			Why:   "Pick phone for a personal account or bot-token for an automation account.",
+			Label:   "Authenticate (phone or bot token)",
+			Done:    sessionOK,
+			Href:    "/login",
+			Why:     "Pick phone for a personal account or bot-token for an automation account.",
+			Detail:  "Phone auth runs the full Telegram code-then-2FA dance in three pages. Bot auth is a single token field (must be issued by @BotFather; the bot needs admin in the target channel before it can post).",
+			Outcome: "session.json appears in the profile directory; subsequent mounts won't prompt for a code.",
+			CTA:     "Start authentication",
 		},
 		{
-			Label: "Bind a private channel",
-			Done:  channelOK,
-			Href:  "/channel",
-			Why:   "Pick the channel TelFS will store chunks in. Creating a private channel first in the Telegram app is the smoothest path.",
+			Label:   "Bind a private channel",
+			Done:    channelOK,
+			Href:    "/channel",
+			Why:     "Pick the channel TelFS will store chunks in. Creating a private channel first in the Telegram app is the smoothest path.",
+			Detail:  "User-authenticated profiles can enumerate your channels (list view). Bot-authenticated profiles must paste the channel id and access_hash explicitly — bots can't list dialogs.",
+			Outcome: "config.toml's [channel] block has id + access_hash set; the dashboard's Channel card lights up.",
+			CTA:     "Choose a channel",
 		},
 		{
-			Label: "Encrypt the FS (optional, must be set before first mount)",
-			Done:  encryptionOK,
-			Href:  "/encrypt",
-			Why:   "AES-256-GCM with an Argon2id-derived key. Once any chunk exists, this becomes a one-way choice.",
+			Label:    "Encrypt the FS",
+			Done:     encryptionOK,
+			Href:     "/encrypt",
+			Why:      "AES-256-GCM with an Argon2id-derived key. Once any chunk exists, this becomes a one-way choice.",
+			Detail:   "Optional but you can only enable it on a fresh filesystem (no chunks yet). Encrypts chunk bytes AND the snapshot blob's metadata. Pre-v0.14 used aes-gcm-v1 (passphrase encrypts everything); from v0.14 onward, aes-gcm-v2 wraps a per-FS DEK so the passphrase can be rotated later without re-uploading chunks. Skipping this step leaves the FS plaintext — Telegram operators and channel members can read your files.",
+			Outcome:  "telfs encrypt status reports mode=aes-gcm-v2 and rotation is available.",
+			Optional: true,
+			CTA:      "Set a passphrase",
 		},
 		{
-			Label: "Mount it",
-			Done:  mountedOK,
-			Href:  "/mount/new",
-			Why:   "Start the FUSE daemon. Files written to the mountpoint flow through the chunk pipeline to the channel.",
+			Label:   "Mount it",
+			Done:    mountedOK,
+			Href:    "/mount/new",
+			Why:     "Start the FUSE daemon. Files written to the mountpoint flow through the chunk pipeline to the channel.",
+			Detail:  "Pick a mountpoint (any empty directory). The web server launches a `telfs mount` child process and tracks it for you — start, stop, and tail the log from the Mounts page. The mount survives `telfs web` restarts via /proc/mounts reconciliation.",
+			Outcome: "An `fuse.telfs` entry shows up in `mount`; the Files page browses live FS contents.",
+			CTA:     "Open mount form",
 		},
 	}
 	complete := true
@@ -220,6 +370,29 @@ func fileExists(path string) bool {
 	}
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// hasChunksFor reports whether the given profile's local DB contains
+// at least one chunk_map row. Used by the setup checklist as a proxy
+// for "this profile has been mounted and written to" — more reliable
+// than /proc/mounts inspection, which can't tell profiles apart.
+func hasChunksFor(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	if !fileExists(cfg.DBPath()) {
+		return false
+	}
+	m, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return false
+	}
+	defer m.Close()
+	chunks, err := m.AllChunkMessageIDs(context.Background())
+	if err != nil {
+		return false
+	}
+	return len(chunks) > 0
 }
 
 // activeMounts scans /proc/mounts for fuse.telfs entries.

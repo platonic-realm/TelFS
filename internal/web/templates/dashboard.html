@@ -4,6 +4,7 @@
 {{if not .Setup.Complete}}
 <section class="card" id="setup-checklist">
   <h3>Get started <small>— complete these to start using TelFS</small></h3>
+  <p><a href="/setup" class="btn primary">Open the guided setup →</a></p>
   <ol class="plain">
     {{$nextSurfaced := false}}
     {{range .Setup.Steps}}
@@ -16,7 +17,7 @@
         <span class="setup-label">{{.Label}}</span>
       {{else}}
         <span class="pill acc">next</span>
-        <a href="{{.Href}}" class="setup-label setup-next"><strong>{{.Label}}</strong></a>
+        <a href="/setup" class="setup-label setup-next"><strong>{{.Label}}</strong></a>
         {{if .Why}}<div class="setup-why"><small>{{.Why}}</small></div>{{end}}
         {{$nextSurfaced = true}}
       {{end}}
