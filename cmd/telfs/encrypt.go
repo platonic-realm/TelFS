@@ -20,16 +20,18 @@ import (
 // NOT trimmed (matches `echo -n`).
 const envPassphrase = "TELFS_PASSPHRASE"
 
-// cmdEncrypt dispatches `telfs encrypt {init,status}`.
+// cmdEncrypt dispatches `telfs encrypt {init,status,rotate}`.
 func cmdEncrypt(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("encrypt: missing subcommand (init, status)")
+		return errors.New("encrypt: missing subcommand (init, status, rotate)")
 	}
 	switch args[0] {
 	case "init":
 		return cmdEncryptInit(ctx)
 	case "status":
 		return cmdEncryptStatus(ctx)
+	case "rotate":
+		return cmdEncryptRotate(ctx)
 	default:
 		return fmt.Errorf("encrypt: unknown subcommand %q", args[0])
 	}
@@ -74,9 +76,23 @@ func cmdEncryptInit(ctx context.Context) error {
 	params := crypto.DefaultArgonParams()
 	fmt.Printf("Deriving key with Argon2id (time=%d, memory=%d MiB, threads=%d)…\n",
 		params.Time, params.Memory/1024, params.Threads)
-	key := crypto.DeriveKey(pass, salt, params)
-	defer zero(key)
-	cipher, err := crypto.NewAESGCM(key)
+	kek := crypto.DeriveKey(pass, salt, params)
+	defer zero(kek)
+
+	// v2: generate a fresh DEK and wrap it under the KEK. Chunks +
+	// snapshots use the DEK, not the KEK directly, so rotation can
+	// re-wrap the DEK with a new KEK without touching any encrypted
+	// data on the channel.
+	dek, err := crypto.NewDEK()
+	if err != nil {
+		return err
+	}
+	defer zero(dek)
+	wrappedDEK, err := crypto.WrapDEK(kek, dek)
+	if err != nil {
+		return err
+	}
+	cipher, err := crypto.NewAESGCM(dek)
 	if err != nil {
 		return err
 	}
@@ -92,19 +108,142 @@ func cmdEncryptInit(ctx context.Context) error {
 		k string
 		v []byte
 	}{
-		{crypto.KVMode, []byte(crypto.ModeAESGCMv1)},
+		{crypto.KVMode, []byte(crypto.ModeAESGCMv2)},
 		{crypto.KVSalt, salt},
 		{crypto.KVArgon, argonJSON},
 		{crypto.KVCanary, canary},
+		{crypto.KVWrappedDEK, wrappedDEK},
 	} {
 		if err := metaStore.PutKV(ctx, kv.k, kv.v); err != nil {
 			return fmt.Errorf("persist %s: %w", kv.k, err)
 		}
 	}
-	fmt.Println("\nEncryption enabled (aes-gcm-v1).")
-	fmt.Println("All future chunk uploads will be encrypted; channel observers see only ciphertext.")
-	fmt.Println("Filenames, sizes, and directory structure are NOT encrypted — the snapshot blob")
-	fmt.Println("in the channel still contains your metadata in the clear.")
+	fmt.Println("\nEncryption enabled (aes-gcm-v2).")
+	fmt.Println("Chunks + snapshots encrypted with a per-FS DEK; your passphrase wraps the DEK.")
+	fmt.Println("Run `telfs encrypt rotate` to change the passphrase later without re-encrypting chunks.")
+	return nil
+}
+
+// cmdEncryptRotate changes the passphrase without re-encrypting any
+// chunks. Only available on v2 FSes (those initialized after v0.14):
+//
+//   1. Prompt for current passphrase, derive old KEK, unwrap DEK.
+//   2. Prompt for new passphrase (+ confirmation), derive new KEK
+//      with a fresh salt, re-wrap the same DEK.
+//   3. Persist new salt + new argon (in case defaults changed) +
+//      new wrapped DEK + new canary (encrypted under DEK — unchanged
+//      semantics, but we re-seal so it's consistent with anyone who
+//      later inspects).
+//
+// Atomicity: each PutKV is its own SQL statement. If we crash mid-
+// rotation, the FS may end up with a hybrid of old-mode/new-mode
+// keys. Since rotation is rare and the user is interactively driving
+// it, we accept that risk — the recovery is "re-run rotate".
+func cmdEncryptRotate(ctx context.Context) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	metaStore, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return err
+	}
+	defer metaStore.Close()
+
+	mode, err := metaStore.GetKV(ctx, crypto.KVMode)
+	if errors.Is(err, meta.ErrNotFound) {
+		return errors.New("encrypt rotate: this FS is not encrypted")
+	}
+	if err != nil {
+		return err
+	}
+	if string(mode) != crypto.ModeAESGCMv2 {
+		return fmt.Errorf("encrypt rotate: only supported on aes-gcm-v2 filesystems "+
+			"(this one is %q); migrate by `cp -r` to a fresh profile if rotation is needed", string(mode))
+	}
+
+	// Step 1: unwrap the DEK with the current passphrase.
+	oldSalt, err := metaStore.GetKV(ctx, crypto.KVSalt)
+	if err != nil {
+		return fmt.Errorf("read salt: %w", err)
+	}
+	argonBytes, err := metaStore.GetKV(ctx, crypto.KVArgon)
+	if err != nil {
+		return fmt.Errorf("read argon: %w", err)
+	}
+	oldParams, err := crypto.UnmarshalArgonParams(argonBytes)
+	if err != nil {
+		return err
+	}
+	wrappedDEK, err := metaStore.GetKV(ctx, crypto.KVWrappedDEK)
+	if err != nil {
+		return fmt.Errorf("read wrapped DEK: %w", err)
+	}
+	oldPass, err := readPassphrase("Current passphrase: ")
+	if err != nil {
+		return err
+	}
+	defer zero(oldPass)
+	oldKEK := crypto.DeriveKey(oldPass, oldSalt, oldParams)
+	defer zero(oldKEK)
+	dek, err := crypto.UnwrapDEK(oldKEK, wrappedDEK)
+	if err != nil {
+		return fmt.Errorf("encrypt rotate: %w", err)
+	}
+	defer zero(dek)
+
+	// Step 2: derive the new KEK with a fresh salt.
+	newPass, err := promptNewPassphrase()
+	if err != nil {
+		return err
+	}
+	defer zero(newPass)
+	newSalt, err := crypto.NewSalt()
+	if err != nil {
+		return err
+	}
+	newParams := crypto.DefaultArgonParams()
+	fmt.Printf("Re-wrapping DEK with new passphrase (Argon2id time=%d, memory=%d MiB, threads=%d)…\n",
+		newParams.Time, newParams.Memory/1024, newParams.Threads)
+	newKEK := crypto.DeriveKey(newPass, newSalt, newParams)
+	defer zero(newKEK)
+	newWrappedDEK, err := crypto.WrapDEK(newKEK, dek)
+	if err != nil {
+		return err
+	}
+
+	// Re-seal the canary too (same plaintext, fresh nonce — keeps the
+	// stored state consistent with a fresh init).
+	cipher, err := crypto.NewAESGCM(dek)
+	if err != nil {
+		return err
+	}
+	newCanary, err := crypto.SealCanary(cipher)
+	if err != nil {
+		return err
+	}
+	newArgonJSON, err := crypto.MarshalArgonParams(newParams)
+	if err != nil {
+		return err
+	}
+
+	// Step 3: persist. PutKV is upsert; updates the existing values.
+	for _, kv := range []struct {
+		k string
+		v []byte
+	}{
+		{crypto.KVSalt, newSalt},
+		{crypto.KVArgon, newArgonJSON},
+		{crypto.KVCanary, newCanary},
+		{crypto.KVWrappedDEK, newWrappedDEK},
+	} {
+		if err := metaStore.PutKV(ctx, kv.k, kv.v); err != nil {
+			return fmt.Errorf("persist %s: %w", kv.k, err)
+		}
+	}
+	fmt.Println("\nPassphrase rotated. Existing chunks remain valid (the DEK didn't change).")
+	fmt.Println("Older snapshots on the channel still decrypt with the OLD passphrase — they'll")
+	fmt.Println("age out of retention naturally. Use the new passphrase from now on.")
 	return nil
 }
 
@@ -132,6 +271,12 @@ func cmdEncryptStatus(ctx context.Context) error {
 	if argon, err := metaStore.GetKV(ctx, crypto.KVArgon); err == nil {
 		fmt.Printf("KDF params:  %s\n", string(argon))
 	}
+	switch string(mode) {
+	case crypto.ModeAESGCMv2:
+		fmt.Println("Rotation:    supported — `telfs encrypt rotate`.")
+	case crypto.ModeAESGCMv1:
+		fmt.Println("Rotation:    NOT supported on v1 — passphrase change requires re-encrypting all chunks.")
+	}
 	fmt.Println("Passphrase is required to mount. Set TELFS_PASSPHRASE to skip the prompt.")
 	return nil
 }
@@ -140,6 +285,11 @@ func cmdEncryptStatus(ctx context.Context) error {
 // NoopCipher when crypto_mode isn't set, an AESGCM cipher with a
 // verified canary when it is, or an error if the user can't be
 // authenticated (wrong passphrase, missing kv state, etc).
+//
+// Routes on mode:
+//   - "" (no key)        → NoopCipher.
+//   - "aes-gcm-v1"       → passphrase → Argon2id → key → cipher.
+//   - "aes-gcm-v2"       → passphrase → KEK → unwrap DEK → cipher.
 func loadCipher(ctx context.Context, m *meta.Store) (crypto.Cipher, error) {
 	mode, err := m.GetKV(ctx, crypto.KVMode)
 	if errors.Is(err, meta.ErrNotFound) {
@@ -147,9 +297,6 @@ func loadCipher(ctx context.Context, m *meta.Store) (crypto.Cipher, error) {
 	}
 	if err != nil {
 		return nil, err
-	}
-	if string(mode) != crypto.ModeAESGCMv1 {
-		return nil, fmt.Errorf("loadCipher: unsupported crypto_mode %q", string(mode))
 	}
 	salt, err := m.GetKV(ctx, crypto.KVSalt)
 	if err != nil {
@@ -172,16 +319,40 @@ func loadCipher(ctx context.Context, m *meta.Store) (crypto.Cipher, error) {
 		return nil, err
 	}
 	defer zero(pass)
-	key := crypto.DeriveKey(pass, salt, params)
-	defer zero(key)
-	cipher, err := crypto.NewAESGCM(key)
-	if err != nil {
-		return nil, err
+	derived := crypto.DeriveKey(pass, salt, params)
+	defer zero(derived)
+
+	switch string(mode) {
+	case crypto.ModeAESGCMv1:
+		cipher, err := crypto.NewAESGCM(derived)
+		if err != nil {
+			return nil, err
+		}
+		if err := crypto.VerifyCanary(cipher, canary); err != nil {
+			return nil, err
+		}
+		return cipher, nil
+	case crypto.ModeAESGCMv2:
+		wrappedDEK, err := m.GetKV(ctx, crypto.KVWrappedDEK)
+		if err != nil {
+			return nil, fmt.Errorf("loadCipher: wrapped_dek missing on v2 FS: %w", err)
+		}
+		dek, err := crypto.UnwrapDEK(derived, wrappedDEK)
+		if err != nil {
+			return nil, err
+		}
+		defer zero(dek)
+		cipher, err := crypto.NewAESGCM(dek)
+		if err != nil {
+			return nil, err
+		}
+		if err := crypto.VerifyCanary(cipher, canary); err != nil {
+			return nil, err
+		}
+		return cipher, nil
+	default:
+		return nil, fmt.Errorf("loadCipher: unsupported crypto_mode %q", string(mode))
 	}
-	if err := crypto.VerifyCanary(cipher, canary); err != nil {
-		return nil, err
-	}
-	return cipher, nil
 }
 
 // promptNewPassphrase prompts for a passphrase + confirmation, or

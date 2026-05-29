@@ -101,11 +101,11 @@ func (m *Manager) Once(ctx context.Context) error {
 	// gzipped DB directly (still compatible with M5-vintage clients).
 	body := snap.Bytes
 	if m.shouldEncrypt() {
-		salt, argonJSON, canary, kerr := loadEnvelopeKDF(ctx, m.Meta)
+		opts, kerr := loadWrapOpts(ctx, m.Meta)
 		if kerr != nil {
 			return fmt.Errorf("snapshot encryption: %w", kerr)
 		}
-		wrapped, werr := Wrap(m.Cipher, salt, argonJSON, canary, snap.Bytes)
+		wrapped, werr := Wrap(m.Cipher, opts, snap.Bytes)
 		if werr != nil {
 			return fmt.Errorf("wrap snapshot: %w", werr)
 		}
@@ -198,22 +198,45 @@ func (m *Manager) shouldEncrypt() bool {
 	return true
 }
 
-// loadEnvelopeKDF reads the public Argon2id state from meta_kv. These
-// are the same fields `telfs encrypt init` persisted; we copy them
-// into every encrypted snapshot envelope so recovery doesn't need
-// the local DB to derive the key.
-func loadEnvelopeKDF(ctx context.Context, m *meta.Store) (salt, argonJSON, canary []byte, err error) {
-	if salt, err = m.GetKV(ctx, crypto.KVSalt); err != nil {
+// loadWrapOpts reads the public crypto state from meta_kv into a
+// WrapOpts. For v2 FSes this also fetches the wrappedDEK so cold
+// recovery is self-contained — the envelope on the channel carries
+// everything needed to unwrap, given the user's passphrase.
+func loadWrapOpts(ctx context.Context, m *meta.Store) (WrapOpts, error) {
+	mode, err := m.GetKV(ctx, crypto.KVMode)
+	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
-			return nil, nil, nil, fmt.Errorf("crypto_salt missing — FS is in inconsistent state")
+			return WrapOpts{}, fmt.Errorf("crypto_mode missing — FS is in inconsistent state")
 		}
-		return nil, nil, nil, err
+		return WrapOpts{}, err
 	}
-	if argonJSON, err = m.GetKV(ctx, crypto.KVArgon); err != nil {
-		return nil, nil, nil, err
+	salt, err := m.GetKV(ctx, crypto.KVSalt)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return WrapOpts{}, fmt.Errorf("crypto_salt missing — FS is in inconsistent state")
+		}
+		return WrapOpts{}, err
 	}
-	if canary, err = m.GetKV(ctx, crypto.KVCanary); err != nil {
-		return nil, nil, nil, err
+	argonJSON, err := m.GetKV(ctx, crypto.KVArgon)
+	if err != nil {
+		return WrapOpts{}, err
 	}
-	return salt, argonJSON, canary, nil
+	canary, err := m.GetKV(ctx, crypto.KVCanary)
+	if err != nil {
+		return WrapOpts{}, err
+	}
+	opts := WrapOpts{
+		Mode: string(mode), Salt: salt, Argon: argonJSON, Canary: canary,
+	}
+	// v2 FSes also carry the wrapped DEK so cold recovery can produce
+	// the DEK from (passphrase, salt, argon, wrappedDEK) without any
+	// local state.
+	if string(mode) == crypto.ModeAESGCMv2 {
+		wrapped, err := m.GetKV(ctx, crypto.KVWrappedDEK)
+		if err != nil {
+			return WrapOpts{}, fmt.Errorf("wrapped DEK missing on v2 FS — inconsistent state: %w", err)
+		}
+		opts.WrappedDEK = wrapped
+	}
+	return opts, nil
 }

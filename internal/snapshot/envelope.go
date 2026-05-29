@@ -23,7 +23,10 @@ const envelopeVersion byte = 1
 // embed in the encrypted body. Recovery (which has no local DB yet)
 // reads this, prompts for the passphrase, and derives the key.
 type envelopeHeader struct {
-	// Mode mirrors meta_kv['crypto_mode'] ("aes-gcm-v1" for now).
+	// Mode mirrors meta_kv['crypto_mode']:
+	//   "aes-gcm-v1" → passphrase derives the key directly.
+	//   "aes-gcm-v2" → passphrase derives a KEK; WrappedDEK
+	//                  unwraps to the actual DEK used for the body.
 	Mode string `json:"mode"`
 	// Salt + Argon + Canary mirror the meta_kv values. We carry them
 	// here so cold-mount recovery is self-contained: it doesn't need
@@ -31,6 +34,21 @@ type envelopeHeader struct {
 	Salt   []byte          `json:"salt"`
 	Argon  json.RawMessage `json:"argon"`
 	Canary []byte          `json:"canary"`
+	// WrappedDEK is the v2-only payload that turns the passphrase-
+	// derived KEK into the DEK used for body / chunks. Empty in v1
+	// envelopes; required in v2.
+	WrappedDEK []byte `json:"wrapped_dek,omitempty"`
+}
+
+// WrapOpts bundles the public state Wrap needs to construct an
+// envelope. WrappedDEK is required for ModeAESGCMv2 and ignored for
+// ModeAESGCMv1.
+type WrapOpts struct {
+	Mode       string
+	Salt       []byte
+	Argon      []byte
+	Canary     []byte
+	WrappedDEK []byte
 }
 
 // Wrap envelops gzipped plaintext bytes with an AES-GCM ciphertext
@@ -41,12 +59,21 @@ type envelopeHeader struct {
 //
 // AAD for the inner Seal is (ino=0, idx=-1) — slot reserved for
 // per-FS-scoped data (canary uses (0,0); the snapshot uses (0,-1)).
-func Wrap(c crypto.Cipher, salt, argonJSON, canary, plaintext []byte) ([]byte, error) {
+//
+// `c` is the cipher to encrypt the body with — for v1, the
+// passphrase-derived key; for v2, the per-FS DEK. The KEK never
+// leaves the caller; only the WrappedDEK (which depends on the KEK)
+// makes it into the envelope.
+func Wrap(c crypto.Cipher, opts WrapOpts, plaintext []byte) ([]byte, error) {
 	hdr := envelopeHeader{
-		Mode:   crypto.ModeAESGCMv1,
-		Salt:   salt,
-		Argon:  argonJSON,
-		Canary: canary,
+		Mode:       opts.Mode,
+		Salt:       opts.Salt,
+		Argon:      opts.Argon,
+		Canary:     opts.Canary,
+		WrappedDEK: opts.WrappedDEK,
+	}
+	if hdr.Mode == "" {
+		hdr.Mode = crypto.ModeAESGCMv1
 	}
 	hdrBytes, err := json.Marshal(hdr)
 	if err != nil {
@@ -131,4 +158,32 @@ func EnvelopeKDFParams(b []byte) (salt []byte, argonJSON []byte, canary []byte, 
 func UnwrapBody(b []byte) ([]byte, error) {
 	_, body, err := Unwrap(b)
 	return body, err
+}
+
+// EnvelopeHeader is the public view of a parsed envelope header,
+// exported for callers (e.g. the mount path) that need to branch on
+// the cipher mode to decide how to derive the body key.
+type EnvelopeHeader struct {
+	Mode       string
+	Salt       []byte
+	Argon      []byte
+	Canary     []byte
+	WrappedDEK []byte
+}
+
+// UnwrapHeaderAndBody returns the parsed header + the ciphertext body
+// in one call. Replaces piecemeal use of EnvelopeKDFParams + UnwrapBody
+// for callers that also need the mode/WrappedDEK.
+func UnwrapHeaderAndBody(b []byte) (EnvelopeHeader, []byte, error) {
+	hdr, body, err := Unwrap(b)
+	if err != nil {
+		return EnvelopeHeader{}, nil, err
+	}
+	return EnvelopeHeader{
+		Mode:       hdr.Mode,
+		Salt:       hdr.Salt,
+		Argon:      hdr.Argon,
+		Canary:     hdr.Canary,
+		WrappedDEK: hdr.WrappedDEK,
+	}, body, nil
 }

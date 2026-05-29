@@ -69,6 +69,7 @@ Usage:
   telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
   telfs encrypt init                Enable AES-256-GCM for this filesystem.
   telfs encrypt status              Show whether encryption is enabled.
+  telfs encrypt rotate              Change passphrase without re-encrypting chunks (v2 FSes).
   telfs profile {list,show,create,delete,use,export,import}
                                     Manage multiple profiles (accounts/channels).
   telfs status                      One-screen summary of the active profile.
@@ -706,19 +707,22 @@ func replayJournalSince(ctx context.Context, sess *tg.Session, cfg *config.Confi
 // from the envelope's salt, verifies the canary (fail-fast on wrong
 // passphrase), and decrypts. If the blob isn't wrapped, returns it
 // as-is.
+//
+// Handles both modes:
+//   - v1 envelopes: passphrase → key → cipher → open(body).
+//   - v2 envelopes: passphrase → KEK → unwrap envelope.WrappedDEK →
+//     DEK → cipher → open(body). Cold recovery is fully self-
+//     contained — the envelope carries the wrapped DEK alongside the
+//     KDF state, so no local meta_kv is needed.
 func maybeUnwrapEncrypted(data []byte) ([]byte, error) {
 	if !snapshot.IsWrapped(data) {
 		return data, nil
 	}
-	salt, argonJSON, canary, err := snapshot.EnvelopeKDFParams(data)
+	hdr, body, err := snapshot.UnwrapHeaderAndBody(data)
 	if err != nil {
 		return nil, err
 	}
-	body, err := snapshot.UnwrapBody(data)
-	if err != nil {
-		return nil, err
-	}
-	params, err := crypto.UnmarshalArgonParams(argonJSON)
+	params, err := crypto.UnmarshalArgonParams(hdr.Argon)
 	if err != nil {
 		return nil, err
 	}
@@ -727,13 +731,36 @@ func maybeUnwrapEncrypted(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer zero(pass)
-	key := crypto.DeriveKey(pass, salt, params)
-	defer zero(key)
-	cipher, err := crypto.NewAESGCM(key)
-	if err != nil {
-		return nil, err
+	derived := crypto.DeriveKey(pass, hdr.Salt, params)
+	defer zero(derived)
+
+	var cipher crypto.Cipher
+	switch hdr.Mode {
+	case "", crypto.ModeAESGCMv1:
+		// Empty mode = v1; envelopes written by pre-v0.14 clients didn't
+		// always set it. Treat as v1.
+		cipher, err = crypto.NewAESGCM(derived)
+		if err != nil {
+			return nil, err
+		}
+	case crypto.ModeAESGCMv2:
+		if len(hdr.WrappedDEK) == 0 {
+			return nil, fmt.Errorf("snapshot: v2 envelope missing wrapped_dek")
+		}
+		dek, derr := crypto.UnwrapDEK(derived, hdr.WrappedDEK)
+		if derr != nil {
+			return nil, derr
+		}
+		defer zero(dek)
+		cipher, err = crypto.NewAESGCM(dek)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("snapshot: unsupported envelope mode %q", hdr.Mode)
 	}
-	if err := crypto.VerifyCanary(cipher, canary); err != nil {
+
+	if err := crypto.VerifyCanary(cipher, hdr.Canary); err != nil {
 		return nil, err
 	}
 	plaintext, err := cipher.Open(0, -1, body)

@@ -40,7 +40,12 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	// SQLite blob. Content doesn't matter for the envelope test;
 	// any bytes will do.
 	plaintext := []byte("this is the gzipped DB pretend-plaintext, ~50B")
-	wrapped, err := Wrap(cipher, salt, argonJSON, canary, plaintext)
+	wrapped, err := Wrap(cipher, WrapOpts{
+		Mode:   crypto.ModeAESGCMv1,
+		Salt:   salt,
+		Argon:  argonJSON,
+		Canary: canary,
+	}, plaintext)
 	if err != nil {
 		t.Fatalf("Wrap: %v", err)
 	}
@@ -108,7 +113,12 @@ func TestEnvelopeWrongPassphraseFailsAtCanary(t *testing.T) {
 	salt, _ := crypto.NewSalt()
 	cipher, _ := crypto.NewAESGCM(crypto.DeriveKey([]byte("right"), salt, params))
 	canary, _ := crypto.SealCanary(cipher)
-	wrapped, err := Wrap(cipher, salt, argonJSON, canary, []byte("body"))
+	wrapped, err := Wrap(cipher, WrapOpts{
+		Mode:   crypto.ModeAESGCMv1,
+		Salt:   salt,
+		Argon:  argonJSON,
+		Canary: canary,
+	}, []byte("body"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +126,124 @@ func TestEnvelopeWrongPassphraseFailsAtCanary(t *testing.T) {
 	wrongCipher, _ := crypto.NewAESGCM(crypto.DeriveKey([]byte("wrong"), salt, params))
 	if err := crypto.VerifyCanary(wrongCipher, gotCanary); err == nil {
 		t.Fatalf("canary should NOT verify under wrong-passphrase key")
+	}
+}
+
+// TestEnvelopeV2RoundTrip mirrors the v2 cold-recovery path:
+// passphrase → KEK → unwrap(envelope.WrappedDEK) → DEK → canary +
+// body decrypt. The DEK never leaves memory; the channel sees only
+// nonce(12)||GCM(KEK, DEK).
+func TestEnvelopeV2RoundTrip(t *testing.T) {
+	params := crypto.ArgonParams{Time: 1, Memory: 8 * 1024, Threads: 1}
+	argonJSON, _ := crypto.MarshalArgonParams(params)
+	salt, _ := crypto.NewSalt()
+	passphrase := []byte("hunter2")
+	kek := crypto.DeriveKey(passphrase, salt, params)
+
+	dek, err := crypto.NewDEK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrappedDEK, err := crypto.WrapDEK(kek, dek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyCipher, _ := crypto.NewAESGCM(dek)
+	canary, _ := crypto.SealCanary(bodyCipher)
+
+	plaintext := []byte("the v2 snapshot body — same shape as v1, different key derivation")
+	wrapped, err := Wrap(bodyCipher, WrapOpts{
+		Mode:       crypto.ModeAESGCMv2,
+		Salt:       salt,
+		Argon:      argonJSON,
+		Canary:     canary,
+		WrappedDEK: wrappedDEK,
+	}, plaintext)
+	if err != nil {
+		t.Fatalf("Wrap v2: %v", err)
+	}
+
+	// Recovery side: pretend the local DB is gone. All we have is the
+	// passphrase + the envelope blob.
+	hdr, body, err := UnwrapHeaderAndBody(wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Mode != crypto.ModeAESGCMv2 {
+		t.Fatalf("envelope mode: got %q want %q", hdr.Mode, crypto.ModeAESGCMv2)
+	}
+	if len(hdr.WrappedDEK) == 0 {
+		t.Fatalf("v2 envelope must carry wrapped DEK")
+	}
+	recoveredKEK := crypto.DeriveKey(passphrase, hdr.Salt, params)
+	recoveredDEK, err := crypto.UnwrapDEK(recoveredKEK, hdr.WrappedDEK)
+	if err != nil {
+		t.Fatalf("UnwrapDEK with correct passphrase: %v", err)
+	}
+	if !bytes.Equal(recoveredDEK, dek) {
+		t.Fatalf("recovered DEK does not match original")
+	}
+	recoveredCipher, _ := crypto.NewAESGCM(recoveredDEK)
+	if err := crypto.VerifyCanary(recoveredCipher, hdr.Canary); err != nil {
+		t.Fatalf("VerifyCanary on v2 recovery: %v", err)
+	}
+	got, err := recoveredCipher.Open(0, -1, body)
+	if err != nil {
+		t.Fatalf("Open v2 body: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("v2 round-trip mismatch")
+	}
+
+	// Negative path: wrong passphrase produces a KEK that can't unwrap
+	// the DEK — fails at UnwrapDEK, not at the canary.
+	wrongKEK := crypto.DeriveKey([]byte("wrong"), hdr.Salt, params)
+	if _, err := crypto.UnwrapDEK(wrongKEK, hdr.WrappedDEK); err == nil {
+		t.Fatalf("UnwrapDEK with wrong passphrase should fail")
+	}
+}
+
+// TestEnvelopeV2RotationSimulated mirrors what `telfs encrypt rotate`
+// does: same DEK, new salt, new KEK, new wrapped DEK. The DEK is
+// unchanged so existing chunks remain readable; the rewrap is O(1)
+// regardless of FS size.
+func TestEnvelopeV2RotationSimulated(t *testing.T) {
+	params := crypto.ArgonParams{Time: 1, Memory: 8 * 1024, Threads: 1}
+	oldSalt, _ := crypto.NewSalt()
+	oldKEK := crypto.DeriveKey([]byte("old-pass"), oldSalt, params)
+	dek, _ := crypto.NewDEK()
+	oldWrapped, _ := crypto.WrapDEK(oldKEK, dek)
+
+	// Rotation: derive a new KEK from a new passphrase + new salt,
+	// unwrap with the OLD KEK, rewrap with the NEW KEK.
+	newSalt, _ := crypto.NewSalt()
+	if bytes.Equal(newSalt, oldSalt) {
+		t.Fatalf("NewSalt collision — extremely unlikely; check entropy source")
+	}
+	newKEK := crypto.DeriveKey([]byte("new-pass"), newSalt, params)
+	recoveredDEK, err := crypto.UnwrapDEK(oldKEK, oldWrapped)
+	if err != nil {
+		t.Fatalf("unwrap with old kek: %v", err)
+	}
+	if !bytes.Equal(recoveredDEK, dek) {
+		t.Fatalf("recovered DEK mismatch — rotation would lose data")
+	}
+	newWrapped, err := crypto.WrapDEK(newKEK, recoveredDEK)
+	if err != nil {
+		t.Fatalf("rewrap: %v", err)
+	}
+
+	// After rotation: old passphrase fails to unwrap.
+	if _, err := crypto.UnwrapDEK(oldKEK, newWrapped); err == nil {
+		t.Fatalf("old KEK should NOT unwrap the new wrapped DEK")
+	}
+	// New passphrase unwraps the same DEK as before.
+	got, err := crypto.UnwrapDEK(newKEK, newWrapped)
+	if err != nil {
+		t.Fatalf("new KEK should unwrap the rewrapped DEK: %v", err)
+	}
+	if !bytes.Equal(got, dek) {
+		t.Fatalf("rotation lost DEK identity")
 	}
 }
 

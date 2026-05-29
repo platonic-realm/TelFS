@@ -254,6 +254,32 @@ Wrong passphrase fails fast — a canary in `meta_kv` is decrypted
 before any user data flows, so a typo surfaces immediately instead
 of as cryptic EIOs.
 
+### Passphrase rotation
+
+Filesystems initialized on v0.14 or later use the `aes-gcm-v2` layout:
+the passphrase derives a key-encryption-key (KEK) that wraps a
+per-filesystem data-encryption-key (DEK). Chunks and snapshots are
+encrypted with the DEK; the wrapped DEK lives in `meta_kv` (and is
+mirrored into every snapshot envelope on the channel for cold
+recovery). Rotating the passphrase only re-wraps the DEK — chunks
+already on the channel are untouched.
+
+```sh
+telfs encrypt rotate                  # interactive: old passphrase, then new
+```
+
+Notes:
+
+- Existing snapshots on the channel still decrypt with the *old*
+  passphrase. They age out of retention naturally; if you need to
+  invalidate them immediately, run `telfs gc --yes` to delete
+  out-of-window snapshots, then trigger a fresh one (e.g. by
+  remounting briefly).
+- Pre-v0.14 filesystems use `aes-gcm-v1` (the passphrase directly
+  encrypts everything) and `telfs encrypt rotate` will refuse — there
+  is no path to rotate those in place. `telfs encrypt status` shows
+  which mode your filesystem is on.
+
 ### What encryption protects against
 
 | Threat | Protected? |
@@ -273,6 +299,10 @@ of as cryptic EIOs.
 - KDF: Argon2id (time=3, memory=64 MiB, threads=4)
 - Salt: 16 random bytes per filesystem, stored in `meta_kv`
 - Canary: encrypted `"telfs-canary-v1"` in `meta_kv`, verified at mount
+- Key hierarchy (`aes-gcm-v2`): passphrase + salt → Argon2id → KEK;
+  random 32-byte DEK wrapped under KEK in `meta_kv['crypto_wrapped_dek']`
+  and inside every snapshot envelope; chunks and snapshot bodies use
+  the DEK. Rotation rewraps the DEK only.
 
 The KDF parameters are stored in `meta_kv['crypto_argon_params']`,
 so a future TelFS with stronger defaults can still mount older
@@ -689,12 +719,6 @@ with data.
   for archival, snapshot the FS instead.
 ## Roadmap
 
-- **Passphrase rotation** via KEK-wrapped data key so changing the
-  passphrase doesn't require re-encrypting every chunk.
-- **Channel-side journal between snapshots** to close the up-to-5-min
-  crash window.
-- **Read-ahead** for sequential FUSE reads — prefetch next-N chunks
-  so `cat`/video playback doesn't round-trip per 4 MiB.
 - **Content-addressed chunk dedup** — SHA-256 index on `chunk_map`;
   identical chunks share one channel message.
 - **First-run wizard in the web UI** — guide a new user through

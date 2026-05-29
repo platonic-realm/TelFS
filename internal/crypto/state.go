@@ -9,16 +9,30 @@ import (
 // (cmd/telfs and internal/fs) wire them into meta.Store.GetKV /
 // meta.Store.PutKV without re-typing strings.
 const (
-	KVMode   = "crypto_mode"          // identifies the cipher; "" = plaintext
-	KVSalt   = "crypto_salt"          // bytes used by Argon2id
-	KVArgon  = "crypto_argon_params"  // JSON-encoded ArgonParams
-	KVCanary = "crypto_canary"        // ciphertext of canaryPlaintext under the FS's key
+	KVMode       = "crypto_mode"          // identifies the cipher; "" = plaintext
+	KVSalt       = "crypto_salt"          // bytes used by Argon2id
+	KVArgon      = "crypto_argon_params"  // JSON-encoded ArgonParams
+	KVCanary     = "crypto_canary"        // ciphertext of canaryPlaintext under the FS's key
+	KVWrappedDEK = "crypto_wrapped_dek"   // v2: AES-GCM(KEK, nonce, DEK, AAD=salt)
 )
 
-// ModeAESGCMv1 is the only cipher mode shipped in M7. Future versions
-// can add new labels (e.g. "aes-gcm-v2", "chacha20-poly1305-v1")
-// without invalidating existing data.
-const ModeAESGCMv1 = "aes-gcm-v1"
+// Cipher modes. ModeAESGCMv1 was the only mode shipped through v0.13;
+// the passphrase-derived KEK directly encrypted chunks and snapshots.
+// That meant rotating the passphrase required re-encrypting every
+// chunk — impractical at scale.
+//
+// ModeAESGCMv2 adds a level of indirection: the user's passphrase
+// derives a KEK; the KEK wraps a per-FS random DEK; chunks and
+// snapshots use the DEK. Rotation only rewraps the DEK with the new
+// passphrase-derived KEK — O(1) work regardless of FS size.
+//
+// Existing v1 filesystems keep working unchanged; the loader picks
+// the cipher based on which mode is recorded in meta_kv. Rotation is
+// only available on v2 filesystems.
+const (
+	ModeAESGCMv1 = "aes-gcm-v1"
+	ModeAESGCMv2 = "aes-gcm-v2"
+)
 
 // canaryPlaintext is the well-known string we encrypt under the FS key
 // to detect wrong-passphrase mounts early — before any user data flows
