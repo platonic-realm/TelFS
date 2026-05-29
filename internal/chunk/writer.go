@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sync"
 
 	"telfs/internal/crypto"
@@ -21,49 +20,27 @@ type Uploader interface {
 }
 
 // DefaultDirtyCapBytes is the per-Writer cap on accumulated dirty bytes
-// before WriteAt starts dispatching the oldest dirty chunks for async
-// upload. Big enough to soak the kernel's writeback for typical large-
-// file copies without forcing FUSE to round-trip on every chunk
-// boundary; small enough that one rogue handle can't OOM the daemon.
+// before WriteAt starts eagerly flushing the oldest dirty chunks. Keeps
+// memory usage bounded for streaming workloads ("cat big > mnt/copy")
+// without forcing a flush on every chunk boundary.
 const DefaultDirtyCapBytes int64 = 256 << 20
-
-// DefaultUploadConcurrency is how many chunks may be uploading at the
-// same time per Writer.
-//
-// Currently pinned at 1 — concurrent UploadDocument calls against the
-// same *tg.Session were observed to crash the daemon mid-copy in live
-// testing (no panic trace surfaced; the process simply vanished). The
-// per-chunk parallelism gotd does internally via SaveFilePart already
-// saturates a typical uplink, so we serialize at the chunk level until
-// we understand whether the issue is in gotd's session or our usage.
-// Async dispatch is still a major win — FUSE writes decouple from the
-// network round-trip, so a multi-GB cp no longer wedges the kernel's
-// writeback queue.
-const DefaultUploadConcurrency = 1
 
 // Writer owns the dirty-chunk buffer for a single open file handle. It
 // is NOT safe to share across goroutines — go-fuse may call WriteAt
 // concurrently for one handle, so all entry points acquire mu.
 //
 // Lifecycle (mirrors a FUSE handle's open/write/flush/release):
-//   - New: allocate, recover current file size from meta, spawn nothing.
-//   - WriteAt: copy bytes into dirty chunks; eagerly DISPATCH (not
-//     synchronously upload) the oldest dirty chunks when dirtyBytes >
-//     dirtyCap. Dispatch acquires an upload-semaphore slot, so if
-//     concurrency is saturated the caller blocks — honest backpressure
-//     to the kernel.
+//   - New: allocate, recover current file size from meta.
+//   - WriteAt: copy bytes into dirty chunks; may auto-Flush oldest chunks
+//     when dirtyBytes > dirtyCap.
 //   - Truncate: drop dirty chunks past size; trim or delete last chunk.
-//   - Flush: dispatch every remaining dirty chunk, then WAIT for all
-//     in-flight uploads to finish. Surfaces the first sticky error.
-//     Updates meta.inodes.size to the final logical size as the LAST
-//     step.
-//   - Close: cancels the worker context (in-flight gotd uploads
-//     unwind), drains the workgroup, drops in-memory state.
-//
-// Lock discipline: w.mu protects every map/slice field below. The
-// network round-trip itself happens with mu released, so FUSE write
-// goroutines can keep filling new dirty chunks while old ones upload
-// in the background.
+//   - Flush: upload every dirty chunk in idx order; on any failure, stop
+//     and return — already-committed chunks stay committed, the rest
+//     remain dirty for a retry. Updates meta.inodes.size to the final
+//     logical size as the LAST step (so a partial flush doesn't shrink
+//     the apparent file size).
+//   - Close: idempotent; drops in-memory state. Caller is responsible
+//     for invoking Flush first if they care about durability.
 type Writer struct {
 	meta     *meta.Store
 	cache    *Cache
@@ -76,22 +53,9 @@ type Writer struct {
 	mu         sync.Mutex
 	dirty      map[int32]*dirtyChunk
 	dirtyBytes int64
-	dirtyOrder []int32 // FIFO insertion order — eager-dispatch victims pop from front
+	dirtyOrder []int32 // FIFO insertion order — eager-flush victims pop from front
 	size       int64
 	closed     bool
-
-	// Async upload pipeline. uploadSem caps in-flight concurrency.
-	// uploading tracks chunks whose data is no longer in `dirty` but
-	// whose upload hasn't finished; loadForWrite waits on the done
-	// channel before treating the chunk as missing from meta.
-	// uploadErr is the first sticky error from any background upload;
-	// once set, subsequent WriteAt / Flush return it.
-	uploadCtx    context.Context
-	uploadCancel context.CancelFunc
-	uploadSem    chan struct{}
-	uploadWg     sync.WaitGroup
-	uploading    map[int32]chan struct{}
-	uploadErr    error
 }
 
 type dirtyChunk struct {
@@ -115,21 +79,16 @@ func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher 
 	if err != nil {
 		return nil, fmt.Errorf("writer: get inode %d: %w", ino, err)
 	}
-	uploadCtx, uploadCancel := context.WithCancel(context.Background())
 	return &Writer{
-		meta:         m,
-		cache:        c,
-		uploader:     u,
-		cipher:       cipher,
-		chunkSz:      chunkSize,
-		dirtyCap:     dirtyCap,
-		ino:          ino,
-		dirty:        make(map[int32]*dirtyChunk),
-		size:         in.Size,
-		uploadCtx:    uploadCtx,
-		uploadCancel: uploadCancel,
-		uploadSem:    make(chan struct{}, DefaultUploadConcurrency),
-		uploading:    make(map[int32]chan struct{}),
+		meta:     m,
+		cache:    c,
+		uploader: u,
+		cipher:   cipher,
+		chunkSz:  chunkSize,
+		dirtyCap: dirtyCap,
+		ino:      ino,
+		dirty:    make(map[int32]*dirtyChunk),
+		size:     in.Size,
 	}, nil
 }
 
@@ -154,9 +113,6 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 	defer w.mu.Unlock()
 	if w.closed {
 		return 0, fmt.Errorf("writer: handle closed")
-	}
-	if err := w.uploadErr; err != nil {
-		return 0, err
 	}
 
 	// Materialize any sparse region between size and off as zeros. This
@@ -199,20 +155,12 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 		}
 	}
 
-	// Eager DISPATCH if we're over the cap. Drains oldest dirty chunks
-	// (by insertion order) until back under the cap. Dispatching does
-	// not block on the network — it queues for the worker pool — BUT
-	// it does block on the upload semaphore when the pool is saturated.
-	// That semaphore wait IS the backpressure that prevents the kernel
-	// from piling up unbounded dirty pages.
+	// Eager flush if we're over the cap. Flush oldest dirty chunks (by
+	// insertion order) until back under the cap.
 	for w.dirtyBytes > w.dirtyCap && len(w.dirtyOrder) > 0 {
 		victim := w.dirtyOrder[0]
-		w.dispatchFlushLocked(victim)
-		// dispatchFlushLocked releases + reacquires w.mu; re-check
-		// the dirtyErr each iteration so a fast-failed background
-		// upload surfaces here.
-		if err := w.uploadErr; err != nil {
-			return written, err
+		if err := w.flushChunkLocked(ctx, victim); err != nil {
+			return written, fmt.Errorf("eager flush chunk %d: %w", victim, err)
 		}
 	}
 
@@ -222,35 +170,9 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 // loadForWrite returns (and registers as dirty) the chunk at idx,
 // preloading existing bytes via the cache when this is the first
 // dirty touch.
-//
-// If an in-flight upload exists for idx (we've popped it from `dirty`
-// but the network round-trip hasn't completed yet), this blocks until
-// that upload finishes so the read-side starts from a consistent
-// chunk_map row.
 func (w *Writer) loadForWrite(ctx context.Context, idx int32) (*dirtyChunk, error) {
-	for {
-		if dc, ok := w.dirty[idx]; ok {
-			return dc, nil
-		}
-		ch, uploading := w.uploading[idx]
-		if !uploading {
-			break
-		}
-		// Wait for the in-flight upload to commit (or fail) before we
-		// preload from meta. Drop the lock during the wait.
-		w.mu.Unlock()
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			w.mu.Lock()
-			return nil, ctx.Err()
-		}
-		w.mu.Lock()
-		if err := w.uploadErr; err != nil {
-			return nil, err
-		}
-		// Loop: the chunk may now have a fresh chunk_map row, or it
-		// may have been re-dirtied by another writer in the meantime.
+	if dc, ok := w.dirty[idx]; ok {
+		return dc, nil
 	}
 	var data []byte
 	// Try to pull existing chunk content (cache hit or TG download).
@@ -384,205 +306,90 @@ func (w *Writer) Truncate(ctx context.Context, n int64) error {
 	return w.meta.SetSize(ctx, w.ino, n)
 }
 
-// Flush dispatches every remaining dirty chunk for upload, waits for
-// all in-flight uploads to complete, surfaces the first error from
-// THIS batch (if any), and writes the final logical size to meta.
-//
-// Flush is the retry primitive: it clears any sticky error from a
-// previous failed Flush before dispatching. A failed Flush leaves the
-// failed chunks back in `dirty`; the next Flush retries them. WriteAt
-// reads the sticky error so the kernel sees EIO immediately on the
-// post-failure write — only Flush wipes the slate.
+// Flush uploads every dirty chunk in ascending idx order. On any
+// per-chunk failure, returns immediately; earlier chunks are already
+// committed (chunk_map + size update for them stays), later chunks
+// remain dirty for the next Flush. The file's size in meta is updated
+// at the end so a partial flush doesn't shrink the visible file.
 func (w *Writer) Flush(ctx context.Context) error {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.closed {
-		w.mu.Unlock()
 		return fmt.Errorf("writer: handle closed")
 	}
-	w.uploadErr = nil // retry-with-clean-slate
-	// Snapshot the dirty list once — restore-on-failure puts failed
-	// chunks back into dirtyOrder, and we MUST NOT re-dispatch them in
-	// the same Flush call or we'd loop forever on persistent failures.
-	// The next Flush picks them up.
-	toFlush := make([]int32, len(w.dirtyOrder))
-	copy(toFlush, w.dirtyOrder)
-	for _, idx := range toFlush {
-		w.dispatchFlushLocked(idx)
-	}
-	w.mu.Unlock()
-	// Wait for every dispatched upload to finish.
-	w.uploadWg.Wait()
-	w.mu.Lock()
-	if err := w.uploadErr; err != nil {
-		w.mu.Unlock()
-		return err
-	}
-	finalSize := w.size
-	w.mu.Unlock()
-	return w.meta.SetSize(ctx, w.ino, finalSize)
+	return w.flushAllLocked(ctx)
 }
 
-// dispatchFlushLocked pops the dirty chunk at idx, marks it as in-flight,
-// acquires a semaphore slot (BLOCKING for backpressure), and launches a
-// goroutine that does the encrypt + upload + chunk_map update.
-//
-// The caller holds w.mu on entry; this method releases the mutex during
-// the semaphore acquire (so other writers can keep filling new chunks)
-// and reacquires it before returning.
-func (w *Writer) dispatchFlushLocked(idx int32) {
+func (w *Writer) flushAllLocked(ctx context.Context) error {
+	// Snapshot the dirty idxes in ascending order so the order is
+	// deterministic regardless of insertion order.
+	idxs := make([]int32, 0, len(w.dirty))
+	for k := range w.dirty {
+		idxs = append(idxs, k)
+	}
+	// Insertion sort suffices.
+	for i := 1; i < len(idxs); i++ {
+		for j := i; j > 0 && idxs[j-1] > idxs[j]; j-- {
+			idxs[j-1], idxs[j] = idxs[j], idxs[j-1]
+		}
+	}
+	for _, idx := range idxs {
+		if err := w.flushChunkLocked(ctx, idx); err != nil {
+			return err
+		}
+	}
+	// All dirty chunks committed — write the final size to meta.
+	return w.meta.SetSize(ctx, w.ino, w.size)
+}
+
+// flushChunkLocked uploads a single dirty chunk and removes it from the
+// dirty set. Caller must hold w.mu.
+func (w *Writer) flushChunkLocked(ctx context.Context, idx int32) error {
 	dc, ok := w.dirty[idx]
 	if !ok {
-		// Already dispatched (could happen if dispatchFlushLocked is
-		// called twice for the same idx after a release/reacquire gap).
-		// Remove from order if it's still there and bail.
-		w.removeFromOrderLocked(idx)
-		return
+		return nil
 	}
-	delete(w.dirty, idx)
-	w.removeFromOrderLocked(idx)
-	w.dirtyBytes -= int64(len(dc.data))
-	doneCh := make(chan struct{})
-	w.uploading[idx] = doneCh
-	w.uploadWg.Add(1)
-	// Drop the lock to acquire the sem slot — this is the backpressure
-	// point. New writers calling WriteAt can hold the lock in the
-	// meantime; they'll see this chunk in w.uploading so loadForWrite
-	// for the same idx will wait correctly.
-	w.mu.Unlock()
-	w.uploadSem <- struct{}{}
-	go w.uploadOne(w.uploadCtx, idx, dc, doneCh)
-	w.mu.Lock()
-}
-
-// removeFromOrderLocked drops idx from w.dirtyOrder if present.
-func (w *Writer) removeFromOrderLocked(idx int32) {
-	for i, o := range w.dirtyOrder {
-		if o == idx {
-			w.dirtyOrder = append(w.dirtyOrder[:i], w.dirtyOrder[i+1:]...)
-			return
-		}
-	}
-}
-
-// uploadOne runs in its own goroutine and performs the encrypt → upload
-// → chunk_map → cache-invalidate sequence with the lock RELEASED for
-// the duration of the network round-trip.
-//
-// On any failure the chunk is RESTORED to the dirty set so a subsequent
-// Flush can retry it, unless a fresh write to the same idx has already
-// arrived (in which case the new dirty entry supersedes ours).
-func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneCh chan struct{}) {
-	// Defers unwind LIFO: panic guard runs LAST (outermost — must catch
-	// even the inner defers' panics). Then restore-on-failure runs
-	// first on normal return (so waiters see the resurrected dirty
-	// entry), then delete uploading[idx], then close doneCh (which
-	// wakes loadForWrite), then release the sem slot, then wg.Done.
-	defer w.uploadWg.Done()
-	defer func() { <-w.uploadSem }()
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "[writer] uploadOne PANIC ino=%d idx=%d: %v\n", w.ino, idx, r)
-			w.recordError(fmt.Errorf("uploadOne panic ino=%d idx=%d: %v", w.ino, idx, r))
-		}
-	}()
-	defer close(doneCh)
-	defer func() {
-		w.mu.Lock()
-		delete(w.uploading, idx)
-		w.mu.Unlock()
-	}()
-	var restore bool
-	defer func() {
-		if !restore {
-			return
-		}
-		w.mu.Lock()
-		if _, hasNew := w.dirty[idx]; !hasNew {
-			w.dirty[idx] = dc
-			// Prepend so a retry Flush re-attempts the failed chunk first.
-			w.dirtyOrder = append([]int32{idx}, w.dirtyOrder...)
-			w.dirtyBytes += int64(len(dc.data))
-		}
-		w.mu.Unlock()
-	}()
-
+	// Encrypt before upload. With NoopCipher the bytes pass through.
 	wire, err := w.cipher.Seal(w.ino, idx, dc.data)
 	if err != nil {
-		restore = true
-		w.recordError(fmt.Errorf("encrypt chunk %d: %w", idx, err))
-		return
+		return fmt.Errorf("encrypt chunk %d: %w", idx, err)
 	}
 	name := fmt.Sprintf("ino%d-idx%d", w.ino, idx)
 	msgID, err := w.uploader.UploadDocument(ctx, bytes.NewReader(wire), name, "")
 	if err != nil {
-		restore = true
-		w.recordError(fmt.Errorf("upload chunk %d: %w", idx, err))
-		return
+		return fmt.Errorf("upload chunk %d: %w", idx, err)
 	}
-	// PutChunk uses Background ctx, not the upload worker's ctx —
-	// Close() cancels uploadCtx to abort in-flight gotd round-trips,
-	// but once an upload has SUCCEEDED we want its chunk_map row to
-	// land regardless. Without this, a sibling chunk's failure (which
-	// calls uploadCancel via recordError on Close) would race the
-	// PutChunk of an already-successful upload and orphan it on the
-	// channel.
-	if err := w.meta.PutChunk(context.Background(), meta.Chunk{
+	if err := w.meta.PutChunk(ctx, meta.Chunk{
 		Ino:         w.ino,
 		Idx:         idx,
 		TGMessageID: int64(msgID),
 		Size:        int32(len(dc.data)),
 	}); err != nil {
-		// At this point the chunk IS on the channel (TG message exists)
-		// but chunk_map didn't get the row. Treat as failure and restore
-		// to dirty for retry — the next Flush will re-upload and the
-		// orphan TG message becomes garbage for `telfs gc`.
-		restore = true
-		w.recordError(fmt.Errorf("chunk_map %d: %w", idx, err))
-		return
+		return fmt.Errorf("chunk_map update %d: %w", idx, err)
 	}
+	// Invalidate the LRU read cache for this chunk so a concurrent reader
+	// on another handle picks up the new bytes on next access.
 	w.cache.Invalidate(Key{Ino: w.ino, Idx: idx})
+	// Remove from dirty bookkeeping.
+	w.dirtyBytes -= int64(len(dc.data))
+	delete(w.dirty, idx)
+	for i, o := range w.dirtyOrder {
+		if o == idx {
+			w.dirtyOrder = append(w.dirtyOrder[:i], w.dirtyOrder[i+1:]...)
+			break
+		}
+	}
+	return nil
 }
 
-// recordError sets the sticky uploadErr (first-wins). It does NOT
-// cancel the worker context — sibling uploads that are already
-// past their network round-trip should still get their chunk_map
-// rows in; the sticky error stops the NEXT dispatch but doesn't
-// abort what's already committed. Close() is the only place that
-// cancels uploadCtx.
-//
-// The error is also printed to stderr at first occurrence so live
-// mount logs surface the underlying cause (FLOOD_WAIT, RPC timeout,
-// network glitch) rather than just "I/O error" via the kernel.
-func (w *Writer) recordError(err error) {
-	w.mu.Lock()
-	first := w.uploadErr == nil
-	if first {
-		w.uploadErr = err
-	}
-	w.mu.Unlock()
-	if first {
-		fmt.Fprintf(os.Stderr, "[writer] upload error (ino=%d): %v\n", w.ino, err)
-	}
-}
-
-// Close releases the writer's in-memory state. Cancels any in-flight
-// uploads and drains them so no goroutine survives this method's
-// return. It does NOT flush — the caller (FUSE Release) is expected
-// to call Flush first if durability matters.
+// Close releases the writer's in-memory state. It does NOT flush; the
+// caller (FUSE Release) is expected to call Flush first if durability
+// matters.
 func (w *Writer) Close() {
 	w.mu.Lock()
-	if w.closed {
-		w.mu.Unlock()
-		return
-	}
+	defer w.mu.Unlock()
 	w.closed = true
-	w.uploadCancel()
-	w.mu.Unlock()
-	w.uploadWg.Wait()
-	w.mu.Lock()
 	w.dirty = nil
 	w.dirtyOrder = nil
 	w.dirtyBytes = 0
-	w.uploading = nil
-	w.mu.Unlock()
 }
