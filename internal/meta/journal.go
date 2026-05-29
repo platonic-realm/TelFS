@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -23,6 +24,23 @@ func (s *Store) AppendJournal(ctx context.Context, opJSON []byte) (int64, error)
 		`INSERT INTO journal(op_json) VALUES (?)`, opJSON)
 	if err != nil {
 		return 0, fmt.Errorf("append journal: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// appendJournalTx records a journal op inside an existing transaction.
+// Used by mutation methods so the journal row and the mutation it
+// describes commit atomically — if the tx rolls back, the journal row
+// disappears too. Returns the assigned seq.
+func appendJournalTx(ctx context.Context, tx *sql.Tx, op JournalOp) (int64, error) {
+	payload, err := json.Marshal(op)
+	if err != nil {
+		return 0, fmt.Errorf("marshal journal op: %w", err)
+	}
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO journal(op_json) VALUES (?)`, payload)
+	if err != nil {
+		return 0, fmt.Errorf("tx append journal: %w", err)
 	}
 	return res.LastInsertId()
 }

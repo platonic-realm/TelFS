@@ -137,6 +137,13 @@ func (s *Store) CreateChild(ctx context.Context, parent int64, name string, chil
 			parent, name, ino); err != nil {
 			return fmt.Errorf("insert dirent: %w", err)
 		}
+		if _, err := appendJournalTx(ctx, tx, JournalOp{
+			Op: OpCreateChild, Parent: parent, Name: name, Ino: ino,
+			Kind: child.Kind, Mode: child.Mode, UID: child.UID, GID: child.GID,
+			Mtime: child.Mtime, SymlinkTarget: child.SymlinkTarget,
+		}); err != nil {
+			return err
+		}
 		newIno = ino
 		return nil
 	})
@@ -177,6 +184,11 @@ func (s *Store) Link(ctx context.Context, parent int64, name string, target int6
 			`UPDATE inodes SET nlink = nlink + 1 WHERE ino = ?`, target); err != nil {
 			return fmt.Errorf("bump nlink: %w", err)
 		}
+		if _, err := appendJournalTx(ctx, tx, JournalOp{
+			Op: OpLink, Parent: parent, Name: name, Target: target,
+		}); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -189,7 +201,12 @@ func (s *Store) Link(ctx context.Context, parent int64, name string, target int6
 // Symlinks behave like regular files.
 func (s *Store) Unlink(ctx context.Context, parent int64, name string) error {
 	return s.WithTx(ctx, func(tx *sql.Tx) error {
-		_, _, err := unlinkInTx(ctx, tx, parent, name)
+		if _, _, err := unlinkInTx(ctx, tx, parent, name); err != nil {
+			return err
+		}
+		_, err := appendJournalTx(ctx, tx, JournalOp{
+			Op: OpUnlink, Parent: parent, Name: name,
+		})
 		return err
 	})
 }
@@ -312,6 +329,12 @@ func (s *Store) Rename(ctx context.Context, oldParent int64, oldName string, new
 			`UPDATE dirents SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?`,
 			newParent, newName, oldParent, oldName); err != nil {
 			return fmt.Errorf("move dirent: %w", err)
+		}
+		if _, err := appendJournalTx(ctx, tx, JournalOp{
+			Op: OpRename, Parent: oldParent, Name: oldName,
+			NewParent: newParent, NewName: newName,
+		}); err != nil {
+			return err
 		}
 		return nil
 	})

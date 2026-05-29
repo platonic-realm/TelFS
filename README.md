@@ -664,10 +664,15 @@ with data.
 - **Single mounter per channel.** Two concurrent mounts will race; no
   locking. The schema reserves `meta_kv[lock_ts]` for a future
   coordination mechanism.
-- **Up-to-5-minute recovery window.** If the daemon crashes hard
-  (kill -9, kernel panic, machine off), data written since the last
-  cadence snapshot is lost. A future channel-side journal would close
-  this gap; see the roadmap.
+- **Up-to-~5-second recovery window** (v0.13). A background journal
+  poster drains the local `journal` table every 5 s and posts each
+  pending op as a journal-op message on the channel; recovery
+  restores the latest snapshot then replays any journal ops with seq
+  > snapshot.seq. Crash window = poster interval, not snapshot
+  interval. Currently journaled: CreateChild, Link, Unlink, Rename,
+  SetSize (truncate). Setattr/xattr/chunk-map mutations aren't
+  journaled yet — chunks themselves are independently recoverable
+  from the channel.
 - **Encryption metadata leakage is bounded but not zero.** Snapshots
   are TFSE-wrapped ciphertext; the channel still exposes the count
   and size of chunk messages and the cadence of snapshots. File size

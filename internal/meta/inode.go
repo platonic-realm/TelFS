@@ -121,10 +121,21 @@ func (s *Store) SetAttrs(ctx context.Context, ino int64, p SetAttrsPatch) error 
 }
 
 // SetSize is a convenience for the common "after truncate or full write"
-// case where size + mtime advance together.
+// case where size + mtime advance together. Also journals the size
+// change for channel-side recovery (the file length is otherwise
+// inferable only from chunk_map, and chunks aren't journaled — the
+// channel messages themselves are the source of truth for chunks).
 func (s *Store) SetSize(ctx context.Context, ino int64, size int64) error {
 	now := time.Now().Unix()
-	return s.SetAttrs(ctx, ino, SetAttrsPatch{Size: &size, Mtime: &now})
+	if err := s.SetAttrs(ctx, ino, SetAttrsPatch{Size: &size, Mtime: &now}); err != nil {
+		return err
+	}
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := appendJournalTx(ctx, tx, JournalOp{
+			Op: OpSetSize, Ino: ino, Size: size, Mtime: now,
+		})
+		return err
+	})
 }
 
 func joinComma(cols []string) string {

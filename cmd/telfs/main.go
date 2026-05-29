@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -504,6 +505,20 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			close(snapDone)
 		}()
 
+		// Journal poster: drains the local journal table every
+		// DefaultPosterInterval and uploads each pending op as a
+		// journal-op message on the channel. With this running,
+		// recovery can replay mutations made between snapshot
+		// cadences — narrowing the crash data-loss window from
+		// 5 min (snapshot interval) to ~5 s (poster interval).
+		journalPoster := &snapshot.Poster{Meta: metaStore, Session: sess}
+		journalCtx, stopJournal := context.WithCancel(sessCtx)
+		journalDone := make(chan struct{})
+		go func() {
+			_ = journalPoster.Run(journalCtx)
+			close(journalDone)
+		}()
+
 		// Trash GC: reads ttl on every tick so changes via
 		// `telfs trash enable --ttl <D>` take effect without remount.
 		if trashIno != 0 {
@@ -534,6 +549,11 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
+			// Stop the journal poster first so any in-flight ops
+			// drain to the channel before snapshot. Its Run does a
+			// final best-effort drain on ctx-cancel; we wait for it.
+			stopJournal()
+			<-journalDone
 			// Final snapshot synchronously BEFORE we ask gotd to
 			// shut down — uploads after callback return fail with
 			// "engine closed". 15-second budget; if it doesn't
@@ -628,8 +648,56 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 			return err
 		}
 		fmt.Printf("Restored %d gzipped bytes → %s\n", len(plaintext), cfg.DBPath())
+		// Channel-side journal replay: any mutations made between the
+		// snapshot we just restored and the crash live as journal-op
+		// messages on the channel. Replay them in seq order so the
+		// recovered DB matches the pre-crash state to within the
+		// poster's interval (~5s) rather than the snapshot's (~5min).
+		if err := replayJournalSince(ctx, sess, cfg, latest.Caption.Seq, latest.Caption.FSUUID); err != nil {
+			fmt.Fprintf(os.Stderr, "[journal] replay failed: %v — proceeding with snapshot-only state\n", err)
+		}
 		return nil
 	})
+}
+
+// replayJournalSince loads journal-op messages from the channel whose
+// seq is strictly greater than sinceSeq (the snapshot's high-water
+// mark) and applies them in ascending order to the just-restored
+// local DB. Failures on individual ops are logged and skipped — the
+// snapshot is still authoritative, the journal just refines it.
+func replayJournalSince(ctx context.Context, sess *tg.Session, cfg *config.Config, sinceSeq int64, fsUUID string) error {
+	msgs, err := sess.ListJournalOps(ctx, fsUUID, sinceSeq, 0)
+	if err != nil {
+		return fmt.Errorf("list journal ops: %w", err)
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	// Sort ascending by seq for in-order application.
+	sort.Slice(msgs, func(i, j int) bool {
+		return msgs[i].Caption.Seq < msgs[j].Caption.Seq
+	})
+	mstore, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return fmt.Errorf("open meta: %w", err)
+	}
+	defer mstore.Close()
+	fmt.Printf("Replaying %d journal op(s) since snapshot seq=%d…\n", len(msgs), sinceSeq)
+	applied := 0
+	for _, m := range msgs {
+		op, err := meta.DecodeOp(m.Caption.Payload)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[journal] decode op seq=%d: %v\n", m.Caption.Seq, err)
+			continue
+		}
+		if err := mstore.ReplayOp(ctx, op); err != nil {
+			fmt.Fprintf(os.Stderr, "[journal] apply op seq=%d (%s): %v\n", m.Caption.Seq, op.Op, err)
+			continue
+		}
+		applied++
+	}
+	fmt.Printf("Replayed %d/%d journal ops.\n", applied, len(msgs))
+	return nil
 }
 
 // maybeUnwrapEncrypted returns the plaintext gzipped-DB bytes given
