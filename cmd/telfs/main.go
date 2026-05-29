@@ -73,6 +73,7 @@ Usage:
   telfs profile {list,show,create,delete,use,export,import}
                                     Manage multiple profiles (accounts/channels).
   telfs status                      One-screen summary of the active profile.
+  telfs doctor                      Lint local profile + DB state for known invariants.
   telfs web [--listen ADDR] [--token TOKEN]
                                     HTTP management UI (default 127.0.0.1:8080).
   telfs fsck [--fix] [--stop-after N]
@@ -141,6 +142,8 @@ func run() error {
 		return cmdTrash(ctx, os.Args[2:])
 	case "debug":
 		return cmdDebug(ctx, os.Args[2:])
+	case "doctor":
+		return cmdDoctor(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n%s", os.Args[1], usage)
 		os.Exit(2)

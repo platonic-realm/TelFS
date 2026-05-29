@@ -38,6 +38,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Orphan chunk + stale snapshot GC | ✓ (`telfs gc`) |
 | Channel-side integrity check | ✓ (`telfs fsck`) |
 | One-screen profile / FS / channel status | ✓ (`telfs status`) |
+| Local invariant lint (config perms, KV, dedup ratio, orphan cache) | ✓ (`telfs doctor`) |
 | AES-256-GCM chunk encryption, Argon2id KDF | ✓ |
 | AES-256-GCM snapshot envelope (metadata-at-rest) | ✓ |
 | Persistent LRU chunk cache across daemon restarts | ✓ |
@@ -415,6 +416,38 @@ telfs status
 Active profile, channel binding, fs_uuid, chunk size, encryption
 state, last snapshot, FUSE mount table, on-disk file sizes — all on
 one screen. Useful first stop when something looks off.
+
+### `telfs doctor` — local invariant lint
+
+```sh
+telfs doctor
+```
+
+Read-only consistency check on the active profile. Complements
+`status` (describes state) and `fsck` (channel-side integrity) by
+validating the things that *have to be true* about local state:
+
+- `config.toml` / `session.json` permissions (warns above 0600 since
+  they hold API hash + MTProto auth key).
+- `meta_kv` invariants: `fs_uuid` is a valid UUID, `chunk_size` is a
+  power of two within the supported range, encryption keys are
+  present and well-formed for the declared mode (v1 vs v2).
+- `chunk_map` health: no rows with non-positive size or message id;
+  reports distinct message count vs row count (dedup ratio).
+- Cache vs `chunk_map`: orphan cache files whose `(ino, idx)` tuple
+  no longer appears in the DB are surfaced as warnings so the user
+  can decide whether to reclaim disk space.
+- Snapshot + journal high-water markers.
+
+Exit code is 0 on clean / warning-only output, 1 if any error-level
+finding surfaces — usable as a periodic health probe.
+
+| Severity | Meaning |
+|---|---|
+| `ok`   | invariant verified |
+| `info` | descriptive only (e.g., "encryption disabled — plaintext FS") |
+| `warn` | suboptimal but functional (e.g., orphan cache file) |
+| `err`  | invariant violated, likely cause of misbehavior |
 
 ## Configuration
 
