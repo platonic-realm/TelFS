@@ -44,6 +44,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Profiles + portable tar.gz export/import bundles | ✓ |
 | Web management UI (dashboard, login, mount, browser) | ✓ (`telfs web`) |
 | Trash safety-net — `rm` reroutes to `/.trash`, TTL GC | ✓ (`telfs trash`) |
+| Snapshot history + point-in-time restore (last 12 by default) | ✓ (`telfs snapshot`) |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
 ## Bot vs user auth
@@ -183,6 +184,38 @@ telfs mount ./mnt
 
 If the channel has no snapshot (first-ever use), recovery is a no-op
 and TelFS starts with an empty filesystem.
+
+### Time travel: rolling back to a historical snapshot
+
+Snapshots are retained on the channel for a configurable window (the
+last 12 by default, so ~1h at the 5-minute cadence). Older ones are
+auto-pruned. `telfs snapshot` lets you inspect and roll back:
+
+```sh
+telfs snapshot list
+# MSG-ID  AGE   TS (UTC)             JOURNAL-SEQ
+# 3004    5m    2026-05-29 14:22:29  17832
+# 2987    10m   2026-05-29 14:17:30  17801
+# 2970    15m   2026-05-29 14:12:30  17784
+# ...
+
+# "I deleted a file 30 minutes ago; undo":
+fusermount -u ~/External                  # stop the live mount
+telfs snapshot restore 2890               # 30-min-ago snapshot
+# This will replace ~/.config/telfs/profiles/main/db.sqlite
+#   with the contents of snapshot msg=2890.
+# The current DB will be saved as db.sqlite.pre-restore-<ts>.
+# Proceed? [y/N] y
+# Saved current DB to .../db.sqlite.pre-restore-1748534400
+# Restored snapshot msg=2890 → .../db.sqlite
+telfs mount ~/External                    # files now reflect that state
+```
+
+Restore is **destructive** to the current DB (the snapshot's state
+replaces it). The pre-restore DB is kept beside it as
+`db.sqlite.pre-restore-<unix-ts>` so you can roll forward again with a
+manual swap. Restore refuses to run while any TelFS mount is live;
+unmount first.
 
 ## Encryption
 

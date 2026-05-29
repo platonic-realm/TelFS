@@ -75,6 +75,8 @@ Usage:
                                     HTTP management UI (default 127.0.0.1:8080).
   telfs fsck [--fix] [--stop-after N]
                                     Verify every chunk_map row against the channel.
+  telfs snapshot {list, restore [--yes] <msg-id>}
+                                    Inspect / roll back to a historical snapshot.
   telfs trash {enable [--ttl D], disable, status, list, empty}
                                     Manage the rm safety-net at /.trash.
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
@@ -131,6 +133,8 @@ func run() error {
 		return cmdFsck(ctx, os.Args[2:])
 	case "gc":
 		return cmdGC(ctx, os.Args[2:])
+	case "snapshot":
+		return cmdSnapshot(ctx, os.Args[2:])
 	case "trash":
 		return cmdTrash(ctx, os.Args[2:])
 	case "debug":

@@ -97,6 +97,63 @@ func (s *Session) FindLatestSnapshot(ctx context.Context, fsUUID string, pageLim
 	return nil, nil
 }
 
+// ListSnapshots scans the channel newest-first and returns every
+// snapshot message whose caption parses as a SnapshotCaption. If
+// fsUUID is non-empty, snapshots from other TelFS instances are
+// filtered out — the same defensive guard FindLatestSnapshot uses.
+//
+// Returns at most `max` entries. With max <= 0 the cap defaults to
+// 200 (covering ~16h of 5-min snapshots) so a misbehaving caller
+// can't stream the entire channel history into RAM.
+func (s *Session) ListSnapshots(ctx context.Context, fsUUID string, max int) ([]LatestSnapshot, error) {
+	if max <= 0 {
+		max = 200
+	}
+	peer, _, err := s.channelPeer()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LatestSnapshot, 0, 16)
+	offsetID := 0
+	const pageLimit = 50 // 5000 messages of history before we give up
+	for page := 0; page < pageLimit && len(out) < max; page++ {
+		res, err := s.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:     peer,
+			OffsetID: offsetID,
+			Limit:    100,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("get history: %w", err)
+		}
+		msgs := extractMessages(res)
+		if len(msgs) == 0 {
+			break
+		}
+		for _, m := range msgs {
+			msg, ok := m.(*tg.Message)
+			if !ok {
+				continue
+			}
+			if cap, ok := parseSnapshotCaption(msg.Message); ok {
+				if fsUUID != "" && cap.FSUUID != fsUUID {
+					continue
+				}
+				out = append(out, LatestSnapshot{MessageID: msg.ID, Caption: cap})
+				if len(out) >= max {
+					return out, nil
+				}
+			}
+		}
+		last := msgs[len(msgs)-1]
+		lastMsg, ok := last.(*tg.Message)
+		if !ok {
+			break
+		}
+		offsetID = lastMsg.ID
+	}
+	return out, nil
+}
+
 // DeleteChannelMessages removes the given message ids from the
 // configured channel. Used by snapshot cleanup. Errors from individual
 // deletes are joined with %w.

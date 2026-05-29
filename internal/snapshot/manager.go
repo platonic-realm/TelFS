@@ -14,12 +14,20 @@ import (
 )
 
 // KVCurrentMsgID is the meta_kv key under which we persist the
-// message-id of the most recently posted snapshot. Used to delete the
-// superseded snapshot after a new one lands.
+// message-id of the most recently posted snapshot. Recovery uses it to
+// jump straight to the latest without scanning the channel.
 const KVCurrentMsgID = "snap_msg_id"
 
 // DefaultInterval is how often the cadence goroutine snapshots.
 const DefaultInterval = 5 * time.Minute
+
+// DefaultRetention is how many recent snapshots to keep on the
+// channel. At the DefaultInterval cadence this is ~1h of recoverable
+// history — enough to roll back a "rm -rf went wrong 30 min ago"
+// without paying for unbounded channel storage. Each snapshot is the
+// gzipped SQLite DB plus the TFSE envelope overhead (typically tens
+// of KB to a few MB depending on FS size).
+const DefaultRetention = 12
 
 // Manager runs periodic snapshots for the lifetime of a mounted FUSE
 // daemon. One snapshot is taken on entry (so a freshly-recovered DB
@@ -29,6 +37,10 @@ type Manager struct {
 	Meta     *meta.Store
 	Session  *tg.Session
 	Interval time.Duration
+	// Retention is how many recent snapshots to keep on the channel
+	// after each successful upload. <=0 falls back to DefaultRetention.
+	// Older snapshots are deleted at the end of Once().
+	Retention int
 	// Cipher encrypts the snapshot body before upload when the FS has
 	// encryption enabled. nil → plaintext snapshot (chunk_map still
 	// uses whatever cipher the chunk pipeline has).
@@ -74,14 +86,14 @@ func (m *Manager) Run(ctx context.Context) error {
 }
 
 // Once performs a single snapshot cycle: build, optionally encrypt
-// under the FS key, upload, record new msg_id, delete the previous
-// snapshot's message.
+// under the FS key, upload, record new msg_id, and prune snapshots
+// older than the retention window so the channel doesn't accumulate
+// indefinitely.
 func (m *Manager) Once(ctx context.Context) error {
 	snap, err := Take(ctx, m.Meta)
 	if err != nil {
 		return fmt.Errorf("take: %w", err)
 	}
-	prevID, _ := loadCurrentMsgID(ctx, m.Meta)
 
 	// If the FS is encrypted, wrap the gzipped blob in an envelope
 	// that bundles the KDF state so recovery can decrypt with just
@@ -107,16 +119,52 @@ func (m *Manager) Once(ctx context.Context) error {
 	if err := storeCurrentMsgID(ctx, m.Meta, newID); err != nil {
 		return fmt.Errorf("persist new snap msg_id: %w", err)
 	}
-	if prevID != 0 && prevID != newID {
-		// Best-effort: if delete fails, the old snapshot is orphaned but
-		// the new one is already authoritative.
-		if err := m.Session.DeleteChannelMessages(ctx, prevID); err != nil {
-			if m.Logger != nil {
-				m.Logger.Printf("[snapshot] could not delete prior snap msg %d: %v", prevID, err)
-			}
-		}
+	// Retention pruning: list every snapshot for this fs_uuid, keep the
+	// `retention` newest, delete the rest. Best-effort — if delete
+	// fails the orphan stays on the channel but the FS keeps working;
+	// `telfs gc` will reap them eventually.
+	if err := m.pruneRetention(ctx, snap.FSUUID, newID); err != nil && m.Logger != nil {
+		m.Logger.Printf("[snapshot] retention prune: %v", err)
 	}
 	return nil
+}
+
+// retention returns the effective snapshot retention count.
+func (m *Manager) retention() int {
+	if m.Retention <= 0 {
+		return DefaultRetention
+	}
+	return m.Retention
+}
+
+// pruneRetention deletes channel-side snapshots beyond the retention
+// window. The newest `retention` snapshots stay; the rest are deleted.
+// We list with cap = retention + 64 so even a chatty channel can't push
+// every old snapshot beyond our visibility in one call; older-than-cap
+// orphans are picked up by `telfs gc` instead.
+func (m *Manager) pruneRetention(ctx context.Context, fsUUID string, justUploaded int) error {
+	keep := m.retention()
+	snaps, err := m.Session.ListSnapshots(ctx, fsUUID, keep+64)
+	if err != nil {
+		return fmt.Errorf("list: %w", err)
+	}
+	if len(snaps) <= keep {
+		return nil
+	}
+	// snaps is newest-first; everything past index `keep` is stale.
+	toDelete := make([]int, 0, len(snaps)-keep)
+	for _, s := range snaps[keep:] {
+		// Never delete the snapshot we JUST uploaded — defensive guard
+		// in case ListSnapshots' newest-first ordering surprises us.
+		if s.MessageID == justUploaded {
+			continue
+		}
+		toDelete = append(toDelete, s.MessageID)
+	}
+	if len(toDelete) == 0 {
+		return nil
+	}
+	return m.Session.DeleteChannelMessages(ctx, toDelete...)
 }
 
 func loadCurrentMsgID(ctx context.Context, m *meta.Store) (int, error) {
