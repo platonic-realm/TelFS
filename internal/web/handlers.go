@@ -40,6 +40,24 @@ type dashboardData struct {
 	Mounts    []string
 	Profiles  []string
 	Active    string
+	Setup     setupChecklist
+}
+
+// setupChecklist surfaces which onboarding steps are still pending so
+// the dashboard can guide a new user instead of presenting an empty
+// "everything looks fine" view. Each Step is a tuple of (label, done,
+// href) — the template walks the slice and renders the first
+// non-done item as the next call-to-action.
+type setupChecklist struct {
+	Complete bool
+	Steps    []setupStep
+}
+
+type setupStep struct {
+	Label string
+	Done  bool
+	Href  string
+	Why   string // optional helper text shown for the current pending step
 }
 
 type channelView struct {
@@ -133,7 +151,75 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	d.Mounts = activeMounts()
 	d.Profiles = listProfileNames()
+	d.Setup = buildSetupChecklist(d)
 	return d
+}
+
+// buildSetupChecklist looks at the loaded dashboard data and produces
+// an ordered list of "do this next" hints for new users. Order matches
+// the conceptual prerequisites: API creds → login → channel → optional
+// encryption → mount. The first not-done step gets a Why message; the
+// dashboard template renders that prominently.
+func buildSetupChecklist(d dashboardData) setupChecklist {
+	cfg, _ := config.Load()
+	apiOK := cfg != nil && cfg.APIID != 0 && cfg.APIHash != ""
+	sessionOK := cfg != nil && fileExists(cfg.SessionPath())
+	channelOK := d.Channel.Set
+	// Encryption is OPTIONAL — mark as "done" if the FS is either
+	// explicitly encrypted OR has chunks already (so opting in later
+	// is no longer possible).
+	encryptionOK := d.Crypto.Enabled || (d.HasMeta && fileExists(cfg.DBPath()))
+	// "Mounted" is best-effort: any fuse.telfs entry counts.
+	mountedOK := len(d.Mounts) > 0
+
+	steps := []setupStep{
+		{
+			Label: "Telegram API ID + hash",
+			Done:  apiOK,
+			Href:  "/profiles",
+			Why:   "Get them at https://my.telegram.org/apps and put them in the active profile's config.toml.",
+		},
+		{
+			Label: "Authenticate (phone or bot token)",
+			Done:  sessionOK,
+			Href:  "/login",
+			Why:   "Pick phone for a personal account or bot-token for an automation account.",
+		},
+		{
+			Label: "Bind a private channel",
+			Done:  channelOK,
+			Href:  "/channel",
+			Why:   "Pick the channel TelFS will store chunks in. Creating a private channel first in the Telegram app is the smoothest path.",
+		},
+		{
+			Label: "Encrypt the FS (optional, must be set before first mount)",
+			Done:  encryptionOK,
+			Href:  "/encrypt",
+			Why:   "AES-256-GCM with an Argon2id-derived key. Once any chunk exists, this becomes a one-way choice.",
+		},
+		{
+			Label: "Mount it",
+			Done:  mountedOK,
+			Href:  "/mount/new",
+			Why:   "Start the FUSE daemon. Files written to the mountpoint flow through the chunk pipeline to the channel.",
+		},
+	}
+	complete := true
+	for _, s := range steps {
+		if !s.Done {
+			complete = false
+			break
+		}
+	}
+	return setupChecklist{Complete: complete, Steps: steps}
+}
+
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // activeMounts scans /proc/mounts for fuse.telfs entries.

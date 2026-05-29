@@ -451,3 +451,31 @@ ul.plain li:last-child { border-bottom: none; }
   th, td { padding: .45rem .55rem; font-size: .9rem; }
   table button { padding: .2rem .5rem; }
 }
+
+/* ─── first-run setup checklist ──────────────────────────────────── */
+#setup-checklist {
+  border-color: var(--acc-soft);
+  background: linear-gradient(180deg, var(--acc-soft) 0, var(--bg-elev) 35%);
+}
+.setup-step {
+  display: flex;
+  align-items: baseline;
+  gap: .6rem;
+  padding: .45rem 0;
+  border-bottom: 1px solid var(--border-soft);
+  flex-wrap: wrap;
+}
+.setup-step:last-child { border-bottom: none; }
+.setup-step .pill { flex-shrink: 0; }
+.setup-label {
+  font-size: .95rem;
+}
+.setup-next {
+  border-bottom: 1px solid var(--acc);
+}
+.setup-why {
+  flex-basis: 100%;
+  padding-left: 4.5rem;
+  margin-top: .15rem;
+  color: var(--fg-muted);
+}

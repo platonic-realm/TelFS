@@ -1,6 +1,31 @@
 {{define "content"}}
 <h2>Dashboard</h2>
 
+{{if not .Setup.Complete}}
+<section class="card" id="setup-checklist">
+  <h3>Get started <small>— complete these to start using TelFS</small></h3>
+  <ol class="plain">
+    {{$nextSurfaced := false}}
+    {{range .Setup.Steps}}
+    <li class="setup-step">
+      {{if .Done}}
+        <span class="pill ok">done</span>
+        <span class="setup-label">{{.Label}}</span>
+      {{else if $nextSurfaced}}
+        <span class="pill muted">pending</span>
+        <span class="setup-label">{{.Label}}</span>
+      {{else}}
+        <span class="pill acc">next</span>
+        <a href="{{.Href}}" class="setup-label setup-next"><strong>{{.Label}}</strong></a>
+        {{if .Why}}<div class="setup-why"><small>{{.Why}}</small></div>{{end}}
+        {{$nextSurfaced = true}}
+      {{end}}
+    </li>
+    {{end}}
+  </ol>
+</section>
+{{end}}
+
 <section class="card">
   <h3>Profile</h3>
   <dl>
