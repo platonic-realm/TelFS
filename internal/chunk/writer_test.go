@@ -362,3 +362,95 @@ func TestAsyncUploadPipeline(t *testing.T) {
 	}
 }
 
+
+// TestEagerFlushCorrectness simulates a cp-like sequential write pattern
+// at sufficient scale to trigger eager-flush. Reads back via Reader and
+// compares to the original source. If TelFS's eager-flush corrupts
+// data, this fails deterministically.
+//
+// Setup: chunkSize=64 bytes, dirtyCap=256 bytes (4 chunks). Source is
+// 1024 bytes (16 chunks). 8-byte writes (mimics cp's 128 KiB writes
+// vs 4 MiB chunks). Eager flush fires after 4 chunks accumulate; each
+// new chunk after that triggers one flush.
+func TestEagerFlushCorrectness(t *testing.T) {
+	w, _, _, _, ino := setupWriter(t, 64)
+	ctx := context.Background()
+	w.dirtyCap = 256
+
+	src := make([]byte, 1024)
+	for i := range src {
+		src[i] = byte(i & 0xff) // 0,1,...,255,0,1,...
+	}
+	// Write in 8-byte chunks, sequential.
+	for off := 0; off < len(src); off += 8 {
+		if _, err := w.WriteAt(ctx, src[off:off+8], int64(off)); err != nil {
+			t.Fatalf("WriteAt off=%d: %v", off, err)
+		}
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// Read back via Reader.
+	r := NewReader(w.meta, w.cache, w.chunkSz)
+	dest := make([]byte, len(src))
+	n, err := r.ReadAt(ctx, ino, dest, 0)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if n != len(src) {
+		t.Errorf("read %d bytes, want %d", n, len(src))
+	}
+	if !bytes.Equal(src, dest) {
+		// Find first mismatch chunk
+		for i := 0; i < len(src); i += 64 {
+			if !bytes.Equal(src[i:i+64], dest[i:i+64]) {
+				t.Errorf("first chunk mismatch at offset %d (chunk %d)", i, i/64)
+				t.Errorf("  want first 16 bytes: %v", src[i:i+16])
+				t.Errorf("  got  first 16 bytes: %v", dest[i:i+16])
+				return
+			}
+		}
+	}
+}
+
+// TestEagerFlushRealScale uses production chunk size (4 MiB) and a
+// proportional dirty cap to verify the eager-flush path works at real
+// scale. Writes 16 MiB (4 chunks) with 128 KiB write granularity
+// (matching cp's typical block size); eager flush fires twice.
+func TestEagerFlushRealScale(t *testing.T) {
+	w, _, _, _, ino := setupWriter(t, 4<<20)
+	ctx := context.Background()
+	w.dirtyCap = 8 << 20
+
+	src := make([]byte, 16<<20)
+	for i := range src {
+		src[i] = byte(i & 0xff)
+	}
+	const writeSz = 128 << 10
+	for off := 0; off < len(src); off += writeSz {
+		if _, err := w.WriteAt(ctx, src[off:off+writeSz], int64(off)); err != nil {
+			t.Fatalf("WriteAt off=%d: %v", off, err)
+		}
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	r := NewReader(w.meta, w.cache, w.chunkSz)
+	dest := make([]byte, len(src))
+	n, err := r.ReadAt(ctx, ino, dest, 0)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if n != len(src) {
+		t.Errorf("read %d, want %d", n, len(src))
+	}
+	if !bytes.Equal(src, dest) {
+		for i := 0; i < len(src); i++ {
+			if src[i] != dest[i] {
+				t.Fatalf("first mismatch at byte %d: want %d got %d (chunk %d offset %d)",
+					i, src[i], dest[i], i/(4<<20), i%(4<<20))
+			}
+		}
+	}
+}

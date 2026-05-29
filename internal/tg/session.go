@@ -184,7 +184,7 @@ func (s *Session) PostMessage(ctx context.Context, text string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("send message: %w", err)
 	}
-	return extractNewMessageID(upd)
+	return extractNewMessageID(upd, rid)
 }
 
 // GetMessageText fetches a message by id and returns its text body.
@@ -230,7 +230,7 @@ func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, cap
 	if err != nil {
 		return 0, fmt.Errorf("send media: %w", err)
 	}
-	return extractNewMessageID(upd)
+	return extractNewMessageID(upd, rid)
 }
 
 // DownloadDocument fetches the document attached to msgID in the
@@ -344,25 +344,59 @@ func (s *Session) fetchDocument(ctx context.Context, msgID int) (*tg.Document, e
 }
 
 // extractNewMessageID walks the UpdatesClass returned by SendMessage /
-// SendMedia and finds the id of the message that was just created.
-func extractNewMessageID(upd tg.UpdatesClass) (int, error) {
+// SendMedia and finds the id of the message corresponding to the
+// caller's RandomID `rid`.
+//
+// MTProto's SendMessage / SendMedia responses can contain MULTIPLE
+// updates — including UpdateNewChannelMessage entries for messages
+// that other concurrent calls created. (We have at least three
+// background producers on one Session: the chunk write path, the
+// snapshot manager every 5 min, and the trash GC. Snapshot-while-cp
+// is the easy reproducer.) Picking the first UpdateNewChannelMessage
+// in the response — what we used to do — silently returns the wrong
+// message id whenever there's contention, which records the wrong
+// (ino, idx, tg_message_id) tuple in chunk_map and causes the
+// "preHash == readHash, file md5 differs" corruption pattern that
+// dogged v0.5..v0.7 on the live mount.
+//
+// The canonical Telegram primitive for "match my SendMedia call to
+// the server-assigned message id" is UpdateMessageID, which carries
+// our original RandomID alongside the new id. We use it
+// preferentially. If the server didn't include UpdateMessageID (some
+// API methods that return UpdateShortSentMessage don't), we fall back
+// to the first new-message update — that case is the no-contention
+// path and works correctly.
+func extractNewMessageID(upd tg.UpdatesClass, rid int64) (int, error) {
 	switch u := upd.(type) {
 	case *tg.UpdateShortSentMessage:
 		return u.ID, nil
 	case *tg.Updates:
-		for _, up := range u.Updates {
-			if id, ok := messageIDFromUpdate(up); ok {
-				return id, nil
-			}
-		}
+		return findIDByRandomID(u.Updates, rid)
 	case *tg.UpdatesCombined:
-		for _, up := range u.Updates {
-			if id, ok := messageIDFromUpdate(up); ok {
-				return id, nil
-			}
-		}
+		return findIDByRandomID(u.Updates, rid)
 	}
 	return 0, fmt.Errorf("no new-message update in response (%T)", upd)
+}
+
+// findIDByRandomID first looks for an UpdateMessageID whose RandomID
+// matches `rid` — that's the unambiguous answer. Without that, falls
+// back to the first new-message update.
+func findIDByRandomID(updates []tg.UpdateClass, rid int64) (int, error) {
+	for _, up := range updates {
+		if mid, ok := up.(*tg.UpdateMessageID); ok && mid.RandomID == rid {
+			return mid.ID, nil
+		}
+	}
+	// No UpdateMessageID in the response — typical for "stand-alone"
+	// sends with no other concurrent traffic. Use the first new-message
+	// update as before; safe because there's at most one such update in
+	// this case.
+	for _, up := range updates {
+		if id, ok := messageIDFromUpdate(up); ok {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("no UpdateMessageID for RandomID %d and no fallback new-message update", rid)
 }
 
 func messageIDFromUpdate(u tg.UpdateClass) (int, bool) {

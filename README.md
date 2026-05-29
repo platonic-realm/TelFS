@@ -649,23 +649,8 @@ with data.
   N separate entries under `/.trash`, restorable individually but not
   as a tree. Acceptable for the safety-net use case (typo undos);
   for archival, snapshot the FS instead.
-- **Single-file writes >256 MiB exercise an eager-flush path with a
-  known corruption bug.** Files ≤256 MiB are provably correct (the
-  whole file buffers in memory before any upload). Above the cap, the
-  writer drains chunks one at a time while accepting new ones; the
-  resulting interleaving has been observed to round-trip wrong bytes
-  through cp on live mounts. Split large copies into ≤200 MiB pieces
-  until this is fixed. A proper async upload pipeline (concurrent
-  drain + backpressure) is the planned fix; see the roadmap.
-
 ## Roadmap
 
-- **Async upload pipeline with bounded concurrency** to lift the
-  per-file 256 MiB practical limit. Today, files > the dirty cap go
-  through an eager-flush path that has a known corruption bug; the
-  v0.6 attempt to replace it with parallel uploads surfaced
-  additional race conditions that need more debugging before the
-  pipeline can be re-enabled.
 - **Passphrase rotation** via KEK-wrapped data key so changing the
   passphrase doesn't require re-encrypting every chunk.
 - **Channel-side journal between snapshots** to close the up-to-5-min
