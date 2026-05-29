@@ -30,7 +30,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Login — phone + code + 2FA (user account) | ✓ |
 | Login — bot token via `auth.ImportBotAuthorization` | ✓ |
 | Read/write mount (POSIX surface incl. hardlinks, symlinks, xattrs) | ✓ |
-| Multi-chunk files up to ~2 GiB per file | ✓ |
+| Multi-chunk files — no fixed per-file ceiling (chunk count × chunk size) | ✓ |
 | Cross-chunk-boundary reads/writes | ✓ verified by integration test |
 | Cold-mount recovery from channel snapshot | ✓ |
 | Read-only mode (`--readonly`) | ✓ |

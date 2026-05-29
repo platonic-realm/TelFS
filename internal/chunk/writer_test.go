@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -12,7 +13,10 @@ import (
 )
 
 // fakeUploader records uploads to a map and can be configured to fail.
+// The Writer now drives uploads concurrently (4 in-flight by default),
+// so every shared field needs its own synchronization.
 type fakeUploader struct {
+	mu      sync.Mutex // guards uploads
 	uploads map[int]byteBlob
 	nextID  atomic.Int64
 	// failFromIdx >= 0 means: fail every upload whose filename ends in
@@ -36,15 +40,30 @@ func (f *fakeUploader) UploadDocument(_ context.Context, r io.Reader, filename, 
 		return 0, err
 	}
 	if f.failFromIdx >= 0 {
-		// Parse the trailing -idx<N> from the filename our Writer uses.
 		var idx int32
 		if err := parseIdxSuffix(filename, &idx); err == nil && idx >= f.failFromIdx {
 			return 0, f.failErr
 		}
 	}
 	id := int(f.nextID.Add(1))
+	f.mu.Lock()
 	f.uploads[id] = byteBlob{name: filename, data: data}
+	f.mu.Unlock()
 	return id, nil
+}
+
+// get returns a shallow snapshot suitable for inspection.
+func (f *fakeUploader) get(id int) (byteBlob, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.uploads[id]
+	return b, ok
+}
+
+func (f *fakeUploader) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.uploads)
 }
 
 // parseIdxSuffix extracts N from "...-idxN" filenames.
@@ -69,7 +88,7 @@ func parseIdxSuffix(name string, out *int32) error {
 type writerFetcher struct{ uploader *fakeUploader }
 
 func (f writerFetcher) Fetch(_ context.Context, _ Key, msgID int64) ([]byte, error) {
-	blob, ok := f.uploader.uploads[int(msgID)]
+	blob, ok := f.uploader.get(int(msgID))
 	if !ok {
 		return nil, errors.New("no such msg")
 	}
@@ -303,3 +322,43 @@ func TestTruncateGrowUpdatesSize(t *testing.T) {
 		t.Fatalf("meta size = %d, want 100", in.Size)
 	}
 }
+
+// TestAsyncUploadPipeline verifies that the async dispatch + buffered-
+// write pattern works end-to-end: many small sequential writes pile
+// bytes well beyond the dirty cap, eager flush kicks in, every chunk
+// lands in chunk_map, and the final size is right.
+//
+// This is the regression test for the "PC hangs on 8 GB copy" bug —
+// before the async pipeline, eager flush held the per-handle mutex
+// through the full network round-trip, blocking new FUSE writes and
+// wedging the kernel's writeback queue. The fact that this test
+// completes promptly (and doesn't deadlock) is the property we care
+// about; the upload-concurrency tunable is a separate dimension (see
+// DefaultUploadConcurrency).
+func TestAsyncUploadPipeline(t *testing.T) {
+	w, m, _, _, ino := setupWriter(t, 16) // 16-byte chunks
+	ctx := context.Background()
+
+	// Write 32 chunks worth (512 B) — past the dirty cap so eager
+	// dispatch runs at least a few times during the write loop.
+	w.dirtyCap = 32
+	const total = 32 * 16
+	for i := 0; i < total; i++ {
+		buf := []byte{byte(i & 0xff)}
+		if _, err := w.WriteAt(ctx, buf, int64(i)); err != nil {
+			t.Fatalf("WriteAt %d: %v", i, err)
+		}
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	chunks, _ := m.ListChunks(ctx, ino)
+	if len(chunks) != 32 {
+		t.Errorf("chunk_map count = %d, want 32", len(chunks))
+	}
+	in, _ := m.GetInode(ctx, ino)
+	if in.Size != total {
+		t.Errorf("file size = %d, want %d", in.Size, total)
+	}
+}
+
