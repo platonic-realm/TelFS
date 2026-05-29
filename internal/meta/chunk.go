@@ -120,6 +120,118 @@ func (s *Store) AllChunkMessageIDs(ctx context.Context) (map[int64]struct{}, err
 	return out, rows.Err()
 }
 
+// ReuseChunkByHash atomically reuses an existing channel chunk for a
+// new (ino, idx) slot if the content hash matches a previously uploaded
+// blob AND that blob's channel message is still referenced by some
+// chunk_map row (i.e., the GC hasn't reaped it).
+//
+// Returns (reused=true, ...) when the chunk_blob index found a live
+// match and a chunk_map row was written; the caller then skips the
+// upload entirely. Returns (reused=false, ...) when no match exists,
+// or when the indexed entry pointed at a dead message — the caller
+// uploads as usual and then calls RecordChunkBlob with the new msg id.
+//
+// The check + insert happen in one transaction so the GC (running
+// against `chunk_map` as the source of truth) can never delete the
+// shared message between the aliveness check and the new row's commit.
+func (s *Store) ReuseChunkByHash(ctx context.Context, ino int64, idx int32, hash []byte) (reused bool, msgID int64, size int32, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, 0, 0, err
+	}
+	defer tx.Rollback()
+
+	var blobMsgID int64
+	var blobSize int32
+	err = tx.QueryRowContext(ctx,
+		`SELECT tg_message_id, size FROM chunk_blob WHERE hash = ?`, hash).
+		Scan(&blobMsgID, &blobSize)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0, 0, tx.Commit()
+	}
+	if err != nil {
+		return false, 0, 0, fmt.Errorf("reuse lookup: %w", err)
+	}
+	// Aliveness gate: the blob index can outlive the underlying message
+	// if `telfs gc` ran since the blob was indexed. Only reuse when at
+	// least one chunk_map row still references the message.
+	var probe int
+	err = tx.QueryRowContext(ctx,
+		`SELECT 1 FROM chunk_map WHERE tg_message_id = ? LIMIT 1`, blobMsgID).Scan(&probe)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Stale entry: chunk_map no longer holds it, treat as miss. We
+		// don't delete the row here — the upload path replaces it with
+		// the fresh msg id.
+		return false, 0, 0, tx.Commit()
+	}
+	if err != nil {
+		return false, 0, 0, fmt.Errorf("reuse alive-check: %w", err)
+	}
+	// Live hit. Insert the new chunk_map row in the same tx. Use
+	// INSERT OR REPLACE in case (ino, idx) is being overwritten.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO chunk_map(ino, idx, tg_message_id, size)
+		   VALUES (?,?,?,?)
+		 ON CONFLICT(ino, idx) DO UPDATE SET
+		   tg_message_id = excluded.tg_message_id,
+		   size          = excluded.size`,
+		ino, idx, blobMsgID, blobSize); err != nil {
+		return false, 0, 0, fmt.Errorf("reuse put chunk: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, 0, 0, err
+	}
+	return true, blobMsgID, blobSize, nil
+}
+
+// RecordChunkBlob upserts the (hash → msg_id, size) index entry after a
+// fresh upload. Called by the writer's upload path immediately after
+// PutChunk lands the chunk_map row, so subsequent identical writes can
+// dedup.
+func (s *Store) RecordChunkBlob(ctx context.Context, hash []byte, msgID int64, size int32) error {
+	if len(hash) == 0 {
+		return errors.New("RecordChunkBlob: empty hash")
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO chunk_blob(hash, tg_message_id, size)
+		   VALUES (?,?,?)
+		 ON CONFLICT(hash) DO UPDATE SET
+		   tg_message_id = excluded.tg_message_id,
+		   size          = excluded.size`,
+		hash, msgID, size)
+	if err != nil {
+		return fmt.Errorf("record chunk blob: %w", err)
+	}
+	return nil
+}
+
+// PruneStaleChunkBlobs deletes chunk_blob index entries whose
+// tg_message_id no longer appears in chunk_map. Run after `telfs gc`
+// to keep the dedup index honest; safe to skip (the ReuseChunkByHash
+// path re-checks aliveness in-line either way). Returns the number of
+// stale rows removed.
+func (s *Store) PruneStaleChunkBlobs(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM chunk_blob
+		  WHERE tg_message_id NOT IN (SELECT DISTINCT tg_message_id FROM chunk_map)`)
+	if err != nil {
+		return 0, fmt.Errorf("prune chunk blobs: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// CountChunkBlobs returns the number of distinct content blobs we've
+// indexed. Useful for the status command and tests.
+func (s *Store) CountChunkBlobs(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunk_blob`).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // DeleteChunksAbove removes every chunk with idx >= startIdx for the
 // given inode. Used by truncate when the file shrinks past a chunk
 // boundary. Returns the number of rows deleted.

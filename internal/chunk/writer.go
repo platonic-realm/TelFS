@@ -3,6 +3,7 @@ package chunk
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -505,6 +506,34 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		w.mu.Unlock()
 	}()
 
+	// Content-addressed dedup (plaintext FSes only): hash the chunk
+	// bytes and ask meta whether an existing channel message holds the
+	// same content. The reuse path inserts the chunk_map row in the
+	// same transaction as the aliveness check, so GC can never delete
+	// the shared message between the check and our reference.
+	//
+	// Why plaintext only: encrypted chunks use random per-chunk nonces
+	// and (ino, idx)-bound AAD, so the same plaintext yields a
+	// different ciphertext for every slot. Sharing the ciphertext
+	// across slots would require either convergent encryption or
+	// rebinding the AAD — both are wire-format changes that need their
+	// own opt-in. Encrypted FSes get the existing upload-every-time
+	// behavior.
+	if w.dedupEnabled() {
+		sum := sha256.Sum256(dc.data)
+		reused, blobMsgID, _, derr := w.meta.ReuseChunkByHash(context.Background(), w.ino, idx, sum[:])
+		if derr != nil {
+			restore = true
+			w.recordError(fmt.Errorf("dedup lookup %d: %w", idx, derr))
+			return
+		}
+		if reused {
+			w.cache.Invalidate(Key{Ino: w.ino, Idx: idx})
+			_ = blobMsgID
+			return
+		}
+	}
+
 	wire, err := w.cipher.Seal(w.ino, idx, dc.data)
 	if err != nil {
 		restore = true
@@ -539,7 +568,27 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		w.recordError(fmt.Errorf("chunk_map %d: %w", idx, err))
 		return
 	}
+	if w.dedupEnabled() {
+		// Best-effort index update. A failure here doesn't lose data —
+		// the chunk is on the channel, chunk_map points at it — it just
+		// means future identical writes won't dedup. Surface via stderr
+		// rather than restoring the upload (which would re-upload and
+		// orphan the just-landed message).
+		sum := sha256.Sum256(dc.data)
+		if err := w.meta.RecordChunkBlob(context.Background(), sum[:], int64(msgID), int32(len(dc.data))); err != nil {
+			fmt.Fprintf(os.Stderr, "[writer] record blob index ino=%d idx=%d: %v\n", w.ino, idx, err)
+		}
+	}
 	w.cache.Invalidate(Key{Ino: w.ino, Idx: idx})
+}
+
+// dedupEnabled reports whether this writer should attempt content-
+// addressed reuse for outgoing chunks. Only true when the FS is
+// plaintext (NoopCipher) — see the rationale at the call site in
+// uploadOne.
+func (w *Writer) dedupEnabled() bool {
+	_, noop := w.cipher.(crypto.NoopCipher)
+	return noop
 }
 
 // recordError sets the sticky uploadErr (first-wins). It does NOT

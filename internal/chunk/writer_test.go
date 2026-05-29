@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"telfs/internal/crypto"
 	"telfs/internal/meta"
 )
 
@@ -452,5 +453,103 @@ func TestEagerFlushRealScale(t *testing.T) {
 					i, src[i], dest[i], i/(4<<20), i%(4<<20))
 			}
 		}
+	}
+}
+
+// TestDedupReusesIdenticalContent verifies the content-addressed
+// dedup path: writing the same plaintext to two different inodes
+// triggers exactly ONE channel upload; the second write reuses the
+// first chunk's tg_message_id via chunk_blob.
+func TestDedupReusesIdenticalContent(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino1, _ := m.CreateChild(ctx, meta.RootIno, "a", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	ino2, _ := m.CreateChild(ctx, meta.RootIno, "b", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+
+	payload := []byte("the same content twice")
+
+	// Write to ino1 → first upload.
+	w1, err := NewWriter(ctx, m, cache, up, nil, ino1, 1024, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w1.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w1.Close()
+	if got := up.count(); got != 1 {
+		t.Fatalf("after first write: %d uploads, want 1", got)
+	}
+
+	// Write IDENTICAL content to ino2 → must reuse, no new upload.
+	w2, err := NewWriter(ctx, m, cache, up, nil, ino2, 1024, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w2.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w2.Close()
+	if got := up.count(); got != 1 {
+		t.Fatalf("after dedup'd write: %d uploads, want 1 (reuse)", got)
+	}
+
+	// Both inodes' chunk_map rows should point at the same msg id.
+	c1, _ := m.GetChunk(ctx, ino1, 0)
+	c2, _ := m.GetChunk(ctx, ino2, 0)
+	if c1.TGMessageID != c2.TGMessageID {
+		t.Fatalf("dedup didn't share msg id: %d vs %d", c1.TGMessageID, c2.TGMessageID)
+	}
+	if c1.Size != int32(len(payload)) || c2.Size != int32(len(payload)) {
+		t.Fatalf("dedup'd row size wrong: %d/%d", c1.Size, c2.Size)
+	}
+}
+
+// TestDedupSkippedWhenEncrypted: with a non-Noop cipher, dedup is
+// disabled — identical writes upload twice (the existing pre-v0.15
+// behavior, preserved so encrypted FSes don't accidentally cross-
+// reference ciphertexts under different (ino, idx) AAD).
+func TestDedupSkippedWhenEncrypted(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino1, _ := m.CreateChild(ctx, meta.RootIno, "a", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	ino2, _ := m.CreateChild(ctx, meta.RootIno, "b", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+
+	key := make([]byte, 32) // all-zero key is fine for the test
+	cipher, err := crypto.NewAESGCM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte("encrypted content")
+	for _, ino := range []int64{ino1, ino2} {
+		w, err := NewWriter(ctx, m, cache, up, cipher, ino, 1024, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		w.Close()
+	}
+	if got := up.count(); got != 2 {
+		t.Fatalf("encrypted FS: %d uploads, want 2 (dedup must be off)", got)
+	}
+	blobs, _ := m.CountChunkBlobs(ctx)
+	if blobs != 0 {
+		t.Fatalf("encrypted FS indexed %d blobs, want 0", blobs)
 	}
 }

@@ -82,6 +82,7 @@ func cmdStatus(ctx context.Context, _ []string) error {
 
 	fmt.Println("\n== Encryption ==")
 	mode, err := metaStore.GetKV(ctx, crypto.KVMode)
+	encrypted := err == nil
 	if errors.Is(err, meta.ErrNotFound) {
 		fmt.Println("  disabled — chunk bytes are uploaded in the clear")
 	} else if err != nil {
@@ -91,6 +92,15 @@ func cmdStatus(ctx context.Context, _ []string) error {
 		if argon, err := metaStore.GetKV(ctx, crypto.KVArgon); err == nil {
 			fmt.Printf("  KDF params: %s\n", string(argon))
 		}
+	}
+
+	fmt.Println("\n== Dedup ==")
+	if encrypted {
+		fmt.Println("  disabled — encrypted FSes upload every chunk (AAD is bound per-slot)")
+	} else if blobs, err := metaStore.CountChunkBlobs(ctx); err == nil {
+		fmt.Printf("  active — %d distinct content blob(s) indexed\n", blobs)
+	} else {
+		fmt.Printf("  (error reading chunk_blob: %v)\n", err)
 	}
 
 	fmt.Println("\n== Last Snapshot ==")

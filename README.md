@@ -45,6 +45,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Web management UI (dashboard, login, mount, browser) | ✓ (`telfs web`) |
 | Trash safety-net — `rm` reroutes to `/.trash`, TTL GC | ✓ (`telfs trash`) |
 | Snapshot history + point-in-time restore (last 12 by default) | ✓ (`telfs snapshot`) |
+| Content-addressed chunk dedup (plaintext FSes) | ✓ (SHA-256 index, automatic) |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
 ## Bot vs user auth
@@ -307,6 +308,42 @@ Notes:
 The KDF parameters are stored in `meta_kv['crypto_argon_params']`,
 so a future TelFS with stronger defaults can still mount older
 filesystems.
+
+## Content-addressed chunk dedup
+
+On plaintext filesystems (no `encrypt init` performed), TelFS hashes
+every chunk's contents with SHA-256 and consults a `chunk_blob` table
+before uploading. If the same content is already on the channel, the
+new `chunk_map` row points at the existing message — no upload, no
+extra channel storage. Identical content across `cp file copy.bin`,
+duplicated regions inside the same file, and re-uploads of the same
+archive all collapse to a single channel message.
+
+The index is just a forward map (`hash → tg_message_id, size`); GC's
+liveness derivation still uses `chunk_map` as the single source of
+truth. Two consequences:
+
+- Sharing is safe under partial deletion. Unlinking one of N files
+  that reference a shared chunk leaves the other N-1 references
+  intact, so GC keeps the message alive. Only when no `chunk_map` row
+  references the message does `telfs gc` delete it.
+- Reuse is verified at runtime. Before pointing a new row at an
+  indexed message, the writer checks (in the same transaction) that
+  some `chunk_map` row still references it. A stale index entry —
+  e.g. its message was reaped by GC before the index was pruned —
+  falls through to a fresh upload.
+
+`telfs status` reports the number of distinct blobs indexed. `telfs
+gc` prunes any stale index entries after each channel-side cleanup.
+
+**Encryption interaction.** Dedup is **disabled** on encrypted
+filesystems. AES-GCM uses a random per-chunk nonce and binds the
+ciphertext to `(ino, idx)` via AAD, so the same plaintext yields a
+different ciphertext for every slot. Cross-slot reuse would require
+either convergent encryption (deterministic nonces, leaks
+confirmation-of-file to a channel observer) or rebinding the AAD to
+the content hash (wire-format change). Both are valid futures —
+tracked in the roadmap — but neither is silently enabled today.
 
 ## Maintenance
 
@@ -719,8 +756,10 @@ with data.
   for archival, snapshot the FS instead.
 ## Roadmap
 
-- **Content-addressed chunk dedup** — SHA-256 index on `chunk_map`;
-  identical chunks share one channel message.
+- **Convergent-encryption dedup mode** — extend dedup to encrypted
+  FSes via deterministic per-content nonces (opt-in; the standard
+  random-nonce mode stays the default since convergent encryption
+  enables a confirmation-of-file attack on the channel observer).
 - **First-run wizard in the web UI** — guide a new user through
   profile/login/channel/encryption/mount in one form.
 

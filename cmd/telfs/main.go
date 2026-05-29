@@ -873,6 +873,16 @@ func cmdGC(ctx context.Context, args []string) error {
 			fmt.Printf("Deleted %d/%d…\n", j, len(toDelete))
 		}
 		fmt.Printf("\nDone — %d messages deleted.\n", len(toDelete))
+		// Housekeeping: the dedup index (chunk_blob) may now point at
+		// freshly-deleted messages. Prune those rows so the next write
+		// doesn't pay an aliveness-check + tx-rollback per stale hit.
+		// Safe to skip on failure — ReuseChunkByHash re-checks aliveness
+		// in-line anyway.
+		if pruned, err := metaStore.PruneStaleChunkBlobs(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: prune chunk_blob index: %v\n", err)
+		} else if pruned > 0 {
+			fmt.Printf("Pruned %d stale dedup index entries.\n", pruned)
+		}
 		return nil
 	})
 }

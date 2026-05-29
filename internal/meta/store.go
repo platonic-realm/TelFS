@@ -123,6 +123,15 @@ CREATE TABLE IF NOT EXISTS meta_kv (
   key   TEXT PRIMARY KEY,
   value BLOB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS chunk_blob (
+  hash          BLOB    PRIMARY KEY,
+  tg_message_id INTEGER NOT NULL,
+  size          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_blob_msgid ON chunk_blob(tg_message_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_map_msgid  ON chunk_map(tg_message_id);
 `
 
 // Key in meta_kv that holds this filesystem's UUID. Set once on first
