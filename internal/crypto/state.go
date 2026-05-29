@@ -32,6 +32,15 @@ const (
 const (
 	ModeAESGCMv1 = "aes-gcm-v1"
 	ModeAESGCMv2 = "aes-gcm-v2"
+	// ModeAESGCMv3 is v2 + deterministic encryption: the chunk nonce is
+	// HMAC-SHA256(DEK, label || plaintext)[:12] instead of random, and
+	// the AAD is nil instead of (ino, idx). Same plaintext under the
+	// same DEK yields byte-identical ciphertext, which is what lets
+	// content-addressed dedup work on encrypted FSes. Trades equality-
+	// detection on the channel for the dedup ratio; see the comment on
+	// AESGCMConvergent in internal/crypto/convergent.go for the threat
+	// model and the GCM-nonce-reuse invariant.
+	ModeAESGCMv3 = "aes-gcm-v3"
 )
 
 // canaryPlaintext is the well-known string we encrypt under the FS key

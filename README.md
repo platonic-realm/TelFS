@@ -46,7 +46,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Web management UI (dashboard, login, mount, browser) | ✓ (`telfs web`) |
 | Trash safety-net — `rm` reroutes to `/.trash`, TTL GC | ✓ (`telfs trash`) |
 | Snapshot history + point-in-time restore (last 12 by default) | ✓ (`telfs snapshot`) |
-| Content-addressed chunk dedup (plaintext FSes) | ✓ (SHA-256 index, automatic) |
+| Content-addressed chunk dedup (plaintext + convergent-encrypted FSes) | ✓ (SHA-256 index; `--convergent` opt-in for encrypted) |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
 ## Bot vs user auth
@@ -312,11 +312,12 @@ filesystems.
 
 ## Content-addressed chunk dedup
 
-On plaintext filesystems (no `encrypt init` performed), TelFS hashes
-every chunk's contents with SHA-256 and consults a `chunk_blob` table
-before uploading. If the same content is already on the channel, the
-new `chunk_map` row points at the existing message — no upload, no
-extra channel storage. Identical content across `cp file copy.bin`,
+On plaintext filesystems (no `encrypt init` performed) AND on encrypted
+filesystems initialized with `--convergent`, TelFS hashes every chunk's
+contents with SHA-256 and consults a `chunk_blob` table before
+uploading. If the same content is already on the channel, the new
+`chunk_map` row points at the existing message — no upload, no extra
+channel storage. Identical content across `cp file copy.bin`,
 duplicated regions inside the same file, and re-uploads of the same
 archive all collapse to a single channel message.
 
@@ -337,14 +338,43 @@ truth. Two consequences:
 `telfs status` reports the number of distinct blobs indexed. `telfs
 gc` prunes any stale index entries after each channel-side cleanup.
 
-**Encryption interaction.** Dedup is **disabled** on encrypted
-filesystems. AES-GCM uses a random per-chunk nonce and binds the
-ciphertext to `(ino, idx)` via AAD, so the same plaintext yields a
-different ciphertext for every slot. Cross-slot reuse would require
-either convergent encryption (deterministic nonces, leaks
-confirmation-of-file to a channel observer) or rebinding the AAD to
-the content hash (wire-format change). Both are valid futures —
-tracked in the roadmap — but neither is silently enabled today.
+**Encryption interaction.** Dedup is **disabled** on default-encrypted
+filesystems (`aes-gcm-v1` / `aes-gcm-v2`). They use a random per-chunk
+nonce and bind ciphertext to `(ino, idx)` via AAD, so the same
+plaintext yields a different ciphertext for every slot. To enable
+dedup on an encrypted FS, opt in to **convergent mode** at init time:
+
+```sh
+telfs encrypt init --convergent
+```
+
+This selects `aes-gcm-v3`: the chunk nonce is
+`HMAC-SHA256(DEK, label || plaintext)[:12]` (deterministic, keyed on
+the per-FS DEK), and the AAD is nil. Identical plaintext under the
+same DEK yields byte-identical ciphertext, which is what makes dedup
+work. Trade-offs vs `aes-gcm-v2`:
+
+| Property | `aes-gcm-v2` (default) | `aes-gcm-v3` (`--convergent`) |
+|---|---|---|
+| Dedup on encrypted chunks | no | yes |
+| Channel observer can see *duplicate-chunk count* | no (every chunk is a unique blob) | yes |
+| Channel observer can verify they have a candidate file | no (needs DEK) | **no** (still needs DEK — confirmation-of-file does **not** apply here) |
+| Tampering / replay detection | yes (GCM tag) | yes (GCM tag) |
+| Passphrase rotation | yes (rewrap DEK) | yes (rewrap DEK) |
+
+Confirmation-of-file is the well-known weakness of classic convergent
+encryption schemes where the key is derived from the content (anyone
+can encrypt a guess and check). Here the nonce derivation is keyed on
+the per-FS DEK; an observer without the DEK cannot compute the
+ciphertext for a candidate plaintext, so possession cannot be tested.
+The residual leak is strictly equality detection (chunk-level
+identity, additive on top of the existing chunk-count metadata leak).
+
+The standards-track equivalent is **AES-GCM-SIV** (RFC 8452); the
+implementation here is a hand-rolled thinner variant. The invariant
+that keeps it safe: the HMAC input is the FULL chunk plaintext, never
+a prefix or a sample — anything else would collapse distinct
+plaintexts onto the same nonce, which is catastrophic for AES-GCM.
 
 ## Maintenance
 
@@ -796,10 +826,14 @@ with data.
   for archival, snapshot the FS instead.
 ## Roadmap
 
-- **Convergent-encryption dedup mode** — extend dedup to encrypted
-  FSes via deterministic per-content nonces (opt-in; the standard
-  random-nonce mode stays the default since convergent encryption
-  enables a confirmation-of-file attack on the channel observer).
+No named items currently outstanding. Open improvement directions:
+
+- A reproducible benchmark harness (`telfs bench`) for read/write
+  throughput regressions across the chunker, cache, and upload
+  pipeline.
+- Better error UX in the web UI on failed login / network errors.
+- Multi-mounter coordination (currently TelFS assumes one writer per
+  channel).
 
 See the [issues](https://github.com/platonic-realm/TelFS/issues) tab
 for the current state.

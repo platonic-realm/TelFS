@@ -95,12 +95,21 @@ func cmdStatus(ctx context.Context, _ []string) error {
 	}
 
 	fmt.Println("\n== Dedup ==")
-	if encrypted {
+	dedupEligible := !encrypted || string(mode) == crypto.ModeAESGCMv3
+	switch {
+	case !dedupEligible:
 		fmt.Println("  disabled — encrypted FSes upload every chunk (AAD is bound per-slot)")
-	} else if blobs, err := metaStore.CountChunkBlobs(ctx); err == nil {
-		fmt.Printf("  active — %d distinct content blob(s) indexed\n", blobs)
-	} else {
-		fmt.Printf("  (error reading chunk_blob: %v)\n", err)
+		fmt.Println("  to enable: re-init with `telfs encrypt init --convergent` on a fresh FS")
+	default:
+		if blobs, err := metaStore.CountChunkBlobs(ctx); err == nil {
+			label := "plaintext content"
+			if encrypted {
+				label = "convergent-encrypted content"
+			}
+			fmt.Printf("  active (%s) — %d distinct blob(s) indexed\n", label, blobs)
+		} else {
+			fmt.Printf("  (error reading chunk_blob: %v)\n", err)
+		}
 	}
 
 	fmt.Println("\n== Last Snapshot ==")

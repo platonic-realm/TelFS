@@ -583,12 +583,25 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 }
 
 // dedupEnabled reports whether this writer should attempt content-
-// addressed reuse for outgoing chunks. Only true when the FS is
-// plaintext (NoopCipher) — see the rationale at the call site in
-// uploadOne.
+// addressed reuse for outgoing chunks. True for any cipher that
+// declares itself deterministic — NoopCipher (plaintext FS) and
+// AESGCMConvergent (aes-gcm-v3 FS) qualify; the random-nonce AESGCM
+// used by v1/v2 does not. The marker interface lives in
+// internal/crypto so a future cipher type can opt in by implementing
+// it; the writer doesn't have to learn new concrete types.
+//
+// Why an interface rather than a Cipher-level method: a missing
+// Deterministic() on the random-nonce AESGCM is a compile-checked
+// guarantee that it cannot be silently flipped into dedup-eligible
+// state. Adding a method that returns false would put the safety in
+// a runtime bool.
+type dedupSafe interface {
+	Deterministic() bool
+}
+
 func (w *Writer) dedupEnabled() bool {
-	_, noop := w.cipher.(crypto.NoopCipher)
-	return noop
+	d, ok := w.cipher.(dedupSafe)
+	return ok && d.Deterministic()
 }
 
 // recordError sets the sticky uploadErr (first-wins). It does NOT

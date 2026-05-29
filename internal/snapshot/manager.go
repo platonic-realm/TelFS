@@ -228,10 +228,11 @@ func loadWrapOpts(ctx context.Context, m *meta.Store) (WrapOpts, error) {
 	opts := WrapOpts{
 		Mode: string(mode), Salt: salt, Argon: argonJSON, Canary: canary,
 	}
-	// v2 FSes also carry the wrapped DEK so cold recovery can produce
+	// v2 and v3 FSes carry the wrapped DEK so cold recovery can produce
 	// the DEK from (passphrase, salt, argon, wrappedDEK) without any
-	// local state.
-	if string(mode) == crypto.ModeAESGCMv2 {
+	// local state. v1 envelopes omit it — the passphrase derives the
+	// cipher key directly.
+	if string(mode) == crypto.ModeAESGCMv2 || string(mode) == crypto.ModeAESGCMv3 {
 		wrapped, err := m.GetKV(ctx, crypto.KVWrappedDEK)
 		if err != nil {
 			return WrapOpts{}, fmt.Errorf("wrapped DEK missing on v2 FS — inconsistent state: %w", err)

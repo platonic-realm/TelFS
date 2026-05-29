@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -27,7 +28,7 @@ func cmdEncrypt(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "init":
-		return cmdEncryptInit(ctx)
+		return cmdEncryptInit(ctx, args[1:])
 	case "status":
 		return cmdEncryptStatus(ctx)
 	case "rotate":
@@ -40,7 +41,20 @@ func cmdEncrypt(ctx context.Context, args []string) error {
 // cmdEncryptInit enables encryption on the local TelFS instance.
 // Hard rule: refuses if any chunk already exists. This is a one-way
 // configuration change.
-func cmdEncryptInit(ctx context.Context) error {
+//
+// Flags:
+//
+//	--convergent   use deterministic-encryption mode (aes-gcm-v3) so
+//	               chunk dedup also works on encrypted FSes. The
+//	               trade-off is that identical chunks produce
+//	               identical channel bytes — see README's
+//	               "Convergent encryption" section.
+func cmdEncryptInit(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("encrypt init", flag.ContinueOnError)
+	convergent := fs.Bool("convergent", false, "enable deterministic encryption (aes-gcm-v3) so encrypted chunks dedup")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -62,6 +76,17 @@ func cmdEncryptInit(ctx context.Context) error {
 		return fmt.Errorf("encrypt init: refuses to enable encryption when chunks already exist (%d chunks in chunk_map). "+
 			"Start a fresh TelFS instance with a new channel and `cp -r` your data over to encrypt existing files.", len(refs))
 	}
+	// Same guard for the dedup index: a non-empty chunk_blob from a
+	// prior plaintext lifetime points at messages we'd now be
+	// encrypting — leaving stale rows is unsafe.
+	if n, err := metaStore.CountChunkBlobs(ctx); err == nil && n > 0 {
+		return fmt.Errorf("encrypt init: chunk_blob index has %d entries from a prior plaintext lifetime; clear local state before enabling encryption", n)
+	}
+
+	mode := crypto.ModeAESGCMv2
+	if *convergent {
+		mode = crypto.ModeAESGCMv3
+	}
 
 	pass, err := promptNewPassphrase()
 	if err != nil {
@@ -79,10 +104,10 @@ func cmdEncryptInit(ctx context.Context) error {
 	kek := crypto.DeriveKey(pass, salt, params)
 	defer zero(kek)
 
-	// v2: generate a fresh DEK and wrap it under the KEK. Chunks +
-	// snapshots use the DEK, not the KEK directly, so rotation can
-	// re-wrap the DEK with a new KEK without touching any encrypted
-	// data on the channel.
+	// v2 and v3 both wrap a per-FS DEK under the KEK. v2 uses random-
+	// nonce AESGCM with (ino, idx) AAD; v3 uses deterministic nonces
+	// and nil AAD so identical plaintext produces identical
+	// ciphertext (enables encrypted dedup).
 	dek, err := crypto.NewDEK()
 	if err != nil {
 		return err
@@ -92,7 +117,7 @@ func cmdEncryptInit(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cipher, err := crypto.NewAESGCM(dek)
+	cipher, err := cipherForMode(mode, dek)
 	if err != nil {
 		return err
 	}
@@ -108,7 +133,7 @@ func cmdEncryptInit(ctx context.Context) error {
 		k string
 		v []byte
 	}{
-		{crypto.KVMode, []byte(crypto.ModeAESGCMv2)},
+		{crypto.KVMode, []byte(mode)},
 		{crypto.KVSalt, salt},
 		{crypto.KVArgon, argonJSON},
 		{crypto.KVCanary, canary},
@@ -118,10 +143,30 @@ func cmdEncryptInit(ctx context.Context) error {
 			return fmt.Errorf("persist %s: %w", kv.k, err)
 		}
 	}
-	fmt.Println("\nEncryption enabled (aes-gcm-v2).")
-	fmt.Println("Chunks + snapshots encrypted with a per-FS DEK; your passphrase wraps the DEK.")
+	fmt.Printf("\nEncryption enabled (%s).\n", mode)
+	if *convergent {
+		fmt.Println("Convergent mode: identical chunks produce identical channel bytes — enables dedup")
+		fmt.Println("on encrypted FSes. Channel observers can distinguish 'distinct chunk count' from")
+		fmt.Println("'total chunk count'. Confirmation-of-file is NOT possible (DEK secrecy still holds).")
+	} else {
+		fmt.Println("Chunks + snapshots encrypted with a per-FS DEK; your passphrase wraps the DEK.")
+	}
 	fmt.Println("Run `telfs encrypt rotate` to change the passphrase later without re-encrypting chunks.")
 	return nil
+}
+
+// cipherForMode returns the right Cipher implementation for the
+// declared mode + a 32-byte DEK. Centralizes the mode -> cipher
+// mapping so init / loadCipher / rotate all agree.
+func cipherForMode(mode string, dek []byte) (crypto.Cipher, error) {
+	switch mode {
+	case crypto.ModeAESGCMv1, crypto.ModeAESGCMv2:
+		return crypto.NewAESGCM(dek)
+	case crypto.ModeAESGCMv3:
+		return crypto.NewAESGCMConvergent(dek)
+	default:
+		return nil, fmt.Errorf("cipherForMode: unsupported crypto_mode %q", mode)
+	}
 }
 
 // cmdEncryptRotate changes the passphrase without re-encrypting any
@@ -157,8 +202,8 @@ func cmdEncryptRotate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if string(mode) != crypto.ModeAESGCMv2 {
-		return fmt.Errorf("encrypt rotate: only supported on aes-gcm-v2 filesystems "+
+	if string(mode) != crypto.ModeAESGCMv2 && string(mode) != crypto.ModeAESGCMv3 {
+		return fmt.Errorf("encrypt rotate: only supported on aes-gcm-v2 / aes-gcm-v3 filesystems "+
 			"(this one is %q); migrate by `cp -r` to a fresh profile if rotation is needed", string(mode))
 	}
 
@@ -212,9 +257,10 @@ func cmdEncryptRotate(ctx context.Context) error {
 		return err
 	}
 
-	// Re-seal the canary too (same plaintext, fresh nonce — keeps the
-	// stored state consistent with a fresh init).
-	cipher, err := crypto.NewAESGCM(dek)
+	// Re-seal the canary too (same plaintext, deterministic-or-fresh
+	// nonce depending on mode — keeps the stored state consistent
+	// with a fresh init under the same mode).
+	cipher, err := cipherForMode(string(mode), dek)
 	if err != nil {
 		return err
 	}
@@ -272,10 +318,13 @@ func cmdEncryptStatus(ctx context.Context) error {
 		fmt.Printf("KDF params:  %s\n", string(argon))
 	}
 	switch string(mode) {
-	case crypto.ModeAESGCMv2:
+	case crypto.ModeAESGCMv2, crypto.ModeAESGCMv3:
 		fmt.Println("Rotation:    supported — `telfs encrypt rotate`.")
 	case crypto.ModeAESGCMv1:
 		fmt.Println("Rotation:    NOT supported on v1 — passphrase change requires re-encrypting all chunks.")
+	}
+	if string(mode) == crypto.ModeAESGCMv3 {
+		fmt.Println("Dedup:       enabled (convergent) — identical chunks share one channel message.")
 	}
 	fmt.Println("Passphrase is required to mount. Set TELFS_PASSPHRASE to skip the prompt.")
 	return nil
@@ -332,17 +381,17 @@ func loadCipher(ctx context.Context, m *meta.Store) (crypto.Cipher, error) {
 			return nil, err
 		}
 		return cipher, nil
-	case crypto.ModeAESGCMv2:
+	case crypto.ModeAESGCMv2, crypto.ModeAESGCMv3:
 		wrappedDEK, err := m.GetKV(ctx, crypto.KVWrappedDEK)
 		if err != nil {
-			return nil, fmt.Errorf("loadCipher: wrapped_dek missing on v2 FS: %w", err)
+			return nil, fmt.Errorf("loadCipher: wrapped_dek missing on %s FS: %w", string(mode), err)
 		}
 		dek, err := crypto.UnwrapDEK(derived, wrappedDEK)
 		if err != nil {
 			return nil, err
 		}
 		defer zero(dek)
-		cipher, err := crypto.NewAESGCM(dek)
+		cipher, err := cipherForMode(string(mode), dek)
 		if err != nil {
 			return nil, err
 		}
@@ -351,7 +400,7 @@ func loadCipher(ctx context.Context, m *meta.Store) (crypto.Cipher, error) {
 		}
 		return cipher, nil
 	default:
-		return nil, fmt.Errorf("loadCipher: unsupported crypto_mode %q", string(mode))
+		return nil, fmt.Errorf("loadCipher: unsupported crypto_mode %q (this binary may be older than the FS — upgrade telfs)", string(mode))
 	}
 }
 

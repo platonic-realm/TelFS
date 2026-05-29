@@ -232,17 +232,20 @@ func checkCryptoState(ctx context.Context, m *meta.Store) []finding {
 	switch string(mode) {
 	case crypto.ModeAESGCMv1:
 		// v1 has no wrapped DEK by design.
-	case crypto.ModeAESGCMv2:
+	case crypto.ModeAESGCMv2, crypto.ModeAESGCMv3:
 		wrapped, err := m.GetKV(ctx, crypto.KVWrappedDEK)
 		if err != nil {
-			out = append(out, errorf("crypto", "v2 FS missing crypto_wrapped_dek: %v", err))
+			out = append(out, errorf("crypto", "%s FS missing crypto_wrapped_dek: %v", string(mode), err))
 		} else if len(wrapped) < 12+32 {
 			out = append(out, errorf("crypto", "crypto_wrapped_dek length %d too short for nonce+DEK+tag", len(wrapped)))
 		} else {
 			out = append(out, okf("crypto", "wrapped DEK present (%d bytes; %s nonce)", len(wrapped), hex.EncodeToString(wrapped[:4])+"..."))
 		}
+		if string(mode) == crypto.ModeAESGCMv3 {
+			out = append(out, infof("crypto", "convergent mode: chunks dedup on identical content; channel observers can distinguish duplicate-chunk count"))
+		}
 	default:
-		out = append(out, errorf("crypto", "unknown crypto_mode %q", string(mode)))
+		out = append(out, errorf("crypto", "unknown crypto_mode %q (this binary may be older than the FS)", string(mode)))
 	}
 	return out
 }

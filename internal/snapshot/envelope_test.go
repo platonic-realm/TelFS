@@ -247,6 +247,65 @@ func TestEnvelopeV2RotationSimulated(t *testing.T) {
 	}
 }
 
+// TestEnvelopeV3RoundTrip mirrors v3 cold-recovery: passphrase → KEK
+// → unwrap(envelope.WrappedDEK) → DEK → AESGCMConvergent → canary +
+// body decrypt. Identical to v2 in structure; the only difference is
+// the cipher type once the DEK is in hand. Verifies that the snapshot
+// envelope path is correctly routed for v3, since a regression here
+// would make every v3 FS unrecoverable after cache wipe.
+func TestEnvelopeV3RoundTrip(t *testing.T) {
+	params := crypto.ArgonParams{Time: 1, Memory: 8 * 1024, Threads: 1}
+	argonJSON, _ := crypto.MarshalArgonParams(params)
+	salt, _ := crypto.NewSalt()
+	passphrase := []byte("convergent-pass")
+	kek := crypto.DeriveKey(passphrase, salt, params)
+
+	dek, _ := crypto.NewDEK()
+	wrappedDEK, _ := crypto.WrapDEK(kek, dek)
+	bodyCipher, err := crypto.NewAESGCMConvergent(dek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canary, _ := crypto.SealCanary(bodyCipher)
+
+	plaintext := []byte("a v3 snapshot body — same envelope format, different cipher")
+	wrapped, err := Wrap(bodyCipher, WrapOpts{
+		Mode:       crypto.ModeAESGCMv3,
+		Salt:       salt,
+		Argon:      argonJSON,
+		Canary:     canary,
+		WrappedDEK: wrappedDEK,
+	}, plaintext)
+	if err != nil {
+		t.Fatalf("Wrap v3: %v", err)
+	}
+
+	// Recovery side: rebuild from envelope + passphrase only.
+	hdr, body, err := UnwrapHeaderAndBody(wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Mode != crypto.ModeAESGCMv3 {
+		t.Fatalf("envelope mode: got %q want %q", hdr.Mode, crypto.ModeAESGCMv3)
+	}
+	recoveredKEK := crypto.DeriveKey(passphrase, hdr.Salt, params)
+	recoveredDEK, err := crypto.UnwrapDEK(recoveredKEK, hdr.WrappedDEK)
+	if err != nil {
+		t.Fatalf("UnwrapDEK v3: %v", err)
+	}
+	recoveredCipher, _ := crypto.NewAESGCMConvergent(recoveredDEK)
+	if err := crypto.VerifyCanary(recoveredCipher, hdr.Canary); err != nil {
+		t.Fatalf("VerifyCanary v3: %v", err)
+	}
+	got, err := recoveredCipher.Open(0, -1, body)
+	if err != nil {
+		t.Fatalf("Open v3 body: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("v3 envelope round-trip mismatch")
+	}
+}
+
 // TestIsWrappedRejectsPlaintextGzip — a plaintext gzipped DB starts
 // with 0x1F 0x8B; IsWrapped must say "not a wrapped envelope" for
 // those, so the dual-path recovery code routes correctly.

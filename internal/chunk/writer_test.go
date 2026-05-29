@@ -553,3 +553,90 @@ func TestDedupSkippedWhenEncrypted(t *testing.T) {
 		t.Fatalf("encrypted FS indexed %d blobs, want 0", blobs)
 	}
 }
+
+// TestDedupWithConvergentCipher exercises the full v3 path: two
+// inodes write identical plaintext through an AESGCMConvergent
+// cipher, and dedup MUST take effect (only one upload). Then both
+// inodes' chunks must read back via the SAME underlying channel
+// message under the SAME cipher — proving Open is mode-correct
+// (nil AAD, ignores ino/idx).
+func TestDedupWithConvergentCipher(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino1, _ := m.CreateChild(ctx, meta.RootIno, "a", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	ino2, _ := m.CreateChild(ctx, meta.RootIno, "b", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i ^ 0x5A)
+	}
+	cipher, err := crypto.NewAESGCMConvergent(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte("identical plaintext under convergent v3 — dedup must collapse")
+
+	// Write payload to ino1 via convergent cipher.
+	w1, err := NewWriter(ctx, m, cache, up, cipher, ino1, 1024, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w1.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w1.Close()
+	if got := up.count(); got != 1 {
+		t.Fatalf("after first encrypted write: %d uploads, want 1", got)
+	}
+
+	// Write IDENTICAL payload to ino2 — dedup MUST kick in (zero new
+	// uploads) because the convergent cipher produces the same
+	// ciphertext bytes.
+	w2, err := NewWriter(ctx, m, cache, up, cipher, ino2, 1024, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w2.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w2.Close()
+	if got := up.count(); got != 1 {
+		t.Fatalf("after dedup'd v3 write: %d uploads, want 1 (reuse)", got)
+	}
+
+	// Both inodes should point at the same tg_message_id.
+	c1, _ := m.GetChunk(ctx, ino1, 0)
+	c2, _ := m.GetChunk(ctx, ino2, 0)
+	if c1.TGMessageID != c2.TGMessageID {
+		t.Fatalf("v3 dedup didn't share msg id: %d vs %d", c1.TGMessageID, c2.TGMessageID)
+	}
+
+	// CRITICAL: the on-channel ciphertext must decrypt cleanly under
+	// BOTH (ino1, idx=0) and (ino2, idx=0) — that's the property
+	// that breaks if Open mistakenly uses (ino, idx) as AAD.
+	blob, ok := up.get(int(c1.TGMessageID))
+	if !ok {
+		t.Fatal("uploaded blob missing")
+	}
+	for _, slot := range []struct {
+		ino int64
+		idx int32
+	}{{ino1, 0}, {ino2, 0}} {
+		pt, err := cipher.Open(slot.ino, slot.idx, blob.data)
+		if err != nil {
+			t.Fatalf("Open(%d, %d) failed on shared v3 ciphertext: %v — dedup'd reads are broken", slot.ino, slot.idx, err)
+		}
+		if !bytes.Equal(pt, payload) {
+			t.Fatalf("Open(%d, %d) returned wrong plaintext", slot.ino, slot.idx)
+		}
+	}
+}

@@ -67,9 +67,12 @@ Usage:
                                       Flags: --readonly --allow-other --debug --no-recover
   telfs init [--chunk-size N]       Initialize FS settings before first mount.
   telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
-  telfs encrypt init                Enable AES-256-GCM for this filesystem.
+  telfs encrypt init [--convergent] Enable AES-256-GCM for this filesystem.
+                                      --convergent picks aes-gcm-v3 so encrypted
+                                      chunks also dedup (trade-off: equality
+                                      detection visible on the channel).
   telfs encrypt status              Show whether encryption is enabled.
-  telfs encrypt rotate              Change passphrase without re-encrypting chunks (v2 FSes).
+  telfs encrypt rotate              Change passphrase without re-encrypting chunks (v2/v3 FSes).
   telfs profile {list,show,create,delete,use,export,import}
                                     Manage multiple profiles (accounts/channels).
   telfs status                      One-screen summary of the active profile.
@@ -746,21 +749,21 @@ func maybeUnwrapEncrypted(data []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-	case crypto.ModeAESGCMv2:
+	case crypto.ModeAESGCMv2, crypto.ModeAESGCMv3:
 		if len(hdr.WrappedDEK) == 0 {
-			return nil, fmt.Errorf("snapshot: v2 envelope missing wrapped_dek")
+			return nil, fmt.Errorf("snapshot: %s envelope missing wrapped_dek", hdr.Mode)
 		}
 		dek, derr := crypto.UnwrapDEK(derived, hdr.WrappedDEK)
 		if derr != nil {
 			return nil, derr
 		}
 		defer zero(dek)
-		cipher, err = crypto.NewAESGCM(dek)
+		cipher, err = cipherForMode(hdr.Mode, dek)
 		if err != nil {
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("snapshot: unsupported envelope mode %q", hdr.Mode)
+		return nil, fmt.Errorf("snapshot: unsupported envelope mode %q (this binary may be older than the FS — upgrade telfs)", hdr.Mode)
 	}
 
 	if err := crypto.VerifyCanary(cipher, hdr.Canary); err != nil {
