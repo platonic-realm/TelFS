@@ -1,12 +1,15 @@
 package tg
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"time"
 
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/telegram/uploader"
@@ -196,15 +199,60 @@ func (s *Session) GetMessageText(ctx context.Context, msgID int) (string, error)
 	return msg.Message, nil
 }
 
+// uploadMaxAttempts caps how many times UploadDocument will retry a
+// transient failure. Each attempt is a fresh uploader.NewUploader +
+// SaveFilePart chain, so retrying isn't free — but it's much cheaper
+// than propagating EIO to the FUSE write path and forcing the user
+// to retry the entire cp.
+const uploadMaxAttempts = 4
+
 // UploadDocument uploads the contents of r as a document attached to a
 // message in the configured channel. The document is sent with the given
 // filename (used for the DocumentAttributeFilename) and optional caption.
 // Returns the new message id.
+//
+// The reader is buffered up-front so the upload can be retried on
+// transient gotd errors ("engine forcibly closed", connection reset,
+// i/o timeout) without the caller having to re-stage the source. We
+// don't retry caller-canceled contexts (Close racing a Flush) — that's
+// honest cancellation. FLOOD_WAIT is handled before reaching us by
+// the gotd middleware.
 func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, caption string) (int, error) {
 	peer, _, err := s.channelPeer()
 	if err != nil {
 		return 0, err
 	}
+	// Buffer once — the reader is typically a chunk's wire bytes (≤ 4 MiB
+	// at default chunk size + GCM overhead), so the memory cost is bounded.
+	body, err := io.ReadAll(r)
+	if err != nil {
+		return 0, fmt.Errorf("read upload bytes: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= uploadMaxAttempts; attempt++ {
+		if attempt > 1 {
+			// 1s, 2s, 4s exponential backoff between retries.
+			delay := time.Duration(1<<(attempt-2)) * time.Second
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		msgID, err := s.tryUploadOnce(ctx, peer, bytes.NewReader(body), filename, caption)
+		if err == nil {
+			return msgID, nil
+		}
+		lastErr = err
+		if !isRetriableUploadErr(ctx, err) {
+			return 0, err
+		}
+	}
+	return 0, fmt.Errorf("upload failed after %d attempts: %w", uploadMaxAttempts, lastErr)
+}
+
+func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, r io.Reader, filename, caption string) (int, error) {
 	u := uploader.NewUploader(s.api)
 	uf, err := u.FromReader(ctx, filename, r)
 	if err != nil {
@@ -231,6 +279,31 @@ func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, cap
 		return 0, fmt.Errorf("send media: %w", err)
 	}
 	return extractNewMessageID(upd, rid)
+}
+
+// isRetriableUploadErr decides whether an UploadDocument failure looks
+// transient enough to be worth retrying. We never retry once the
+// caller's ctx is done (honest shutdown). Otherwise we look for the
+// few gotd error stringings we've actually observed in the wild —
+// keeping the allow-list narrow so a real misconfiguration (bad
+// channel id, expired session) doesn't get masked by a retry loop.
+func isRetriableUploadErr(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{
+		"engine forcibly closed",
+		"connection reset",
+		"i/o timeout",
+		"broken pipe",
+		"unexpected EOF",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // DownloadDocument fetches the document attached to msgID in the
