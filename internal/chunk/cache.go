@@ -182,6 +182,17 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64) ([]byte, er
 	return data, nil
 }
 
+// Has reports whether a chunk is already present in the LRU.
+// Used by the prefetcher to skip work for chunks the cache already
+// has — saves both a Telegram round trip and the disk write inside
+// Get's miss path.
+func (c *Cache) Has(key Key) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.entries[key]
+	return ok
+}
+
 // Invalidate removes a chunk from the cache (both in-memory and on
 // disk). Used after a chunk overwrite so subsequent reads don't return
 // stale data. Returns true if the chunk was actually in the cache.

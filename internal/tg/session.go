@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gotd/td/telegram/downloader"
@@ -333,32 +334,71 @@ func (s *Session) DownloadDocument(ctx context.Context, msgID int, w io.Writer) 
 	return s.streamDocument(ctx, doc, w)
 }
 
+// downloadThreads is the parallelism inside ONE document download.
+// gotd's Builder.Parallel splits the file into 512 KiB parts (the
+// downloader's default part size) and fetches `threads` of them at
+// once via concurrent UploadGetFile RPCs. For a 4 MiB chunk that's
+// 8 parts; 4 threads gets us 2 round-trip passes instead of 8 serial
+// ones, which is the difference between "slow chunk reads" and
+// "reads at par with writes".
+const downloadThreads = 4
+
 func (s *Session) streamDocument(ctx context.Context, doc *tg.Document, w io.Writer) (int64, error) {
 	loc := &tg.InputDocumentFileLocation{
 		ID:            doc.ID,
 		AccessHash:    doc.AccessHash,
 		FileReference: doc.FileReference,
 	}
-	cw := &countingWriter{w: w}
+	// We need an io.WriterAt for Builder.Parallel. We don't always know
+	// the document size up front (.Size on tg.Document is set but the
+	// API doesn't guarantee it matches the bytes actually streamed),
+	// so we use a growable bufferWriterAt that allocates on first
+	// non-contiguous write. After download completes, we copy the
+	// resulting bytes into the caller's io.Writer.
+	buf := &bufferWriterAt{}
 	d := downloader.NewDownloader()
-	if _, err := d.Download(s.api, loc).Stream(ctx, cw); err != nil {
-		return cw.n, err
+	if _, err := d.Download(s.api, loc).WithThreads(downloadThreads).Parallel(ctx, buf); err != nil {
+		return 0, err
 	}
-	return cw.n, nil
+	n, err := w.Write(buf.bytes())
+	return int64(n), err
 }
 
-// countingWriter wraps an io.Writer and tracks how many bytes were
-// written. We use this to recover the byte count from gotd's downloader,
-// which returns a file-type tag rather than a count.
-type countingWriter struct {
-	w io.Writer
-	n int64
+// bufferWriterAt is a minimal io.WriterAt that grows its backing slice
+// to fit out-of-order writes. gotd's Parallel downloader writes the
+// file in fixed-size parts to known offsets; the size field tracks the
+// high-water mark so bytes() returns exactly the downloaded length.
+type bufferWriterAt struct {
+	mu   sync.Mutex
+	data []byte
+	size int64
 }
 
-func (cw *countingWriter) Write(p []byte) (int, error) {
-	n, err := cw.w.Write(p)
-	cw.n += int64(n)
-	return n, err
+func (b *bufferWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	end := off + int64(len(p))
+	if end > int64(len(b.data)) {
+		// Grow with some headroom to avoid a tiny re-alloc on every part.
+		newCap := int64(len(b.data)) * 2
+		if newCap < end {
+			newCap = end
+		}
+		grown := make([]byte, end, newCap)
+		copy(grown, b.data)
+		b.data = grown
+	}
+	copy(b.data[off:], p)
+	if end > b.size {
+		b.size = end
+	}
+	return len(p), nil
+}
+
+func (b *bufferWriterAt) bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.data[:b.size]
 }
 
 // getMessage fetches a single channel message by id, returning it as the

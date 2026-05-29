@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"telfs/internal/meta"
 )
@@ -215,4 +216,71 @@ func TestCacheInvalidateRemovesEntry(t *testing.T) {
 	if ff.calls.Load() != 2 {
 		t.Fatalf("fetcher calls = %d, want 2", ff.calls.Load())
 	}
+}
+
+// TestReadAtSchedulesPrefetch verifies that a ReadAt for chunk N
+// triggers background prefetches for chunks N+1..N+PrefetchWindow.
+// We use a slow fetcher so the prefetches are still pending when we
+// inspect; the in-flight map tells us which keys are being fetched.
+func TestReadAtSchedulesPrefetch(t *testing.T) {
+	m := newTestMeta(t)
+	chunks := make([][]byte, 12)
+	for i := range chunks {
+		chunks[i] = bytes.Repeat([]byte{byte('a' + i)}, 10)
+	}
+	ino, ff := seedFile(t, m, "f", chunks, 100)
+
+	// Slow fetcher: blocks on a chan so prefetches stay in flight
+	// long enough for us to observe them.
+	gate := make(chan struct{})
+	slow := &gatedFetcher{inner: ff, gate: gate}
+	cache := newTestCache(t, slow)
+	r := NewReader(m, cache, 10)
+
+	// Trigger a 10-byte read for chunk 0. This should kick off
+	// prefetches for chunks 1..PrefetchWindow.
+	done := make(chan int)
+	go func() {
+		dest := make([]byte, 10)
+		n, _ := r.ReadAt(context.Background(), ino, dest, 0)
+		done <- n
+	}()
+
+	// Wait until chunks 0..PrefetchWindow are seen by the fetcher.
+	// The exact set depends on scheduling order, but we expect at
+	// least 2 in-flight (current + first prefetch).
+	expected := PrefetchWindow + 1
+	deadline := time.After(2 * time.Second)
+	for {
+		if int(slow.inner.calls.Load()) >= expected {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("only %d fetches in flight, want >= %d", slow.inner.calls.Load(), expected)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Release all gated fetches.
+	close(gate)
+	<-done
+}
+
+// gatedFetcher wraps a fetcher with a chan that blocks until closed.
+// Lets tests freeze prefetches in their RPC step so the in-flight
+// state is observable.
+type gatedFetcher struct {
+	inner *fakeFetcher
+	gate  chan struct{}
+}
+
+func (g *gatedFetcher) Fetch(ctx context.Context, key Key, msgID int64) ([]byte, error) {
+	g.inner.calls.Add(1)
+	select {
+	case <-g.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return g.inner.contents[msgID], nil
 }
