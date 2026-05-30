@@ -10,6 +10,8 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+
+	"telfs/internal/metrics"
 )
 
 // MaxFloodWait is the upper bound this daemon will honor on a single
@@ -63,6 +65,7 @@ func (w *FloodWaiter) Handle(next tg.Invoker) telegram.InvokeFunc {
 			if d > w.max {
 				return fmt.Errorf("flood wait %v exceeds cap %v: %w", d, w.max, err)
 			}
+			metrics.FloodWaits.Inc()
 			if err := sleepWithProgress(ctx, d); err != nil {
 				return err
 			}

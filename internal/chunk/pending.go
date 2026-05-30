@@ -59,6 +59,18 @@ func (p *PendingInodes) End(ino int64) {
 	}
 }
 
+// Total returns the sum of in-flight upload counts across all inos.
+// Used by the metrics endpoint as a gauge.
+func (p *PendingInodes) Total() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var total int64
+	for _, c := range p.counts {
+		total += int64(c)
+	}
+	return total
+}
+
 // Wait blocks until the current batch of in-flight uploads for ino
 // drains. Returns immediately if nothing is in flight. Returns
 // ctx.Err() if ctx fires first.

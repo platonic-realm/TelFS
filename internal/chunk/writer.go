@@ -13,6 +13,7 @@ import (
 	"telfs/internal/compress"
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
+	"telfs/internal/metrics"
 )
 
 // Uploader is the upload side of a chunk pipeline — what Writer uses to
@@ -624,6 +625,7 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		if reused {
 			w.cache.Invalidate(Key{Ino: w.ino, Idx: idx})
 			_ = blobMsgID
+			metrics.DedupHits.Inc()
 			return
 		}
 	}
@@ -650,9 +652,12 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	msgID, err := w.uploader.UploadDocument(ctx, bytes.NewReader(wire), name, "")
 	if err != nil {
 		restore = true
+		metrics.UploadErrors.Inc()
 		w.recordError(fmt.Errorf("upload chunk %d: %w", idx, err))
 		return
 	}
+	metrics.ChunksUploaded.Inc()
+	metrics.BytesUploaded.Add(int64(len(wire)))
 	// PutChunk uses Background ctx, not the upload worker's ctx —
 	// Close() cancels uploadCtx to abort in-flight gotd round-trips,
 	// but once an upload has SUCCEEDED we want its chunk_map row to

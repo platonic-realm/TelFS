@@ -37,6 +37,7 @@ import (
 	"telfs/internal/crypto"
 	telfsfs "telfs/internal/fs"
 	"telfs/internal/meta"
+	"telfs/internal/metrics"
 	"telfs/internal/snapshot"
 	"telfs/internal/tg"
 	"telfs/internal/trash"
@@ -419,8 +420,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	allowOther := fs.Bool("allow-other", false, "allow other users to access the mount (FUSE -o allow_other; requires user_allow_other in /etc/fuse.conf)")
 	debug := fs.Bool("debug", false, "log every FUSE op")
 	noRecover := fs.Bool("no-recover", false, "skip cold-mount recovery from channel snapshot (starts with an empty DB if local DB is missing)")
+	metricsAddr := fs.String("metrics-addr", "", "bind a Prometheus /metrics endpoint at this addr (default: off). Example: 127.0.0.1:9090")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] <mountpoint>")
+		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] <mountpoint>")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -541,6 +543,26 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			ReadOnly:  *readonly,
 			TrashIno:  trashIno,
 		}
+
+		// Metrics endpoint (opt-in). Gauges are registered AFTER the
+		// pool & cache exist so they read the live values, not the
+		// nil pre-construction state. Counters are registered in
+		// metrics' package init and increment from chunk/tg call
+		// sites already.
+		var metricsSrv *metrics.Server
+		if *metricsAddr != "" {
+			metrics.Default.AddGauge("telfs_cache_size_bytes",
+				"Bytes currently held in the LRU disk cache.",
+				func() int64 { return cache.SizeBytes() })
+			metrics.Default.AddGauge("telfs_pending_uploads",
+				"In-flight chunk uploads (detached + still in flight).",
+				func() int64 { return pool.Pending.Total() })
+			metricsSrv = metrics.NewServer(*metricsAddr)
+			if err := metricsSrv.Start(); err != nil {
+				return err
+			}
+			fmt.Printf("Metrics: http://%s/metrics\n", metricsSrv.Addr())
+		}
 		server, err := telfsfs.Mount(telfsfs.MountOptions{
 			MountPoint: mountpoint,
 			AllowOther: *allowOther,
@@ -635,6 +657,11 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			drainCtx, cancelDrain := context.WithTimeout(context.Background(), 12*time.Second)
 			backend.Shutdown(drainCtx)
 			cancelDrain()
+			if metricsSrv != nil {
+				mctx, mcancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = metricsSrv.Shutdown(mctx)
+				mcancel()
+			}
 			// Final snapshot, post-drain. Uploads after RunSession
 			// returns fail with "engine closed", so this MUST run
 			// inside the callback. 10-second budget keeps the total

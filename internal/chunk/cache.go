@@ -10,6 +10,7 @@ import (
 
 	"telfs/internal/compress"
 	"telfs/internal/crypto"
+	"telfs/internal/metrics"
 )
 
 // ChunkSize is TelFS's fixed chunk size in bytes (4 MiB). Every file is
@@ -147,6 +148,14 @@ func (c *Cache) Dir() string { return c.dir }
 // CapBytes returns the configured cap.
 func (c *Cache) CapBytes() int64 { return c.capBytes }
 
+// SizeBytes returns the current footprint on disk (sum of LRU entry
+// sizes). Used by the metrics endpoint as a gauge.
+func (c *Cache) SizeBytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.totalSize
+}
+
 // Get returns the bytes for the chunk identified by key. On a cache hit,
 // the file is read from disk and the LRU position is bumped. On miss, we
 // call the Fetcher, write the result to disk, and insert into the LRU
@@ -157,9 +166,11 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64) ([]byte, er
 	if e, ok := c.entries[key]; ok {
 		c.order.MoveToFront(e.el)
 		c.mu.Unlock()
+		metrics.CacheHits.Inc()
 		return os.ReadFile(filepath.Join(c.dir, key.fileName()))
 	}
 	c.mu.Unlock()
+	metrics.CacheMisses.Inc()
 
 	// Miss path: fetch outside the lock. Fetcher returns the bytes
 	// stored in TG (ciphertext if encryption is enabled, plaintext
@@ -172,6 +183,8 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64) ([]byte, er
 	if err != nil {
 		return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
 	}
+	metrics.ChunksDownloaded.Inc()
+	metrics.BytesDownloaded.Add(int64(len(ciphertext)))
 	compressed, err := c.cipher.Open(key.Ino, key.Idx, ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt chunk %d/%d: %w", key.Ino, key.Idx, err)
