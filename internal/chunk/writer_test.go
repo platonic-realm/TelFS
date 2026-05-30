@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
@@ -108,7 +109,7 @@ func setupWriter(t *testing.T, chunkSize int64) (*Writer, *meta.Store, *fakeUplo
 	}
 	up := newFakeUploader()
 	cache := newTestCache(t, writerFetcher{uploader: up})
-	w, err := NewWriter(ctx, m, cache, up, nil, ino, chunkSize, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, ino, chunkSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +125,7 @@ func TestWriteAtSingleChunkRoundTrip(t *testing.T) {
 	if err != nil || n != 5 {
 		t.Fatalf("WriteAt: n=%d err=%v", n, err)
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if w.Size() != 5 {
@@ -155,7 +156,7 @@ func TestWriteAtCrossChunkBoundary(t *testing.T) {
 	if err != nil || n != 15 {
 		t.Fatalf("WriteAt: n=%d err=%v", n, err)
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if w.Size() != 20 {
@@ -183,18 +184,18 @@ func TestWriteAtReadModifyWritePreservesOtherBytes(t *testing.T) {
 	if _, err := w.WriteAt(ctx, []byte("AAAAAAAAAA"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// Overwrite bytes 2..5 with 'B'.
 	if _, err := w.WriteAt(ctx, []byte("BBBB"), 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// Read it back via Reader.
-	r := NewReader(w.meta, w.cache, w.chunkSz)
+	r := NewReader(w.meta, w.cache, nil, w.chunkSz)
 	dest := make([]byte, 10)
 	got, err := r.ReadAt(ctx, w.ino, dest, 0)
 	if err != nil || got != 10 {
@@ -223,7 +224,7 @@ func TestFlushPartialFailureLeavesLaterChunksDirty(t *testing.T) {
 	up.failFromIdx = 1
 	up.failErr = errors.New("simulated FLOOD_WAIT")
 
-	err := w.Flush(ctx)
+	err := w.Sync(ctx)
 	if err == nil {
 		t.Fatalf("Flush should have errored on chunk 1")
 	}
@@ -237,7 +238,7 @@ func TestFlushPartialFailureLeavesLaterChunksDirty(t *testing.T) {
 	}
 	// Recover: clear failure mode and retry Flush. Should succeed.
 	up.failFromIdx = -1
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatalf("retry Flush: %v", err)
 	}
 	chunks, _ = m.ListChunks(ctx, ino)
@@ -255,11 +256,11 @@ func TestFlushInvalidatesCache(t *testing.T) {
 	if _, err := w.WriteAt(ctx, []byte("OLDOLDOLDX"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// Prime the cache by reading through Reader.
-	r := NewReader(w.meta, w.cache, w.chunkSz)
+	r := NewReader(w.meta, w.cache, nil, w.chunkSz)
 	dest := make([]byte, 10)
 	_, _ = r.ReadAt(ctx, w.ino, dest, 0)
 	if string(dest) != "OLDOLDOLDX" {
@@ -269,7 +270,7 @@ func TestFlushInvalidatesCache(t *testing.T) {
 	if _, err := w.WriteAt(ctx, []byte("NEW"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// Reader should now see the new bytes; if the cache wasn't
@@ -290,7 +291,7 @@ func TestTruncateShrinkRemovesChunks(t *testing.T) {
 	if _, err := w.WriteAt(ctx, bytes.Repeat([]byte{'A'}, 25), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// File now: 3 chunks (10, 10, 5).
@@ -350,7 +351,7 @@ func TestAsyncUploadPipeline(t *testing.T) {
 			t.Fatalf("WriteAt %d: %v", i, err)
 		}
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 	chunks, _ := m.ListChunks(ctx, ino)
@@ -388,12 +389,12 @@ func TestEagerFlushCorrectness(t *testing.T) {
 			t.Fatalf("WriteAt off=%d: %v", off, err)
 		}
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
 	// Read back via Reader.
-	r := NewReader(w.meta, w.cache, w.chunkSz)
+	r := NewReader(w.meta, w.cache, nil, w.chunkSz)
 	dest := make([]byte, len(src))
 	n, err := r.ReadAt(ctx, ino, dest, 0)
 	if err != nil {
@@ -434,10 +435,10 @@ func TestEagerFlushRealScale(t *testing.T) {
 			t.Fatalf("WriteAt off=%d: %v", off, err)
 		}
 	}
-	if err := w.Flush(ctx); err != nil {
+	if err := w.Sync(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	r := NewReader(w.meta, w.cache, w.chunkSz)
+	r := NewReader(w.meta, w.cache, nil, w.chunkSz)
 	dest := make([]byte, len(src))
 	n, err := r.ReadAt(ctx, ino, dest, 0)
 	if err != nil {
@@ -471,14 +472,14 @@ func TestDedupReusesIdenticalContent(t *testing.T) {
 	payload := []byte("the same content twice")
 
 	// Write to ino1 → first upload.
-	w1, err := NewWriter(ctx, m, cache, up, nil, ino1, 1024, 0)
+	w1, err := NewWriter(ctx, m, cache, up, nil, nil, ino1, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w1.WriteAt(ctx, payload, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w1.Flush(ctx); err != nil {
+	if err := w1.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	w1.Close()
@@ -487,14 +488,14 @@ func TestDedupReusesIdenticalContent(t *testing.T) {
 	}
 
 	// Write IDENTICAL content to ino2 → must reuse, no new upload.
-	w2, err := NewWriter(ctx, m, cache, up, nil, ino2, 1024, 0)
+	w2, err := NewWriter(ctx, m, cache, up, nil, nil, ino2, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w2.WriteAt(ctx, payload, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w2.Flush(ctx); err != nil {
+	if err := w2.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	w2.Close()
@@ -533,14 +534,14 @@ func TestDedupSkippedWhenEncrypted(t *testing.T) {
 
 	payload := []byte("encrypted content")
 	for _, ino := range []int64{ino1, ino2} {
-		w, err := NewWriter(ctx, m, cache, up, cipher, ino, 1024, 0)
+		w, err := NewWriter(ctx, m, cache, up, cipher, nil, ino, 1024, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := w.WriteAt(ctx, payload, 0); err != nil {
 			t.Fatal(err)
 		}
-		if err := w.Flush(ctx); err != nil {
+		if err := w.Sync(ctx); err != nil {
 			t.Fatal(err)
 		}
 		w.Close()
@@ -580,14 +581,14 @@ func TestDedupWithConvergentCipher(t *testing.T) {
 	payload := []byte("identical plaintext under convergent v3 — dedup must collapse")
 
 	// Write payload to ino1 via convergent cipher.
-	w1, err := NewWriter(ctx, m, cache, up, cipher, ino1, 1024, 0)
+	w1, err := NewWriter(ctx, m, cache, up, cipher, nil, ino1, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w1.WriteAt(ctx, payload, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w1.Flush(ctx); err != nil {
+	if err := w1.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	w1.Close()
@@ -598,14 +599,14 @@ func TestDedupWithConvergentCipher(t *testing.T) {
 	// Write IDENTICAL payload to ino2 — dedup MUST kick in (zero new
 	// uploads) because the convergent cipher produces the same
 	// ciphertext bytes.
-	w2, err := NewWriter(ctx, m, cache, up, cipher, ino2, 1024, 0)
+	w2, err := NewWriter(ctx, m, cache, up, cipher, nil, ino2, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w2.WriteAt(ctx, payload, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w2.Flush(ctx); err != nil {
+	if err := w2.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	w2.Close()
@@ -638,5 +639,218 @@ func TestDedupWithConvergentCipher(t *testing.T) {
 		if !bytes.Equal(pt, payload) {
 			t.Fatalf("Open(%d, %d) returned wrong plaintext", slot.ino, slot.idx)
 		}
+	}
+}
+
+// slowUploader gates each upload on a channel so tests can hold a
+// chunk mid-flight and observe pre-completion state.
+type slowUploader struct {
+	mu      sync.Mutex
+	gate    chan struct{} // close to release ALL uploads
+	uploads map[int]byteBlob
+	nextID  atomic.Int64
+}
+
+func newSlowUploader() *slowUploader {
+	return &slowUploader{
+		gate:    make(chan struct{}),
+		uploads: make(map[int]byteBlob),
+	}
+}
+
+func (s *slowUploader) release() { close(s.gate) }
+
+func (s *slowUploader) get(id int) (byteBlob, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.uploads[id]
+	return b, ok
+}
+
+func (s *slowUploader) UploadDocument(ctx context.Context, r io.Reader, filename, _ string) (int, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	select {
+	case <-s.gate:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	id := int(s.nextID.Add(1))
+	s.mu.Lock()
+	s.uploads[id] = byteBlob{name: filename, data: data}
+	s.mu.Unlock()
+	return id, nil
+}
+
+type slowFetcher struct{ up *slowUploader }
+
+func (f slowFetcher) Fetch(_ context.Context, _ Key, msgID int64) ([]byte, error) {
+	blob, ok := f.up.get(int(msgID))
+	if !ok {
+		return nil, errors.New("no such msg")
+	}
+	out := make([]byte, len(blob.data))
+	copy(out, blob.data)
+	return out, nil
+}
+
+// TestFlushIsAsync proves the core async-close property: Flush returns
+// before background uploads land, and the per-ino Pending barrier
+// holds a count for the in-flight upload so readers will wait.
+func TestFlushIsAsync(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino, err := m.CreateChild(ctx, meta.RootIno, "f", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := newSlowUploader()
+	cache := newTestCache(t, slowFetcher{up: up})
+	pool := NewUploadPool(4)
+	w, err := NewWriter(ctx, m, cache, up, nil, pool, ino, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteAt(ctx, []byte("hello"), 0); err != nil {
+		t.Fatal(err)
+	}
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- w.Flush(ctx) }()
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatalf("Flush returned err=%v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Flush blocked on the slow upload — async semantics broken")
+	}
+	// Upload hasn't landed: chunk_map still empty, but size persisted.
+	chunks, _ := m.ListChunks(ctx, ino)
+	if len(chunks) != 0 {
+		t.Fatalf("chunks landed before upload completed: %+v", chunks)
+	}
+	in, _ := m.GetInode(ctx, ino)
+	if in.Size != 5 {
+		t.Fatalf("size = %d, want 5 (Flush must persist size synchronously)", in.Size)
+	}
+	pool.Pending.mu.Lock()
+	count := pool.Pending.counts[ino]
+	pool.Pending.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("Pending barrier count for ino %d = %d, want 1", ino, count)
+	}
+	up.release()
+	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if !pool.Drain(drainCtx) {
+		t.Fatal("pool drain timed out")
+	}
+	chunks, _ = m.ListChunks(ctx, ino)
+	if len(chunks) != 1 {
+		t.Fatalf("after drain, chunks = %+v", chunks)
+	}
+}
+
+// TestReadAfterAsyncCloseWaits is the read-side correctness check:
+// once Flush returns, a subsequent ReadAt that goes through the same
+// Pending barrier blocks until the upload lands and then sees the
+// new bytes.
+func TestReadAfterAsyncCloseWaits(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino, err := m.CreateChild(ctx, meta.RootIno, "f", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := newSlowUploader()
+	cache := newTestCache(t, slowFetcher{up: up})
+	pool := NewUploadPool(4)
+	w, err := NewWriter(ctx, m, cache, up, nil, pool, ino, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteAt(ctx, []byte("hello"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReader(m, cache, pool.Pending, 10)
+	type readResult struct {
+		n   int
+		err error
+		buf []byte
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, 5)
+		n, err := r.ReadAt(ctx, ino, buf, 0)
+		readDone <- readResult{n, err, buf}
+	}()
+	select {
+	case res := <-readDone:
+		t.Fatalf("ReadAt returned before upload landed: n=%d buf=%q — Pending barrier didn't engage", res.n, res.buf)
+	case <-time.After(50 * time.Millisecond):
+	}
+	up.release()
+	res := <-readDone
+	if res.err != nil || res.n != 5 || string(res.buf) != "hello" {
+		t.Fatalf("ReadAt after barrier: n=%d err=%v buf=%q", res.n, res.err, res.buf)
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if !pool.Drain(drainCtx) {
+		t.Fatal("pool drain timed out")
+	}
+}
+
+// TestPoolGlobalConcurrency proves the upload sem is shared across
+// writers — the load-bearing fix that async close depends on. With
+// concurrency=1 the second writer's dispatch must wait until the
+// first writer's in-flight upload completes.
+func TestPoolGlobalConcurrency(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino1, _ := m.CreateChild(ctx, meta.RootIno, "a", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	ino2, _ := m.CreateChild(ctx, meta.RootIno, "b", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	up := newSlowUploader()
+	cache := newTestCache(t, slowFetcher{up: up})
+	pool := NewUploadPool(1) // only one upload at a time globally
+	w1, err := NewWriter(ctx, m, cache, up, nil, pool, ino1, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := NewWriter(ctx, m, cache, up, nil, pool, ino2, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w1.WriteAt(ctx, []byte("aaaaa"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w2.WriteAt(ctx, []byte("bbbbb"), 0); err != nil {
+		t.Fatal(err)
+	}
+	// Flush w1 — sem grabbed by w1's upload (which is stuck on gate).
+	if err := w1.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// w2.Flush must now block on dispatch's pool.Reserve.
+	flush2Done := make(chan error, 1)
+	go func() { flush2Done <- w2.Flush(ctx) }()
+	select {
+	case <-flush2Done:
+		t.Fatal("w2.Flush returned with only 1 sem slot and 1 in-flight upload — sem isn't actually global")
+	case <-time.After(50 * time.Millisecond):
+	}
+	up.release()
+	if err := <-flush2Done; err != nil {
+		t.Fatalf("w2.Flush after release: %v", err)
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if !pool.Drain(drainCtx) {
+		t.Fatal("pool drain timed out")
 	}
 }

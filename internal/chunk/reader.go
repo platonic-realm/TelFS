@@ -34,9 +34,15 @@ const PrefetchConcurrency = 4
 // background fetches for the next PrefetchWindow chunks before doing
 // its own (potentially slow) cache.Get; by the time the kernel asks
 // for chunk N+1, it should already be in the LRU.
+//
+// pending is the per-ino read-after-write barrier owned by the upload
+// pool. ReadAt blocks on it before consulting chunk_map so a read
+// issued just after the writer's async close() still sees the data.
+// May be nil for read-only mounts that have no writer side at all.
 type Reader struct {
 	meta      *meta.Store
 	cache     *Cache
+	pending   *PendingInodes
 	chunkSize int64
 
 	// Prefetch state. prefetchSem caps in-flight fetches; inflight is
@@ -49,14 +55,15 @@ type Reader struct {
 }
 
 // NewReader wires up the read path. chunkSize is normally ChunkSize but
-// is configurable for tests.
-func NewReader(m *meta.Store, c *Cache, chunkSize int64) *Reader {
+// is configurable for tests. pending may be nil for read-only mounts.
+func NewReader(m *meta.Store, c *Cache, pending *PendingInodes, chunkSize int64) *Reader {
 	if chunkSize <= 0 {
 		chunkSize = ChunkSize
 	}
 	return &Reader{
 		meta:        m,
 		cache:       c,
+		pending:     pending,
 		chunkSize:   chunkSize,
 		prefetchSem: make(chan struct{}, PrefetchConcurrency),
 	}
@@ -72,6 +79,16 @@ func NewReader(m *meta.Store, c *Cache, chunkSize int64) *Reader {
 func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) (int, error) {
 	if len(dest) == 0 {
 		return 0, nil
+	}
+	// Async-close barrier: if a writer recently called Flush on this
+	// ino and the upload goroutines haven't landed yet, wait for them
+	// so chunk_map sees the new rows before we look. Fast path is a
+	// single mutex roundtrip + nil-channel return when nothing is in
+	// flight, so reads of cold files pay no measurable cost.
+	if r.pending != nil {
+		if err := r.pending.Wait(ctx, ino); err != nil {
+			return 0, err
+		}
 	}
 	startIdx := int32(off / r.chunkSize)
 	endIdx := int32((off + int64(len(dest)) - 1) / r.chunkSize)

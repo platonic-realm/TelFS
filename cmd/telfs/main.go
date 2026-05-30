@@ -480,22 +480,31 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		reader := chunk.NewReader(metaStore, cache, chunkSize)
+		// Backend-global upload pool: one concurrency cap and one
+		// long-lived ctx shared across every file handle on the
+		// mount. With async close, individual Writers no longer own
+		// their dispatcher — the pool does, and survives Release of
+		// any single handle. Drained at unmount before tearing down
+		// the gotd session.
+		pool := chunk.NewUploadPool(chunk.DefaultUploadConcurrency)
+		reader := chunk.NewReader(metaStore, cache, pool.Pending, chunkSize)
 
-		server, err := telfsfs.Mount(telfsfs.MountOptions{
-			MountPoint: mountpoint,
-			AllowOther: *allowOther,
-			Debug:      *debug,
-		}, &telfsfs.Backend{
+		backend := &telfsfs.Backend{
 			Meta:      metaStore,
 			Reader:    reader,
 			Cache:     cache,
 			Uploader:  sess,
+			Pool:      pool,
 			Cipher:    cipher,
 			ChunkSize: chunkSize,
 			ReadOnly:  *readonly,
 			TrashIno:  trashIno,
-		})
+		}
+		server, err := telfsfs.Mount(telfsfs.MountOptions{
+			MountPoint: mountpoint,
+			AllowOther: *allowOther,
+			Debug:      *debug,
+		}, backend)
 		if err != nil {
 			return err
 		}
@@ -561,29 +570,46 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// final best-effort drain on ctx-cancel; we wait for it.
 			stopJournal()
 			<-journalDone
-			// Final snapshot synchronously BEFORE we ask gotd to
-			// shut down — uploads after callback return fail with
-			// "engine closed". 15-second budget; if it doesn't
-			// land we accept losing the cadence-since-last-snap
-			// delta and move on.
 			stopSnap()
 			<-snapDone
-			fmt.Println("Taking final snapshot…")
-			finalCtx, finalCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			if err := snapMgr.Once(finalCtx); err != nil {
-				fmt.Fprintln(os.Stderr, "[snapshot] final failed:", err)
-			}
-			finalCancel()
+			// Unmount + drain BEFORE the final snapshot. Two-step:
+			//   1. Unmount severs the kernel-to-userspace channel so
+			//      no new FUSE writes can fire; server.Wait drains
+			//      any FUSE request goroutines still in flight.
+			//   2. backend.Shutdown drains the upload pool — the
+			//      uploadOne goroutines that outlived their handle
+			//      via async close. Until this returns, freshly-
+			//      closed files may have inode.size persisted but
+			//      no chunk_map row.
+			// THEN take the snapshot, so the channel state reflects
+			// a fully-quiescent DB. Snapshotting before drain would
+			// ship a torn DB (file present, chunks missing) — fine
+			// for warm restart (local DB is authoritative) but
+			// catastrophic for recover-from-channel.
 			fmt.Println("Unmounting…")
 			if uerr := server.Unmount(); uerr != nil {
 				fmt.Fprintln(os.Stderr, "unmount:", uerr)
 			}
 			server.Wait()
+			drainCtx, cancelDrain := context.WithTimeout(context.Background(), 12*time.Second)
+			backend.Shutdown(drainCtx)
+			cancelDrain()
+			// Final snapshot, post-drain. Uploads after RunSession
+			// returns fail with "engine closed", so this MUST run
+			// inside the callback. 10-second budget keeps the total
+			// (12 drain + 10 snapshot + slack) under the 30s
+			// watchdog below.
+			fmt.Println("Taking final snapshot…")
+			finalCtx, finalCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := snapMgr.Once(finalCtx); err != nil {
+				fmt.Fprintln(os.Stderr, "[snapshot] final failed:", err)
+			}
+			finalCancel()
 		}()
 		select {
 		case <-done:
 			// Orderly shutdown complete.
-		case <-time.After(25 * time.Second):
+		case <-time.After(30 * time.Second):
 			fmt.Fprintln(os.Stderr, "telfs: orderly shutdown timed out — forcing lazy unmount + exit")
 			_ = exec.Command("fusermount", "-uz", mountpoint).Run()
 			os.Exit(1)

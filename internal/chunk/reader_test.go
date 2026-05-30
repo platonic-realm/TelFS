@@ -87,7 +87,7 @@ func TestReadAtCrossChunkBoundary(t *testing.T) {
 	}
 	ino, ff := seedFile(t, m, "x", chunks, 1000)
 	cache := newTestCache(t, ff)
-	r := NewReader(m, cache, 10)
+	r := NewReader(m, cache, nil, 10)
 
 	// Read 5 bytes starting at offset 8 — spans chunk 0 (8..10) + chunk 1 (0..3).
 	got := make([]byte, 5)
@@ -108,7 +108,7 @@ func TestReadAtPastEOFReturnsShort(t *testing.T) {
 	m := newTestMeta(t)
 	ino, ff := seedFile(t, m, "x", [][]byte{[]byte("Hello")}, 1)
 	cache := newTestCache(t, ff)
-	r := NewReader(m, cache, 10)
+	r := NewReader(m, cache, nil, 10)
 
 	// Ask for 20 bytes; file only has 5.
 	dest := make([]byte, 20)
@@ -128,7 +128,7 @@ func TestReadAtCachesAfterFirstFetch(t *testing.T) {
 	m := newTestMeta(t)
 	ino, ff := seedFile(t, m, "x", [][]byte{[]byte("HelloWorld")}, 1)
 	cache := newTestCache(t, ff)
-	r := NewReader(m, cache, 10)
+	r := NewReader(m, cache, nil, 10)
 
 	dest := make([]byte, 10)
 	for i := 0; i < 3; i++ {
@@ -150,7 +150,7 @@ func TestReadAtFullChunkAligned(t *testing.T) {
 	}
 	ino, ff := seedFile(t, m, "x", chunks, 100)
 	cache := newTestCache(t, ff)
-	r := NewReader(m, cache, 10)
+	r := NewReader(m, cache, nil, 10)
 
 	dest := make([]byte, 25)
 	n, err := r.ReadAt(context.Background(), ino, dest, 0)
@@ -177,7 +177,7 @@ func TestCacheAdoptsExistingFilesOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewReader(m, cache1, 10)
+	r := NewReader(m, cache1, nil, 10)
 	// Populate cache via a read.
 	dest := make([]byte, 10)
 	if _, err := r.ReadAt(context.Background(), ino, dest, 0); err != nil {
@@ -191,7 +191,7 @@ func TestCacheAdoptsExistingFilesOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2 := NewReader(m, cache2, 10)
+	r2 := NewReader(m, cache2, nil, 10)
 	if _, err := r2.ReadAt(context.Background(), ino, dest, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestCacheInvalidateRemovesEntry(t *testing.T) {
 	m := newTestMeta(t)
 	ino, ff := seedFile(t, m, "x", [][]byte{[]byte("HelloWorld")}, 1)
 	cache := newTestCache(t, ff)
-	r := NewReader(m, cache, 10)
+	r := NewReader(m, cache, nil, 10)
 
 	dest := make([]byte, 10)
 	_, _ = r.ReadAt(context.Background(), ino, dest, 0)
@@ -235,7 +235,7 @@ func TestReadAtSchedulesPrefetch(t *testing.T) {
 	gate := make(chan struct{})
 	slow := &gatedFetcher{inner: ff, gate: gate}
 	cache := newTestCache(t, slow)
-	r := NewReader(m, cache, 10)
+	r := NewReader(m, cache, nil, 10)
 
 	// Trigger a 10-byte read for chunk 0. This should kick off
 	// prefetches for chunks 1..PrefetchWindow.

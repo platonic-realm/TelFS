@@ -72,12 +72,14 @@ func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
 	return 0
 }
 
-// Fsync also forces a flush; we don't distinguish between data-only and
-// metadata-only fsync because both target the same backing path.
+// Fsync is the durability checkpoint: dispatch + WAIT for the round
+// trips before returning. Flush above is async by design so close(2)
+// returns fast; apps that need close-implies-durable must fsync, and
+// this path honors that.
 func (h *fileHandle) Fsync(ctx context.Context, _ uint32) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.writer.Flush(ctx); err != nil {
+	if err := h.writer.Sync(ctx); err != nil {
 		return syscall.EIO
 	}
 	return 0

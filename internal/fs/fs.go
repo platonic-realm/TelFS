@@ -17,15 +17,16 @@ import (
 
 // Backend bundles the dependencies every Node needs. It's shared by
 // reference among all nodes in the mounted tree. The Cache + Uploader
-// + ChunkSize fields are only needed for the write path; read-only
-// mounts can leave them zero (or set ReadOnly = true to explicitly
+// + Pool + ChunkSize fields are only needed for the write path; read-
+// only mounts can leave them zero (or set ReadOnly = true to explicitly
 // reject all mutations regardless).
 type Backend struct {
 	Meta      *meta.Store
 	Reader    *chunk.Reader
 	Cache     *chunk.Cache
 	Uploader  chunk.Uploader
-	Cipher    crypto.Cipher // nil → NoopCipher (plaintext mode)
+	Pool      *chunk.UploadPool // backend-global upload concurrency + per-ino R-A-W barrier
+	Cipher    crypto.Cipher     // nil → NoopCipher (plaintext mode)
 	ChunkSize int64
 	ReadOnly  bool
 
@@ -34,6 +35,24 @@ type Backend struct {
 	// running outside the FS layer reaps aged entries. TrashIno == 0
 	// (the default) means the FS layer behaves as if trash is off.
 	TrashIno int64
+}
+
+// Shutdown drains any uploads that were detached when their handle's
+// fd closed, up to ctx's deadline. After this returns the caller can
+// safely tear down the upload pool's MTProto session. On timeout the
+// pool ctx is canceled so still-running gotd round trips unwind.
+func (b *Backend) Shutdown(ctx context.Context) {
+	if b.Pool == nil {
+		return
+	}
+	if !b.Pool.Drain(ctx) {
+		// Watchdog: ctx timed out. Cancel the pool ctx so any goroutine
+		// still waiting on a gotd round trip (or a sem slot) errors
+		// out and unwinds; we don't wait for them.
+		b.Pool.Shutdown()
+		return
+	}
+	b.Pool.Shutdown()
 }
 
 // canWrite reports whether the backend supports mutating ops. False when
@@ -181,7 +200,7 @@ func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
 	if !n.backend.canWrite() {
 		return syscall.EROFS
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Pool, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -233,7 +252,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 		}
 		return nil, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Pool, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
@@ -291,7 +310,7 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 		return nil, nil, 0, syscall.EIO
 	}
 	childInode := n.newChildInode(ctx, child)
-	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, ino, n.backend.chunkSize(), 0)
+	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Pool, ino, n.backend.chunkSize(), 0)
 	if werr != nil {
 		return nil, nil, 0, syscall.EIO
 	}
