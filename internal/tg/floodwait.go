@@ -16,12 +16,14 @@ import (
 
 // MaxFloodWait is the upper bound this daemon will honor on a single
 // FLOOD_WAIT response. Telegram will sometimes ask for very long waits
-// (~tens of minutes) after a burst; gotd's stock SimpleWaiter caps at
-// 2 min and bounces anything bigger, which our journal poster then
-// retries in a 5 s tight loop forever (seen in the wild). 30 minutes
-// is the longest cooldown observed in practice; past that we surface
-// the error rather than block a goroutine indefinitely.
-const MaxFloodWait = 30 * time.Minute
+// (tens of minutes, occasionally ~1 hour) after a bulk operation —
+// notably after `telfs gc` reaps thousands of messages. gotd's stock
+// SimpleWaiter caps at 2 min and bounces anything bigger, which our
+// journal poster then retries in a 5 s tight loop forever (seen in
+// the wild). 60 minutes covers post-bulk-gc cooldowns without daemon
+// intervention; past that something is structurally wrong (account
+// restriction, channel ban) and the retry loop won't fix it.
+const MaxFloodWait = 60 * time.Minute
 
 // FloodWaitLogInterval is how often a long sleep emits a progress
 // line. Without this, a 10-minute wait looks indistinguishable from
