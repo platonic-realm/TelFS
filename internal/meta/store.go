@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS chunk_map (
   idx           INTEGER NOT NULL,
   tg_message_id INTEGER NOT NULL,
   size          INTEGER NOT NULL,
+  -- pack_offset, pack_size: see docs/architecture and meta.Chunk.
+  pack_offset   INTEGER,
+  pack_size     INTEGER,
   PRIMARY KEY (ino, idx),
   FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
 );
@@ -188,6 +191,20 @@ func (s *Store) initSchema(ctx context.Context) error {
 	for _, stmt := range splitStmts(schemaSQL) {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("exec %q: %w", firstLine(stmt), err)
+		}
+	}
+	// Idempotent migration: add pack_offset and pack_size to
+	// chunk_map on filesystems that predate the small-file packer.
+	// SQLite has no `ADD COLUMN IF NOT EXISTS`, so we eat the
+	// "duplicate column name" error from a re-run on a fresh DB
+	// where the CREATE TABLE above already includes them. Any
+	// other error surfaces normally.
+	for _, alter := range []string{
+		`ALTER TABLE chunk_map ADD COLUMN pack_offset INTEGER`,
+		`ALTER TABLE chunk_map ADD COLUMN pack_size INTEGER`,
+	} {
+		if _, err := s.db.ExecContext(ctx, alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("migrate chunk_map: %w", err)
 		}
 	}
 	// Seed root inode if missing. Using explicit ino=1 ensures auto-increment

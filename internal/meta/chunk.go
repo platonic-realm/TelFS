@@ -12,31 +12,55 @@ import (
 // tg_message_id; callers are responsible for deleting the old Telegram
 // message separately (TelFS chunks are immutable in the channel, so
 // the old message id is what gets posted to the channel as a delete op).
+//
+// For packed chunks the caller fills Chunk.PackOffset and PackSize too;
+// for unpacked chunks they stay zero and the row stores SQL NULL so
+// pre-packer rows decode identically.
 func (s *Store) PutChunk(ctx context.Context, c Chunk) error {
+	packOff, packSize := nullablePackFields(c)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO chunk_map(ino, idx, tg_message_id, size)
-		   VALUES (?,?,?,?)
+		`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size)
+		   VALUES (?,?,?,?,?,?)
 		 ON CONFLICT(ino, idx) DO UPDATE SET
 		   tg_message_id = excluded.tg_message_id,
-		   size          = excluded.size`,
-		c.Ino, c.Idx, c.TGMessageID, c.Size)
+		   size          = excluded.size,
+		   pack_offset   = excluded.pack_offset,
+		   pack_size     = excluded.pack_size`,
+		c.Ino, c.Idx, c.TGMessageID, c.Size, packOff, packSize)
 	if err != nil {
 		return fmt.Errorf("put chunk %d/%d: %w", c.Ino, c.Idx, err)
 	}
 	return nil
 }
 
+// nullablePackFields returns SQL NULL placeholders when the chunk is
+// unpacked. Zero pack_offset with non-zero pack_size is a valid
+// packed-extent at the start of a blob; treat pack_size as the
+// canonical "is this a packed row" signal.
+func nullablePackFields(c Chunk) (any, any) {
+	if c.PackSize == 0 {
+		return nil, nil
+	}
+	return c.PackOffset, c.PackSize
+}
+
 // GetChunk returns the chunk_map entry for (ino, idx), or ErrNotFound.
 func (s *Store) GetChunk(ctx context.Context, ino int64, idx int32) (Chunk, error) {
 	var c Chunk
+	var packOff sql.NullInt64
+	var packSize sql.NullInt64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT ino, idx, tg_message_id, size FROM chunk_map WHERE ino = ? AND idx = ?`,
-		ino, idx).Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size)
+		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size FROM chunk_map WHERE ino = ? AND idx = ?`,
+		ino, idx).Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Chunk{}, ErrNotFound
 	}
 	if err != nil {
 		return Chunk{}, fmt.Errorf("get chunk %d/%d: %w", ino, idx, err)
+	}
+	if packSize.Valid {
+		c.PackOffset = packOff.Int64
+		c.PackSize = int32(packSize.Int64)
 	}
 	return c, nil
 }
@@ -44,7 +68,7 @@ func (s *Store) GetChunk(ctx context.Context, ino int64, idx int32) (Chunk, erro
 // ListChunks returns all chunks for an inode in ascending idx order.
 func (s *Store) ListChunks(ctx context.Context, ino int64) ([]Chunk, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ino, idx, tg_message_id, size FROM chunk_map WHERE ino = ? ORDER BY idx`, ino)
+		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size FROM chunk_map WHERE ino = ? ORDER BY idx`, ino)
 	if err != nil {
 		return nil, fmt.Errorf("list chunks %d: %w", ino, err)
 	}
@@ -52,8 +76,14 @@ func (s *Store) ListChunks(ctx context.Context, ino int64) ([]Chunk, error) {
 	var out []Chunk
 	for rows.Next() {
 		var c Chunk
-		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size); err != nil {
+		var packOff sql.NullInt64
+		var packSize sql.NullInt64
+		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize); err != nil {
 			return nil, err
+		}
+		if packSize.Valid {
+			c.PackOffset = packOff.Int64
+			c.PackSize = int32(packSize.Int64)
 		}
 		out = append(out, c)
 	}
@@ -84,7 +114,7 @@ func (s *Store) DeleteChunk(ctx context.Context, ino int64, idx int32) error {
 // for multi-GB filesystems.
 func (s *Store) AllChunks(ctx context.Context) ([]Chunk, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ino, idx, tg_message_id, size FROM chunk_map ORDER BY ino, idx`)
+		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size FROM chunk_map ORDER BY ino, idx`)
 	if err != nil {
 		return nil, fmt.Errorf("all chunks: %w", err)
 	}
@@ -92,8 +122,14 @@ func (s *Store) AllChunks(ctx context.Context) ([]Chunk, error) {
 	var out []Chunk
 	for rows.Next() {
 		var c Chunk
-		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size); err != nil {
+		var packOff sql.NullInt64
+		var packSize sql.NullInt64
+		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize); err != nil {
 			return nil, err
+		}
+		if packSize.Valid {
+			c.PackOffset = packOff.Int64
+			c.PackSize = int32(packSize.Int64)
 		}
 		out = append(out, c)
 	}
@@ -169,12 +205,19 @@ func (s *Store) ReuseChunkByHash(ctx context.Context, ino int64, idx int32, hash
 	}
 	// Live hit. Insert the new chunk_map row in the same tx. Use
 	// INSERT OR REPLACE in case (ino, idx) is being overwritten.
+	// NOTE: pack_offset/pack_size are explicitly cleared to NULL —
+	// if the previous occupant of this slot was a packed extent
+	// and we're now reusing a NON-packed message via dedup, leaving
+	// the old pack fields in place would point the Reader at a
+	// stale offset in the wrong message.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO chunk_map(ino, idx, tg_message_id, size)
-		   VALUES (?,?,?,?)
+		`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size)
+		   VALUES (?,?,?,?,NULL,NULL)
 		 ON CONFLICT(ino, idx) DO UPDATE SET
 		   tg_message_id = excluded.tg_message_id,
-		   size          = excluded.size`,
+		   size          = excluded.size,
+		   pack_offset   = NULL,
+		   pack_size     = NULL`,
 		ino, idx, blobMsgID, blobSize); err != nil {
 		return false, 0, 0, fmt.Errorf("reuse put chunk: %w", err)
 	}

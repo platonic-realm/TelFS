@@ -46,4 +46,20 @@ type Chunk struct {
 	Idx         int32
 	TGMessageID int64
 	Size        int32
+	// PackOffset and PackSize are non-zero when this chunk is an
+	// EXTENT into a shared "packed blob" message — multiple small
+	// files share one TG message to amortize the per-message round-
+	// trip cost. For an unpacked chunk (the common case for files
+	// >= chunk.PackThreshold), both are zero and the reader treats
+	// the entire TG message as this chunk's wire bytes.
+	//
+	// Stored as SQLite NULL when zero (`pack_offset IS NULL` in
+	// chunk_map); existing pre-packer rows decode as zero/zero
+	// without migration, so older filesystems keep working.
+	PackOffset int64
+	PackSize   int32
 }
+
+// IsPacked reports whether this chunk is an extent into a shared
+// packed blob (vs. owning its TG message exclusively).
+func (c Chunk) IsPacked() bool { return c.PackSize > 0 }

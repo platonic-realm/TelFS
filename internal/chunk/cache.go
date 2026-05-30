@@ -156,11 +156,17 @@ func (c *Cache) SizeBytes() int64 {
 	return c.totalSize
 }
 
-// Get returns the bytes for the chunk identified by key. On a cache hit,
-// the file is read from disk and the LRU position is bumped. On miss, we
-// call the Fetcher, write the result to disk, and insert into the LRU
-// (evicting older entries if needed).
-func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64) ([]byte, error) {
+// Get returns the plaintext bytes for the chunk identified by key.
+// On a cache hit, the file is read from disk and the LRU position is
+// bumped. On miss, we call the Fetcher, write the result to disk,
+// and insert into the LRU (evicting older entries if needed).
+//
+// packOffset / packSize: when packSize > 0, the chunk is an EXTENT
+// into a packed blob — the fetcher returns the full blob and Get
+// slices [packOffset : packOffset+packSize] before decryption.
+// packOffset==0 && packSize==0 means "unpacked" — Get uses the full
+// fetched bytes (the historical behavior).
+func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset int64, packSize int32) ([]byte, error) {
 	// Hit path: bump LRU under lock; then read off disk outside lock.
 	c.mu.Lock()
 	if e, ok := c.entries[key]; ok {
@@ -179,12 +185,26 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64) ([]byte, er
 	//   wire ── decrypt ──▶ compressed ── decompress ──▶ plaintext
 	//
 	// We persist plaintext so cache hits skip both costs.
-	ciphertext, err := c.fetcher.Fetch(ctx, key, tgMessageID)
+	fetched, err := c.fetcher.Fetch(ctx, key, tgMessageID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
 	}
 	metrics.ChunksDownloaded.Inc()
-	metrics.BytesDownloaded.Add(int64(len(ciphertext)))
+	metrics.BytesDownloaded.Add(int64(len(fetched)))
+	// Slice if packed: the fetched blob holds many chunks back-to-back.
+	// packSize > 0 marks this chunk as a sub-extent. packOffset == 0 is
+	// valid (start-of-blob); packSize is the load-bearing signal.
+	var ciphertext []byte
+	if packSize > 0 {
+		end := packOffset + int64(packSize)
+		if end > int64(len(fetched)) {
+			return nil, fmt.Errorf("packed extent out of range for chunk %d/%d: blob=%d bytes, want [%d:%d]",
+				key.Ino, key.Idx, len(fetched), packOffset, end)
+		}
+		ciphertext = fetched[packOffset:end]
+	} else {
+		ciphertext = fetched
+	}
 	compressed, err := c.cipher.Open(key.Ino, key.Idx, ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt chunk %d/%d: %w", key.Ino, key.Idx, err)

@@ -111,7 +111,7 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 		if err != nil {
 			return written, fmt.Errorf("chunk lookup %d/%d: %w", ino, idx, err)
 		}
-		data, err := r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID)
+		data, err := r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
 		if err != nil {
 			return written, err
 		}
@@ -177,5 +177,5 @@ func (r *Reader) prefetchOne(ino int64, idx int32, key Key) {
 		return
 	}
 	// cache.Get does the fetch + decrypt + disk persist on miss.
-	_, _ = r.cache.Get(ctx, key, c.TGMessageID)
+	_, _ = r.cache.Get(ctx, key, c.TGMessageID, c.PackOffset, c.PackSize)
 }

@@ -530,6 +530,11 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// the gotd session.
 		pool := chunk.NewUploadPool(chunk.DefaultUploadConcurrency)
 		reader := chunk.NewReader(metaStore, cache, pool.Pending, chunkSize)
+		// Small-file packer: aggregates chunks smaller than
+		// chunk.DefaultPackThreshold into shared TG blobs to amortize
+		// the per-message RTT. Nil-safe — Writer falls back to
+		// direct upload when no packer is wired.
+		packer := chunk.NewPacker(metaStore, sess, 0, 0, 0)
 
 		backend := &telfsfs.Backend{
 			Meta:      metaStore,
@@ -537,6 +542,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			Cache:     cache,
 			Uploader:  sess,
 			Pool:      pool,
+			Packer:    packer,
 			Cipher:    cipher,
 			Codec:     codec,
 			ChunkSize: chunkSize,

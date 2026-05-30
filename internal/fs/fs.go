@@ -27,6 +27,7 @@ type Backend struct {
 	Cache     *chunk.Cache
 	Uploader  chunk.Uploader
 	Pool      *chunk.UploadPool // backend-global upload concurrency + per-ino R-A-W barrier
+	Packer    *chunk.Packer     // nil → no small-file packing
 	Cipher    crypto.Cipher     // nil → NoopCipher (plaintext mode)
 	Codec     compress.Codec    // nil → compress.None (no compression)
 	ChunkSize int64
@@ -43,7 +44,15 @@ type Backend struct {
 // fd closed, up to ctx's deadline. After this returns the caller can
 // safely tear down the upload pool's MTProto session. On timeout the
 // pool ctx is canceled so still-running gotd round trips unwind.
+//
+// Order: drain the Packer FIRST so any pending small-file batches
+// finish landing their chunk_map rows, then drain the Pool for any
+// non-packed uploads. Reverse order would let the pool drain return
+// while a packed-flush goroutine still held buffered wires.
 func (b *Backend) Shutdown(ctx context.Context) {
+	if b.Packer != nil {
+		b.Packer.Close()
+	}
 	if b.Pool == nil {
 		return
 	}
@@ -202,7 +211,7 @@ func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
 	if !n.backend.canWrite() {
 		return syscall.EROFS
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -254,7 +263,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 		}
 		return nil, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
@@ -312,7 +321,7 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 		return nil, nil, 0, syscall.EIO
 	}
 	childInode := n.newChildInode(ctx, child)
-	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, ino, n.backend.chunkSize(), 0)
+	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, ino, n.backend.chunkSize(), 0)
 	if werr != nil {
 		return nil, nil, 0, syscall.EIO
 	}

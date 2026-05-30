@@ -77,6 +77,7 @@ type Writer struct {
 	cipher   crypto.Cipher  // never nil; defaults to NoopCipher
 	codec    compress.Codec // never nil; defaults to None
 	pool     *UploadPool
+	packer   *Packer // nil disables packing; small chunks upload directly
 	chunkSz  int64
 	dirtyCap int64
 	ino      int64
@@ -116,7 +117,7 @@ type dirtyChunk struct {
 // initial size from meta, so a freshly-opened writer sees the size that
 // previously-detached writers committed via SetSize even if their
 // chunk uploads are still in flight.
-func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher crypto.Cipher, codec compress.Codec, pool *UploadPool, ino int64, chunkSize, dirtyCap int64) (*Writer, error) {
+func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher crypto.Cipher, codec compress.Codec, pool *UploadPool, packer *Packer, ino int64, chunkSize, dirtyCap int64) (*Writer, error) {
 	if chunkSize <= 0 {
 		chunkSize = ChunkSize
 	}
@@ -146,6 +147,7 @@ func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher 
 		cipher:    cipher,
 		codec:     codec,
 		pool:      pool,
+		packer:    packer,
 		chunkSz:   chunkSize,
 		dirtyCap:  dirtyCap,
 		ino:       ino,
@@ -282,7 +284,7 @@ func (w *Writer) loadForWrite(ctx context.Context, idx int32) (*dirtyChunk, erro
 	// Try to pull existing chunk content (cache hit or TG download).
 	c, err := w.meta.GetChunk(ctx, w.ino, idx)
 	if err == nil {
-		existing, fetchErr := w.cache.Get(ctx, Key{Ino: w.ino, Idx: idx}, c.TGMessageID)
+		existing, fetchErr := w.cache.Get(ctx, Key{Ino: w.ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
 		if fetchErr != nil {
 			return nil, fmt.Errorf("preload chunk %d: %w", idx, fetchErr)
 		}
@@ -648,6 +650,33 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		w.recordError(fmt.Errorf("encrypt chunk %d: %w", idx, err))
 		return
 	}
+	// Route: pack small chunks, direct-upload everything else. Packing
+	// trades per-file dedup (skipped for packed chunks in v1) for a
+	// massive throughput win on many-tiny-files workloads, so the
+	// dedup decision above is BYPASSED whenever the chunk would
+	// qualify for packing. Larger chunks still flow through the
+	// dedup + direct-upload path unchanged.
+	if w.packer != nil && int32(len(dc.data)) < w.packer.Threshold() {
+		resultCh := w.packer.Submit(w.ino, idx, int32(len(dc.data)), wire)
+		select {
+		case res := <-resultCh:
+			if res.err != nil {
+				restore = true
+				w.recordError(fmt.Errorf("pack chunk %d: %w", idx, res.err))
+				return
+			}
+			// Packer already wrote the chunk_map row with pack_offset
+			// + pack_size. We just need to invalidate the local cache
+			// so the next read fetches the new bytes.
+			w.cache.Invalidate(Key{Ino: w.ino, Idx: idx})
+			return
+		case <-ctx.Done():
+			restore = true
+			w.recordError(fmt.Errorf("pack chunk %d: %w", idx, ctx.Err()))
+			return
+		}
+	}
+
 	name := fmt.Sprintf("ino%d-idx%d", w.ino, idx)
 	msgID, err := w.uploader.UploadDocument(ctx, bytes.NewReader(wire), name, "")
 	if err != nil {

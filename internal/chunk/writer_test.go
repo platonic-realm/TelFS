@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -110,7 +111,7 @@ func setupWriter(t *testing.T, chunkSize int64) (*Writer, *meta.Store, *fakeUplo
 	}
 	up := newFakeUploader()
 	cache := newTestCache(t, writerFetcher{uploader: up})
-	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, ino, chunkSize, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, nil, ino, chunkSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +474,7 @@ func TestDedupReusesIdenticalContent(t *testing.T) {
 	payload := []byte("the same content twice")
 
 	// Write to ino1 → first upload.
-	w1, err := NewWriter(ctx, m, cache, up, nil, nil, nil, ino1, 1024, 0)
+	w1, err := NewWriter(ctx, m, cache, up, nil, nil, nil, nil, ino1, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +490,7 @@ func TestDedupReusesIdenticalContent(t *testing.T) {
 	}
 
 	// Write IDENTICAL content to ino2 → must reuse, no new upload.
-	w2, err := NewWriter(ctx, m, cache, up, nil, nil, nil, ino2, 1024, 0)
+	w2, err := NewWriter(ctx, m, cache, up, nil, nil, nil, nil, ino2, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -535,7 +536,7 @@ func TestDedupSkippedWhenEncrypted(t *testing.T) {
 
 	payload := []byte("encrypted content")
 	for _, ino := range []int64{ino1, ino2} {
-		w, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, ino, 1024, 0)
+		w, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, nil, ino, 1024, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -582,7 +583,7 @@ func TestDedupWithConvergentCipher(t *testing.T) {
 	payload := []byte("identical plaintext under convergent v3 — dedup must collapse")
 
 	// Write payload to ino1 via convergent cipher.
-	w1, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, ino1, 1024, 0)
+	w1, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, nil, ino1, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +601,7 @@ func TestDedupWithConvergentCipher(t *testing.T) {
 	// Write IDENTICAL payload to ino2 — dedup MUST kick in (zero new
 	// uploads) because the convergent cipher produces the same
 	// ciphertext bytes.
-	w2, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, ino2, 1024, 0)
+	w2, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, nil, ino2, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -710,7 +711,7 @@ func TestFlushIsAsync(t *testing.T) {
 	up := newSlowUploader()
 	cache := newTestCache(t, slowFetcher{up: up})
 	pool := NewUploadPool(4)
-	w, err := NewWriter(ctx, m, cache, up, nil, nil, pool, ino, 10, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, pool, nil, ino, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -768,7 +769,7 @@ func TestReadAfterAsyncCloseWaits(t *testing.T) {
 	up := newSlowUploader()
 	cache := newTestCache(t, slowFetcher{up: up})
 	pool := NewUploadPool(4)
-	w, err := NewWriter(ctx, m, cache, up, nil, nil, pool, ino, 10, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, pool, nil, ino, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -819,11 +820,11 @@ func TestPoolGlobalConcurrency(t *testing.T) {
 	up := newSlowUploader()
 	cache := newTestCache(t, slowFetcher{up: up})
 	pool := NewUploadPool(1) // only one upload at a time globally
-	w1, err := NewWriter(ctx, m, cache, up, nil, nil, pool, ino1, 10, 0)
+	w1, err := NewWriter(ctx, m, cache, up, nil, nil, pool, nil, ino1, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	w2, err := NewWriter(ctx, m, cache, up, nil, nil, pool, ino2, 10, 0)
+	w2, err := NewWriter(ctx, m, cache, up, nil, nil, pool, nil, ino2, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,7 +881,7 @@ func TestCompressionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w, err := NewWriter(ctx, m, cache, up, nil, codec, nil, ino, 4096, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, codec, nil, nil, ino, 4096, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -912,5 +913,279 @@ func TestCompressionRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(dest, payload) {
 		t.Fatal("read-back differs from original plaintext")
+	}
+}
+
+// TestPackerRoutesSmallFiles: writes a small file (below the packer
+// threshold). Verifies that (a) the chunk lands in chunk_map with
+// non-zero pack_offset/pack_size, (b) the on-channel blob contains
+// the encrypted wire at that offset, (c) Reader can round-trip.
+func TestPackerRoutesSmallFiles(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino, err := m.CreateChild(ctx, meta.RootIno, "f", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+	// Aggressive window so test doesn't wait long.
+	packer := NewPacker(m, up, 1024, 10000, 50*time.Millisecond)
+	defer packer.Close()
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, ino, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("hello packer world")
+	if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	chunks, _ := m.ListChunks(ctx, ino)
+	if len(chunks) != 1 {
+		t.Fatalf("want 1 chunk, got %d", len(chunks))
+	}
+	c := chunks[0]
+	if !c.IsPacked() {
+		t.Fatalf("chunk not packed: %+v", c)
+	}
+	if c.Size != int32(len(payload)) {
+		t.Fatalf("Size=%d want %d", c.Size, len(payload))
+	}
+	if c.PackSize == 0 {
+		t.Fatal("PackSize is 0 — pack route didn't run")
+	}
+	// Reader round-trip — the slice + decrypt + decompress path.
+	r := NewReader(m, cache, nil, 4096)
+	dest := make([]byte, len(payload))
+	n, err := r.ReadAt(ctx, ino, dest, 0)
+	if err != nil || n != len(payload) || !bytes.Equal(dest, payload) {
+		t.Fatalf("read-back: n=%d err=%v got=%q want=%q", n, err, dest, payload)
+	}
+}
+
+// TestPackerAggregatesMultiple: write three small files; observe
+// they share a single TG message (one blob upload), with distinct
+// pack_offsets.
+func TestPackerAggregatesMultiple(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+	// Wider window so all three submits land in the same batch.
+	packer := NewPacker(m, up, 1024, 1<<20, 100*time.Millisecond)
+	defer packer.Close()
+
+	const N = 3
+	inos := make([]int64, N)
+	for i := 0; i < N; i++ {
+		ino, err := m.CreateChild(ctx, meta.RootIno, fmt.Sprintf("f%d", i), meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+		if err != nil {
+			t.Fatal(err)
+		}
+		inos[i] = ino
+	}
+	// Submit all three before the window elapses. Each Sync blocks on
+	// its own per-writer wg, so we issue them in goroutines.
+	var wg sync.WaitGroup
+	for i, ino := range inos {
+		wg.Add(1)
+		go func(i int, ino int64) {
+			defer wg.Done()
+			w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, ino, 4096, 0)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			payload := []byte(fmt.Sprintf("file-%d-content", i))
+			if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := w.Sync(ctx); err != nil {
+				t.Error(err)
+				return
+			}
+		}(i, ino)
+	}
+	wg.Wait()
+
+	// All three chunks must share one TG message id (the packed blob).
+	seen := map[int64]struct{}{}
+	for _, ino := range inos {
+		chunks, _ := m.ListChunks(ctx, ino)
+		if len(chunks) != 1 {
+			t.Fatalf("ino %d has %d chunks", ino, len(chunks))
+		}
+		c := chunks[0]
+		if !c.IsPacked() {
+			t.Fatalf("ino %d not packed: %+v", ino, c)
+		}
+		seen[c.TGMessageID] = struct{}{}
+	}
+	if len(seen) != 1 {
+		t.Fatalf("packer didn't aggregate: chunks land in %d distinct TG messages", len(seen))
+	}
+}
+
+// TestPackerLargeBypasses: a file larger than the packer's threshold
+// should go straight to direct upload, not through the pack route.
+func TestPackerLargeBypasses(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino, err := m.CreateChild(ctx, meta.RootIno, "big", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+	packer := NewPacker(m, up, 100, 10000, 50*time.Millisecond)
+	defer packer.Close()
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, ino, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{'A'}, 500) // way above threshold=100
+	if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	chunks, _ := m.ListChunks(ctx, ino)
+	if len(chunks) != 1 {
+		t.Fatalf("want 1 chunk")
+	}
+	if chunks[0].IsPacked() {
+		t.Fatalf("large chunk wrongly packed: %+v", chunks[0])
+	}
+}
+
+// TestPackerCloseDrainsBuffer is the advisor's discriminator for the
+// "Close cancels its own upload ctx" bug. Submit one chunk, Close
+// before the window fires, assert the chunk_map row landed and the
+// reader can round-trip the data. The bug version of Close cancelled
+// the upload ctx before the final flush ran, so the row never landed
+// and every buffered small file evaporated at unmount.
+func TestPackerCloseDrainsBuffer(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino, err := m.CreateChild(ctx, meta.RootIno, "f", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+	// Window is long so the only flush opportunity is Close's drain.
+	packer := NewPacker(m, up, 1024, 1<<20, 30*time.Second)
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, ino, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("drained-on-close")
+	if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Issue Sync in a goroutine — it'll block on the packer's result
+	// chan, which only fires after Close's drain.
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- w.Sync(ctx) }()
+	// Give the writer a moment to enqueue in the packer.
+	time.Sleep(50 * time.Millisecond)
+	packer.Close()
+	if err := <-syncDone; err != nil {
+		t.Fatalf("Sync after Close: %v", err)
+	}
+	chunks, _ := m.ListChunks(ctx, ino)
+	if len(chunks) != 1 {
+		t.Fatalf("chunk_map row missing after Close-drain: %+v", chunks)
+	}
+	r := NewReader(m, cache, nil, 4096)
+	dest := make([]byte, len(payload))
+	n, err := r.ReadAt(ctx, ino, dest, 0)
+	if err != nil || n != len(payload) || !bytes.Equal(dest, payload) {
+		t.Fatalf("read-back: n=%d err=%v got=%q want=%q", n, err, dest, payload)
+	}
+}
+
+// TestDedupOverwritePreservesUnpackedFields is the advisor's
+// discriminator for the "ReuseChunkByHash leaves stale pack
+// fields" bug. Setup: write a small file via the packer, then
+// overwrite it with a NON-packed chunk whose content hash matches
+// an existing direct-uploaded chunk so the dedup path fires. The
+// chunk_map row must end up with pack_offset/pack_size = NULL so
+// Reader doesn't slice the wrong message.
+func TestDedupOverwritePreservesUnpackedFields(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+
+	// Step 1: create a "source" file with the content X (large enough
+	// to bypass packing). This populates chunk_blob with hash(X).
+	srcIno, _ := m.CreateChild(ctx, meta.RootIno, "src", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	packer := NewPacker(m, up, 256, 1<<20, 50*time.Millisecond)
+	defer packer.Close()
+	wSrc, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, srcIno, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	X := bytes.Repeat([]byte("X"), 1024)
+	if _, err := wSrc.WriteAt(ctx, X, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := wSrc.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 2: a small file packed via the packer.
+	tgtIno, _ := m.CreateChild(ctx, meta.RootIno, "tgt", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	wTgt, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, tgtIno, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wTgt.WriteAt(ctx, []byte("small content"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := wTgt.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	chunks, _ := m.ListChunks(ctx, tgtIno)
+	if !chunks[0].IsPacked() {
+		t.Fatalf("setup: target wasn't packed: %+v", chunks)
+	}
+
+	// Step 3: overwrite the target with content X. The chunk is now
+	// 1024 bytes — bigger than the threshold (256) — so it skips the
+	// pack route and hits dedup, which reuses the source's TG message.
+	wTgt2, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, tgtIno, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wTgt2.Truncate(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wTgt2.WriteAt(ctx, X, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := wTgt2.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	chunks, _ = m.ListChunks(ctx, tgtIno)
+	if len(chunks) != 1 {
+		t.Fatalf("after overwrite: chunks = %+v", chunks)
+	}
+	if chunks[0].IsPacked() {
+		t.Fatalf("overwrite-dedup left stale pack fields: %+v", chunks[0])
+	}
+	// And the read-back is the new content X.
+	r := NewReader(m, cache, nil, 4096)
+	dest := make([]byte, len(X))
+	n, err := r.ReadAt(ctx, tgtIno, dest, 0)
+	if err != nil || n != len(X) || !bytes.Equal(dest, X) {
+		t.Fatalf("read-back after overwrite: n=%d err=%v match=%v", n, err, bytes.Equal(dest, X))
 	}
 }
