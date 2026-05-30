@@ -1,11 +1,10 @@
-{{define "content"}}
+{{define "telegram_panel"}}
 <section id="tg-panel" hx-get="/partials/telegram" hx-trigger="every 2s" hx-swap="outerHTML">
 {{if not .Online}}
 <div class="panel error">
   <p><strong>Daemon /telegram endpoint unreachable.</strong></p>
   <p>Tried <code>{{.Source}}</code>: {{.FetchError}}</p>
-  <p>Make sure <code>telfs mount</code> is running with <code>--metrics-addr 127.0.0.1:9090</code>.
-     The default in this build also exposes <code>/telegram</code> from the metrics server.</p>
+  <p>Make sure <code>telfs mount</code> is running with <code>--metrics-addr 127.0.0.1:9090</code>.</p>
 </div>
 {{else}}
 

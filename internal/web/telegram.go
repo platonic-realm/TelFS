@@ -51,15 +51,19 @@ type tgPageData struct {
 // TELFS_METRICS_URL env var the daemon's wrapper might set.
 func (s *Server) telegramPage(w http.ResponseWriter, r *http.Request) {
 	data := s.fetchTelegramState(w, r)
-	s.renderTemplate(w, "telegram.html", data)
+	// Parse the partial alongside the page so {{template
+	// "telegram_panel" .}} in telegram.html resolves. The partial
+	// defines a uniquely-named block (NOT "content"), so this
+	// doesn't collide with telegram.html's own content define.
+	s.renderTemplateWith(w, "telegram.html", data, "templates/partials/telegram.html")
 }
 
 // telegramPartial is the HTMX-polled inner fragment. Same data
-// fetch as telegramPage; renders only the partial so hx-swap can
-// replace the section without a full page navigation.
+// fetch as telegramPage; renders only the telegram_panel block so
+// hx-swap can replace the section without a full page navigation.
 func (s *Server) telegramPartial(w http.ResponseWriter, r *http.Request) {
 	data := s.fetchTelegramState(w, r)
-	s.renderPartial(w, "partials/telegram.html", data)
+	s.renderPartialBlock(w, "partials/telegram.html", "telegram_panel", data)
 }
 
 // fetchTelegramState pulls + parses the daemon's /telegram JSON for

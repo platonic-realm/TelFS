@@ -80,16 +80,24 @@ func (s *Server) registerRoutes() {
 // the base layout). Templates live under internal/web/templates/
 // and are accessed by their relative path.
 //
-// Also includes every partial under templates/partials so a page
-// can {{template "partials/X.html" .}} embed them at render time —
-// HTMX-polled partials are then served as standalone HTML by
-// renderPartial.
+// Each partial file defines its own "content" block (used by the
+// HTMX endpoint via renderPartial). DO NOT add partials to this
+// static parse list — every partial's "content" define would
+// override the page's own, and you'd see the partial's HTML on
+// pages that have nothing to do with it (we shipped that bug once;
+// 4c1b4b9's regression). Pages that need to embed a partial inline
+// should renderTemplateWith extras for an explicit, per-page parse.
 func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
-	t, err := template.New("").Funcs(tmplFuncs()).
-		ParseFS(templatesFS,
-			"templates/layout.html",
-			"templates/"+name,
-			"templates/partials/telegram.html")
+	s.renderTemplateWith(w, name, data)
+}
+
+// renderTemplateWith is renderTemplate plus extra template files
+// merged into the set. Used by handlers that want to {{template ...}}
+// embed a partial in their page. Pass the partial paths relative to
+// the templates root.
+func (s *Server) renderTemplateWith(w http.ResponseWriter, name string, data any, extras ...string) {
+	files := append([]string{"templates/layout.html", "templates/" + name}, extras...)
+	t, err := template.New("").Funcs(tmplFuncs()).ParseFS(templatesFS, files...)
 	if err != nil {
 		s.opts.Logger.Printf("template parse %s: %v", name, err)
 		http.Error(w, "template error", http.StatusInternalServerError)
@@ -101,9 +109,19 @@ func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 	}
 }
 
-// renderPartial parses a single template (no layout) — for HTMX
-// fragment responses.
+// renderPartial parses a single template (no layout) and executes
+// its "content" block — for HTMX fragment responses from partials
+// that define {{define "content"}}.
 func (s *Server) renderPartial(w http.ResponseWriter, name string, data any) {
+	s.renderPartialBlock(w, name, "content", data)
+}
+
+// renderPartialBlock is the named-block variant. Use when a partial
+// defines a uniquely-named block (e.g., "telegram_panel") instead
+// of the shared "content" name — that's the right pattern when the
+// partial is ALSO embedded into a full page, since two "content"
+// defines in one parse set collide.
+func (s *Server) renderPartialBlock(w http.ResponseWriter, name, block string, data any) {
 	t, err := template.New("").Funcs(tmplFuncs()).
 		ParseFS(templatesFS, "templates/"+name)
 	if err != nil {
@@ -112,8 +130,8 @@ func (s *Server) renderPartial(w http.ResponseWriter, name string, data any) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := t.ExecuteTemplate(w, "content", data); err != nil {
-		s.opts.Logger.Printf("partial exec %s: %v", name, err)
+	if err := t.ExecuteTemplate(w, block, data); err != nil {
+		s.opts.Logger.Printf("partial exec %s [%s]: %v", name, block, err)
 	}
 }
 
