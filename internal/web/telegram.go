@@ -50,6 +50,21 @@ type tgPageData struct {
 // `telfs mount --metrics-addr`. Configurable via the
 // TELFS_METRICS_URL env var the daemon's wrapper might set.
 func (s *Server) telegramPage(w http.ResponseWriter, r *http.Request) {
+	data := s.fetchTelegramState(w, r)
+	s.renderTemplate(w, "telegram.html", data)
+}
+
+// telegramPartial is the HTMX-polled inner fragment. Same data
+// fetch as telegramPage; renders only the partial so hx-swap can
+// replace the section without a full page navigation.
+func (s *Server) telegramPartial(w http.ResponseWriter, r *http.Request) {
+	data := s.fetchTelegramState(w, r)
+	s.renderPartial(w, "partials/telegram.html", data)
+}
+
+// fetchTelegramState pulls + parses the daemon's /telegram JSON for
+// rendering by either the page or the partial.
+func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPageData {
 	url := "http://127.0.0.1:9090/telegram"
 	if v := r.URL.Query().Get("source"); v != "" {
 		url = v
@@ -63,34 +78,30 @@ func (s *Server) telegramPage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		data.Online = false
 		data.FetchError = err.Error()
-		s.renderTemplate(w, "telegram.html", data)
-		return
+		return data
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		data.Online = false
 		data.FetchError = fmt.Sprintf("HTTP %d from daemon", resp.StatusCode)
-		s.renderTemplate(w, "telegram.html", data)
-		return
+		return data
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		data.Online = false
 		data.FetchError = "read body: " + err.Error()
-		s.renderTemplate(w, "telegram.html", data)
-		return
+		return data
 	}
 	if err := json.Unmarshal(body, &data.State); err != nil {
 		data.Online = false
 		data.FetchError = "parse json: " + err.Error()
-		s.renderTemplate(w, "telegram.html", data)
-		return
+		return data
 	}
 	data.Online = true
 	if data.State.LastSuccessAgeSeconds > 0 && data.State.InFlight > 0 {
 		data.StallSeconds = data.State.LastSuccessAgeSeconds
 	}
-	s.renderTemplate(w, "telegram.html", data)
+	return data
 }
 
 // httpClient has a short timeout — the daemon's /telegram endpoint

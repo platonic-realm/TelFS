@@ -39,12 +39,14 @@ const DefaultPackThreshold int32 = 256 << 10
 const DefaultPackTarget int64 = 32 << 20
 
 // DefaultPackWindow is how long the packer will wait for more
-// wires before flushing what it has. Async close makes 200 ms
-// invisible to the close() caller (close returned long before);
+// wires before flushing what it has. Async close makes this
+// invisible to close() (returns long before the window matters);
 // fsync waits on the packer's per-chunk result, so its latency
-// IS bounded by this. Pick small enough to not surprise fsync
-// users, large enough for many cp processes to converge.
-const DefaultPackWindow = 200 * time.Millisecond
+// IS bounded by this. 1 s is generous enough for staggered
+// many-tiny-file bursts (git clone, tar -x, slow upload of many
+// small attachments) to coalesce into one TG message instead of
+// firing per-200ms-tick blobs that each carry only a few files.
+const DefaultPackWindow = 1 * time.Second
 
 // Packer aggregates small chunk wires into shared "packed blobs" —
 // one TG message carrying many chunks back-to-back — and writes

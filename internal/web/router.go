@@ -57,6 +57,7 @@ func (s *Server) registerRoutes() {
 
 	// Telegram connection state + recent requests.
 	s.mux.HandleFunc("GET /telegram", s.telegramPage)
+	s.mux.HandleFunc("GET /partials/telegram", s.telegramPartial)
 
 	// Mount supervisor.
 	s.mux.HandleFunc("GET /mount", s.mountList)
@@ -78,11 +79,17 @@ func (s *Server) registerRoutes() {
 // renderTemplate parses + executes a template set (always including
 // the base layout). Templates live under internal/web/templates/
 // and are accessed by their relative path.
+//
+// Also includes every partial under templates/partials so a page
+// can {{template "partials/X.html" .}} embed them at render time —
+// HTMX-polled partials are then served as standalone HTML by
+// renderPartial.
 func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
-	t, err := template.New("").Funcs(template.FuncMap{
-		"humanBytes": humanBytesTpl,
-		"add1":       func(i int) int { return i + 1 },
-	}).ParseFS(templatesFS, "templates/layout.html", "templates/"+name)
+	t, err := template.New("").Funcs(tmplFuncs()).
+		ParseFS(templatesFS,
+			"templates/layout.html",
+			"templates/"+name,
+			"templates/partials/telegram.html")
 	if err != nil {
 		s.opts.Logger.Printf("template parse %s: %v", name, err)
 		http.Error(w, "template error", http.StatusInternalServerError)
@@ -97,9 +104,8 @@ func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 // renderPartial parses a single template (no layout) — for HTMX
 // fragment responses.
 func (s *Server) renderPartial(w http.ResponseWriter, name string, data any) {
-	t, err := template.New("").Funcs(template.FuncMap{
-		"humanBytes": humanBytesTpl,
-	}).ParseFS(templatesFS, "templates/"+name)
+	t, err := template.New("").Funcs(tmplFuncs()).
+		ParseFS(templatesFS, "templates/"+name)
 	if err != nil {
 		s.opts.Logger.Printf("partial parse %s: %v", name, err)
 		http.Error(w, "template error", http.StatusInternalServerError)
@@ -108,5 +114,22 @@ func (s *Server) renderPartial(w http.ResponseWriter, name string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := t.ExecuteTemplate(w, "content", data); err != nil {
 		s.opts.Logger.Printf("partial exec %s: %v", name, err)
+	}
+}
+
+// tmplFuncs returns the shared template FuncMap. Keep all helpers
+// here so a page and its partials see the same functions; otherwise
+// {{template ...}} embeds fail when the helper exists on the page's
+// FuncMap but not the partial's.
+func tmplFuncs() template.FuncMap {
+	return template.FuncMap{
+		"humanBytes": humanBytesTpl,
+		"add1":       func(i int) int { return i + 1 },
+		"ageSeconds": func(now, then int64) int64 {
+			if now < then {
+				return 0
+			}
+			return now - then
+		},
 	}
 }

@@ -1,0 +1,62 @@
+{{define "content"}}
+<section id="tg-panel" hx-get="/partials/telegram" hx-trigger="every 2s" hx-swap="outerHTML">
+{{if not .Online}}
+<div class="panel error">
+  <p><strong>Daemon /telegram endpoint unreachable.</strong></p>
+  <p>Tried <code>{{.Source}}</code>: {{.FetchError}}</p>
+  <p>Make sure <code>telfs mount</code> is running with <code>--metrics-addr 127.0.0.1:9090</code>.
+     The default in this build also exposes <code>/telegram</code> from the metrics server.</p>
+</div>
+{{else}}
+
+<div class="panel">
+  <table class="kv">
+    <tr><td>In-flight RPCs</td><td><strong>{{.State.InFlight}}</strong></td></tr>
+    {{if .State.LastSuccessUnix}}
+    <tr><td>Last successful RPC</td><td>{{.State.LastSuccessAgeSeconds}}s ago</td></tr>
+    {{else}}
+    <tr><td>Last successful RPC</td><td>(none yet)</td></tr>
+    {{end}}
+    {{if .State.LastErrorUnix}}
+    <tr><td>Last error</td><td>{{.State.LastErrorAgeSeconds}}s ago — <code>{{.State.LastErrorMessage}}</code></td></tr>
+    {{end}}
+    {{if gt .StallSeconds 90}}
+    <tr><td>Stall warning</td><td class="warn"><strong>No upload progress for {{.StallSeconds}}s with work pending.</strong> Watchdog will trigger reconnect automatically.</td></tr>
+    {{end}}
+  </table>
+</div>
+
+<h3>Recent RPCs <small>(auto-refresh 2s)</small></h3>
+<table class="rpc">
+  <thead>
+    <tr>
+      <th>Method</th>
+      <th>Status</th>
+      <th>Duration</th>
+      <th>Bytes</th>
+      <th>FLOOD_WAIT</th>
+      <th>Age</th>
+    </tr>
+  </thead>
+  <tbody>
+  {{range .State.Requests}}
+    <tr>
+      <td><code>{{.Method}}</code></td>
+      <td>
+        {{if .InFlight}}<span class="warn">in flight</span>
+        {{else if .Err}}<span class="error" title="{{.Err}}">err</span>
+        {{else}}<span class="ok">ok</span>{{end}}
+      </td>
+      <td>{{if .InFlight}}—{{else}}{{.DurationMS}} ms{{end}}</td>
+      <td>{{.Bytes}}</td>
+      <td>{{if gt .FloodWaitSeconds 0}}{{.FloodWaitSeconds}}s{{else}}—{{end}}</td>
+      <td>{{ageSeconds $.NowUnix .StartedUnix}}s ago</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="6">(no RPCs recorded yet)</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+</section>
+{{end}}

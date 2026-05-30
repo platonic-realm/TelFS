@@ -1,65 +1,7 @@
 {{define "content"}}
 <h2>Telegram connection</h2>
 
-{{if not .Online}}
-<div class="panel error">
-  <p><strong>Daemon /telegram endpoint unreachable.</strong></p>
-  <p>Tried <code>{{.Source}}</code>: {{.FetchError}}</p>
-  <p>Make sure <code>telfs mount</code> is running with <code>--metrics-addr 127.0.0.1:9090</code>.
-     The default in this build also exposes <code>/telegram</code> from the metrics server.</p>
-</div>
-{{else}}
+{{template "partials/telegram.html" .}}
 
-<div class="panel">
-  <table class="kv">
-    <tr><td>In-flight RPCs</td><td><strong>{{.State.InFlight}}</strong></td></tr>
-    {{if .State.LastSuccessUnix}}
-    <tr><td>Last successful RPC</td><td>{{.State.LastSuccessAgeSeconds}}s ago</td></tr>
-    {{else}}
-    <tr><td>Last successful RPC</td><td>(none yet)</td></tr>
-    {{end}}
-    {{if .State.LastErrorUnix}}
-    <tr><td>Last error</td><td>{{.State.LastErrorAgeSeconds}}s ago — <code>{{.State.LastErrorMessage}}</code></td></tr>
-    {{end}}
-    {{if gt .StallSeconds 90}}
-    <tr><td>Stall warning</td><td class="warn"><strong>No upload progress for {{.StallSeconds}}s with work pending.</strong> TCP connection may be wedged; consider restarting the mount daemon (your data is safe — pending wires are persisted to disk).</td></tr>
-    {{end}}
-  </table>
-</div>
-
-<h3>Recent RPCs</h3>
-<table class="rpc">
-  <thead>
-    <tr>
-      <th>Method</th>
-      <th>Status</th>
-      <th>Duration</th>
-      <th>Bytes</th>
-      <th>FLOOD_WAIT</th>
-      <th>Started</th>
-    </tr>
-  </thead>
-  <tbody>
-  {{range .State.Requests}}
-    <tr>
-      <td><code>{{.Method}}</code></td>
-      <td>
-        {{if .InFlight}}<span class="warn">in flight</span>
-        {{else if .Err}}<span class="error" title="{{.Err}}">err</span>
-        {{else}}<span class="ok">ok</span>{{end}}
-      </td>
-      <td>{{if .InFlight}}—{{else}}{{.DurationMS}} ms{{end}}</td>
-      <td>{{.Bytes}}</td>
-      <td>{{if gt .FloodWaitSeconds 0}}{{.FloodWaitSeconds}}s{{else}}—{{end}}</td>
-      <td>{{.StartedUnix}}</td>
-    </tr>
-  {{else}}
-    <tr><td colspan="6">(no RPCs recorded yet — start uploading or wait for the journal poster's first tick)</td></tr>
-  {{end}}
-  </tbody>
-</table>
-
-<p><small>Page does not auto-refresh; reload to update. Source: <code>{{.Source}}</code></small></p>
-
-{{end}}
+<p><small>Source: <code>{{.Source}}</code> · auto-refreshes every 2s via HTMX</small></p>
 {{end}}
