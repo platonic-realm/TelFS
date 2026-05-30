@@ -13,13 +13,27 @@ import (
 // web process runs separately from the mount daemon, so we have to
 // fetch over HTTP — there's no shared memory between the two.
 type tgState struct {
-	InFlight              int       `json:"in_flight"`
-	LastSuccessUnix       int64     `json:"last_success_unix"`
-	LastSuccessAgeSeconds int64     `json:"last_success_age_seconds"`
-	LastErrorUnix         int64     `json:"last_error_unix"`
-	LastErrorAgeSeconds   int64     `json:"last_error_age_seconds"`
-	LastErrorMessage      string    `json:"last_error_message"`
-	Requests              []tgRequest `json:"requests"`
+	ChannelID             int64        `json:"channel_id"`
+	ChannelTitle          string       `json:"channel_title"`
+	InFlight              int          `json:"in_flight"`
+	TotalOK               int64        `json:"total_ok"`
+	TotalErr              int64        `json:"total_err"`
+	TotalBytes            int64        `json:"total_bytes"`
+	LastSuccessUnix       int64        `json:"last_success_unix"`
+	LastSuccessAgeSeconds int64        `json:"last_success_age_seconds"`
+	LastErrorUnix         int64        `json:"last_error_unix"`
+	LastErrorAgeSeconds   int64        `json:"last_error_age_seconds"`
+	LastErrorMessage      string       `json:"last_error_message"`
+	PerMethod             []tgMethod   `json:"per_method"`
+	Requests              []tgRequest  `json:"requests"`
+}
+
+type tgMethod struct {
+	Method    string `json:"method"`
+	OK        int64  `json:"ok"`
+	Err       int64  `json:"err"`
+	FloodWait int64  `json:"flood_wait"`
+	Bytes     int64  `json:"bytes"`
 }
 
 type tgRequest struct {

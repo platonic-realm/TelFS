@@ -27,19 +27,35 @@ type Request struct {
 	FloodWait time.Duration // non-zero if Telegram returned FLOOD_WAIT
 }
 
+// MethodCount aggregates totals for one RPC method since daemon
+// start. Surfaced via /telegram so the web can render "uploaded
+// 8 blobs by SendMedia + 512 wire parts by SaveFilePart" rather
+// than just the latest 128 entries.
+type MethodCount struct {
+	Method    string
+	OK        int64 // successful invocations
+	Err       int64 // failed invocations (any non-nil error)
+	FloodWait int64 // FLOOD_WAIT responses (subset of Err — gets retried)
+	Bytes     int64 // sum of encoded request bytes (best-effort, request side only)
+}
+
 // Tracker is a thread-safe ring buffer of recent RPCs plus aggregate
 // connection-health state (last successful RPC, count of FLOOD_WAITs,
-// in-flight count). One Tracker is shared by the gotd middleware
-// chain and the web /telegram handler.
+// in-flight count, per-method totals). One Tracker is shared by the
+// gotd middleware chain and the web /telegram handler.
 type Tracker struct {
-	mu       sync.Mutex
-	ring     []Request
-	head     int       // next write position
-	cap      int       // ring capacity
-	seq      int64     // last issued ID
-	inFlight int       // currently outstanding RPCs
-	lastOK   time.Time // wall time of last successful Invoke
-	lastErr  time.Time // wall time of last errored Invoke
+	mu        sync.Mutex
+	ring      []Request
+	head      int       // next write position
+	cap       int       // ring capacity
+	seq       int64     // last issued ID
+	totalOK   int64     // count of successful Invokes since start
+	totalErr  int64     // count of errored Invokes since start
+	totalBytes int64    // sum of request bytes since start
+	byMethod  map[string]*MethodCount
+	inFlight  int       // currently outstanding RPCs
+	lastOK    time.Time // wall time of last successful Invoke
+	lastErr   time.Time // wall time of last errored Invoke
 	lastErrText string
 }
 
@@ -50,8 +66,9 @@ func NewTracker(capacity int) *Tracker {
 		capacity = 64
 	}
 	return &Tracker{
-		ring: make([]Request, capacity),
-		cap:  capacity,
+		ring:     make([]Request, capacity),
+		cap:      capacity,
+		byMethod: make(map[string]*MethodCount),
 	}
 }
 
@@ -84,17 +101,36 @@ func (t *Tracker) End(id int64, err error, floodWait time.Duration) {
 		t.inFlight = 0
 	}
 	now := time.Now()
+	// Update ring + aggregate totals. We need the method name and
+	// bytes from the ring entry to feed byMethod, so do both in
+	// one pass.
 	for i := range t.ring {
 		if t.ring[i].ID == id {
 			t.ring[i].Duration = now.Sub(t.ring[i].Started)
 			t.ring[i].InFlight = false
 			t.ring[i].FloodWait = floodWait
+			method := t.ring[i].Method
+			bytes := int64(t.ring[i].Bytes)
+			mc := t.byMethod[method]
+			if mc == nil {
+				mc = &MethodCount{Method: method}
+				t.byMethod[method] = mc
+			}
+			mc.Bytes += bytes
+			t.totalBytes += bytes
 			if err != nil {
 				t.ring[i].Err = err.Error()
 				t.lastErr = now
 				t.lastErrText = err.Error()
+				t.totalErr++
+				mc.Err++
+				if floodWait > 0 {
+					mc.FloodWait++
+				}
 			} else {
 				t.lastOK = now
+				t.totalOK++
+				mc.OK++
 			}
 			return
 		}
@@ -110,6 +146,11 @@ type Snapshot struct {
 	LastSuccess  time.Time
 	LastError    time.Time
 	LastErrorMsg string
+	// Aggregate totals since daemon start.
+	TotalOK    int64
+	TotalErr   int64
+	TotalBytes int64
+	PerMethod  []MethodCount // sorted by total count desc
 }
 
 func (t *Tracker) Snapshot() Snapshot {
@@ -122,12 +163,32 @@ func (t *Tracker) Snapshot() Snapshot {
 			out = append(out, t.ring[idx])
 		}
 	}
+	perMethod := make([]MethodCount, 0, len(t.byMethod))
+	for _, mc := range t.byMethod {
+		perMethod = append(perMethod, *mc)
+	}
+	// Sort by total count (OK+Err) desc — most-used methods first.
+	for i := 1; i < len(perMethod); i++ {
+		for j := i; j > 0; j-- {
+			ai := perMethod[j].OK + perMethod[j].Err
+			aj := perMethod[j-1].OK + perMethod[j-1].Err
+			if ai > aj {
+				perMethod[j], perMethod[j-1] = perMethod[j-1], perMethod[j]
+				continue
+			}
+			break
+		}
+	}
 	return Snapshot{
 		Requests:     out,
 		InFlight:     t.inFlight,
 		LastSuccess:  t.lastOK,
 		LastError:    t.lastErr,
 		LastErrorMsg: t.lastErrText,
+		TotalOK:      t.totalOK,
+		TotalErr:     t.totalErr,
+		TotalBytes:   t.totalBytes,
+		PerMethod:    perMethod,
 	}
 }
 

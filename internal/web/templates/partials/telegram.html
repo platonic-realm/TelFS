@@ -10,7 +10,11 @@
 
 <div class="panel">
   <table class="kv">
-    <tr><td>In-flight RPCs</td><td><strong>{{.State.InFlight}}</strong></td></tr>
+    {{if .State.ChannelTitle}}
+    <tr><td>Channel</td><td><code>{{.State.ChannelTitle}}</code> (id {{.State.ChannelID}})</td></tr>
+    {{end}}
+    <tr><td>RPCs sent (since daemon start)</td><td><strong>{{.State.TotalOK}}</strong> ok / <strong>{{.State.TotalErr}}</strong> err · {{humanBytes .State.TotalBytes}}</td></tr>
+    <tr><td>In-flight</td><td><strong>{{.State.InFlight}}</strong></td></tr>
     {{if .State.LastSuccessUnix}}
     <tr><td>Last successful RPC</td><td>{{.State.LastSuccessAgeSeconds}}s ago</td></tr>
     {{else}}
@@ -24,6 +28,32 @@
     {{end}}
   </table>
 </div>
+
+{{if .State.PerMethod}}
+<h3>RPC totals by method</h3>
+<table class="rpc">
+  <thead>
+    <tr>
+      <th>Method</th>
+      <th>OK</th>
+      <th>Err</th>
+      <th>FLOOD_WAIT</th>
+      <th>Bytes</th>
+    </tr>
+  </thead>
+  <tbody>
+  {{range .State.PerMethod}}
+    <tr>
+      <td><code>{{.Method}}</code></td>
+      <td>{{.OK}}</td>
+      <td>{{if gt .Err 0}}<span class="error">{{.Err}}</span>{{else}}0{{end}}</td>
+      <td>{{if gt .FloodWait 0}}<span class="warn">{{.FloodWait}}</span>{{else}}0{{end}}</td>
+      <td>{{humanBytes .Bytes}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
 
 <h3>Recent RPCs <small>(auto-refresh 2s)</small></h3>
 <table class="rpc">

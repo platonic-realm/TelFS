@@ -626,7 +626,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// upload isn't progressing — was Telegram acking? are
 			// we stuck in FLOOD_WAIT? did we get FILE_PART_MISSING?
 			// JSON only for now; rendering is the web's problem.
-			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker()))
+			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker(), cfg))
 			if err := metricsSrv.Start(); err != nil {
 				return err
 			}
@@ -849,15 +849,21 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionM
 // tracker's current state as JSON. Format is intentionally simple so
 // the web UI can fetch + render with a few lines of JS, and curl
 // pipes nicely through jq.
-func telegramJSONHandler(tr *tg.Tracker) http.HandlerFunc {
+func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snap := tr.Snapshot()
-		// Hand-roll the JSON so we don't pull in encoding/json's
-		// generic reflection cost on every poll and so the shape is
-		// stable across gotd revs.
 		fmt.Fprintln(w, "{")
+		// Channel binding so the web can label aggregates with
+		// which channel the daemon is talking to. Today there's
+		// one channel per daemon; if multi-channel ever ships
+		// the JSON shape doesn't have to change.
+		fmt.Fprintf(w, "  \"channel_id\": %d,\n", cfg.Channel.ID)
+		fmt.Fprintf(w, "  \"channel_title\": %q,\n", cfg.Channel.Title)
 		fmt.Fprintf(w, "  \"in_flight\": %d,\n", snap.InFlight)
+		fmt.Fprintf(w, "  \"total_ok\": %d,\n", snap.TotalOK)
+		fmt.Fprintf(w, "  \"total_err\": %d,\n", snap.TotalErr)
+		fmt.Fprintf(w, "  \"total_bytes\": %d,\n", snap.TotalBytes)
 		if !snap.LastSuccess.IsZero() {
 			fmt.Fprintf(w, "  \"last_success_unix\": %d,\n", snap.LastSuccess.Unix())
 			fmt.Fprintf(w, "  \"last_success_age_seconds\": %d,\n", int64(time.Since(snap.LastSuccess).Seconds()))
@@ -867,6 +873,18 @@ func telegramJSONHandler(tr *tg.Tracker) http.HandlerFunc {
 			fmt.Fprintf(w, "  \"last_error_age_seconds\": %d,\n", int64(time.Since(snap.LastError).Seconds()))
 			fmt.Fprintf(w, "  \"last_error_message\": %q,\n", snap.LastErrorMsg)
 		}
+		// Per-method totals — what the user wants visible on the
+		// web. Sorted by call count desc inside the tracker.
+		fmt.Fprintln(w, "  \"per_method\": [")
+		for i, mc := range snap.PerMethod {
+			sep := ","
+			if i == len(snap.PerMethod)-1 {
+				sep = ""
+			}
+			fmt.Fprintf(w, "    {\"method\":%q,\"ok\":%d,\"err\":%d,\"flood_wait\":%d,\"bytes\":%d}%s\n",
+				mc.Method, mc.OK, mc.Err, mc.FloodWait, mc.Bytes, sep)
+		}
+		fmt.Fprintln(w, "  ],")
 		fmt.Fprintln(w, "  \"requests\": [")
 		for i, r := range snap.Requests {
 			sep := ","
