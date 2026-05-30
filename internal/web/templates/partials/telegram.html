@@ -29,30 +29,32 @@
 <table class="rpc">
   <thead>
     <tr>
+      <th>Started</th>
+      <th>Age</th>
       <th>Method</th>
       <th>Status</th>
       <th>Duration</th>
       <th>Bytes</th>
       <th>FLOOD_WAIT</th>
-      <th>Age</th>
     </tr>
   </thead>
   <tbody>
   {{range .State.Requests}}
     <tr>
+      <td><code>{{formatTime .StartedUnix}}</code></td>
+      <td>{{ageSeconds $.NowUnix .StartedUnix}}s</td>
       <td><code>{{.Method}}</code></td>
       <td>
         {{if .InFlight}}<span class="warn">in flight</span>
         {{else if .Err}}<span class="error" title="{{.Err}}">err</span>
         {{else}}<span class="ok">ok</span>{{end}}
       </td>
-      <td>{{if .InFlight}}—{{else}}{{.DurationMS}} ms{{end}}</td>
+      <td>{{if .InFlight}}—{{else}}{{formatDuration .DurationMS}}{{end}}</td>
       <td>{{.Bytes}}</td>
       <td>{{if gt .FloodWaitSeconds 0}}{{.FloodWaitSeconds}}s{{else}}—{{end}}</td>
-      <td>{{ageSeconds $.NowUnix .StartedUnix}}s ago</td>
     </tr>
   {{else}}
-    <tr><td colspan="6">(no RPCs recorded yet)</td></tr>
+    <tr><td colspan="7">(no RPCs recorded yet)</td></tr>
   {{end}}
   </tbody>
 </table>

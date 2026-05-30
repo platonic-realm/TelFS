@@ -1,9 +1,11 @@
 package web
 
 import (
+	"fmt"
 	"html/template"
 	"io/fs"
 	"net/http"
+	"time"
 )
 
 // registerRoutes binds the P1 surface. Subsequent phases add login,
@@ -148,6 +150,25 @@ func tmplFuncs() template.FuncMap {
 				return 0
 			}
 			return now - then
+		},
+		// formatTime renders a unix-seconds timestamp as
+		// HH:MM:SS in local time — easier to correlate with
+		// daemon logs and `date` than a raw epoch number.
+		"formatTime": func(unix int64) string {
+			if unix == 0 {
+				return ""
+			}
+			return time.Unix(unix, 0).Local().Format("15:04:05")
+		},
+		// formatDuration renders milliseconds as either "Nms"
+		// (for sub-second) or "N.NNs" (for one second or more)
+		// so the eye doesn't have to parse "4231 ms" as "~4 s"
+		// in a column otherwise full of two-digit numbers.
+		"formatDuration": func(ms int64) string {
+			if ms < 1000 {
+				return fmt.Sprintf("%dms", ms)
+			}
+			return fmt.Sprintf("%.2fs", float64(ms)/1000.0)
 		},
 	}
 }
