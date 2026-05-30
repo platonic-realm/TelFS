@@ -520,7 +520,7 @@ func (w *Writer) dispatchFlushLocked(ctx context.Context, idx int32) error {
 	w.uploading[idx] = doneCh
 	w.uploadWg.Add(1)
 	w.mu.Unlock()
-	release, err := w.pool.Reserve(ctx, w.ino)
+	res, err := w.pool.Reserve(ctx, w.ino)
 	if err != nil {
 		// Couldn't get a slot — undo the bookkeeping and put dc back
 		// where dispatchFlushLocked found it so the next Flush can
@@ -535,7 +535,7 @@ func (w *Writer) dispatchFlushLocked(ctx context.Context, idx int32) error {
 		w.dirtyBytes += int64(len(dc.data))
 		return err
 	}
-	go w.uploadOne(w.pool.UploadCtx(), idx, dc, doneCh, release)
+	go w.uploadOne(w.pool.UploadCtx(), idx, dc, doneCh, res)
 	w.mu.Lock()
 	return nil
 }
@@ -559,16 +559,18 @@ func (w *Writer) removeFromOrderLocked(idx int32) {
 // arrived (in which case the new dirty entry supersedes ours), or the
 // writer has been Detached (no map left to restore into — the failed
 // chunk is lost, the error logs to stderr).
-func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneCh chan struct{}, release func()) {
+func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneCh chan struct{}, res *Reservation) {
 	// Defers unwind LIFO: panic guard runs LAST (outermost — must catch
 	// even the inner defers' panics). Then restore-on-failure runs
 	// first on normal return (so waiters see the resurrected dirty
 	// entry), then delete uploading[idx], then close doneCh (which
-	// wakes loadForWrite), then release the pool slot (decrements
-	// pool wg + per-ino Pending so reader-side barriers unblock), then
-	// per-writer wg.Done.
+	// wakes loadForWrite), then Release the pool reservation
+	// (decrements pool wg + per-ino Pending so reader-side barriers
+	// unblock), then per-writer wg.Done. Pack route may call
+	// res.ReleaseSem() early to free the upload concurrency slot
+	// while keeping Pending+wg held until the packer's PutChunk lands.
 	defer w.uploadWg.Done()
-	defer release()
+	defer res.Release()
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "[writer] uploadOne PANIC ino=%d idx=%d: %v\n", w.ino, idx, r)
@@ -657,12 +659,21 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	// qualify for packing. Larger chunks still flow through the
 	// dedup + direct-upload path unchanged.
 	if w.packer != nil && int32(len(dc.data)) < w.packer.Threshold() {
+		// Release the upload SEM slot before waiting on the packer's
+		// result chan — the packer runs its own serialized flusher,
+		// so holding a pool slot through the pack wait would cap
+		// per-batch aggregation at DefaultUploadConcurrency (4) for
+		// no reason (advisor-noted limitation in v1, now fixed).
+		// Pending + wg stay held until res.Release() at the bottom
+		// of this function, so reader-side R-A-W barrier remains
+		// honored.
 		resultCh := w.packer.Submit(w.ino, idx, int32(len(dc.data)), wire)
+		res.ReleaseSem()
 		select {
-		case res := <-resultCh:
-			if res.err != nil {
+		case packRes := <-resultCh:
+			if packRes.err != nil {
 				restore = true
-				w.recordError(fmt.Errorf("pack chunk %d: %w", idx, res.err))
+				w.recordError(fmt.Errorf("pack chunk %d: %w", idx, packRes.err))
 				return
 			}
 			// Packer already wrote the chunk_map row with pack_offset

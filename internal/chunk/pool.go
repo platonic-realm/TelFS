@@ -52,16 +52,55 @@ func (p *UploadPool) UploadCtx() context.Context {
 	return p.uploadCtx
 }
 
+// Reservation tracks a pool entry's three resources separately so a
+// pack-route uploader can release just the SEM slot early (freeing a
+// new dispatch to start) while keeping the Pending counter + wg held
+// until the actual chunk_map row has been written by the packer's
+// flush. Without this split, the pool's sem caps the number of small
+// files the packer can aggregate per batch at DefaultUploadConcurrency
+// — defeating most of the point of having a packer.
+type Reservation struct {
+	pool       *UploadPool
+	ino        int64
+	semHeld    bool
+	pendingHeld bool
+}
+
+// ReleaseSem returns the upload concurrency slot to the pool while
+// keeping Pending + wg held. Used by the pack route in uploadOne
+// after Submit returns: the wire is now the packer's responsibility,
+// but readers + Drain must still see the upload as pending until the
+// packer's PutChunk lands.
+func (r *Reservation) ReleaseSem() {
+	if !r.semHeld {
+		return
+	}
+	r.semHeld = false
+	<-r.pool.sem
+}
+
+// Release returns every resource. Idempotent — safe to defer in
+// uploadOne whether or not ReleaseSem already fired.
+func (r *Reservation) Release() {
+	r.ReleaseSem()
+	if !r.pendingHeld {
+		return
+	}
+	r.pendingHeld = false
+	r.pool.Pending.End(r.ino)
+	r.pool.wg.Done()
+}
+
 // Reserve registers a pending upload for ino and acquires a global
 // concurrency slot, BLOCKING if the pool is saturated. Returns a
-// release fn the upload goroutine MUST call exactly once on
+// *Reservation the upload goroutine MUST Release exactly once on
 // completion (success or failure).
 //
 // Cancellation: the wait can be unblocked by either the caller's ctx
 // or the pool's own ctx (shutdown). Returns the canceling ctx's err
-// in either case; in that case release returns the resources
-// already-acquired so Begin/End stay balanced.
-func (p *UploadPool) Reserve(ctx context.Context, ino int64) (release func(), err error) {
+// in either case; in that case any resources already-acquired are
+// returned so Begin/End stay balanced.
+func (p *UploadPool) Reserve(ctx context.Context, ino int64) (*Reservation, error) {
 	p.wg.Add(1)
 	p.Pending.Begin(ino)
 	select {
@@ -75,15 +114,11 @@ func (p *UploadPool) Reserve(ctx context.Context, ino int64) (release func(), er
 		p.wg.Done()
 		return nil, p.uploadCtx.Err()
 	}
-	released := false
-	return func() {
-		if released {
-			return
-		}
-		released = true
-		<-p.sem
-		p.Pending.End(ino)
-		p.wg.Done()
+	return &Reservation{
+		pool:        p,
+		ino:         ino,
+		semHeld:     true,
+		pendingHeld: true,
 	}, nil
 }
 

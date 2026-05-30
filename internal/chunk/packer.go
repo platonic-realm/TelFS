@@ -230,10 +230,19 @@ func (p *Packer) flush() {
 	// survive Close (final drain) to avoid the torn-snapshot
 	// scenario where inode.size persisted but chunk_map didn't.
 	// The 30s shutdown watchdog in cmdMount is the backstop.
-	msgID, err := p.uploader.UploadDocument(context.Background(), &buf, name, "")
+	//
+	// Snapshot the assembled body via bytes.NewReader so the size
+	// log line below stays meaningful AFTER UploadDocument's
+	// internal io.ReadAll consumes the reader. Using &buf directly
+	// would still work (UploadDocument buffers internally for
+	// retries), but the post-call log would show "0 bytes" because
+	// the bytes.Buffer was drained.
+	blobBytes := buf.Bytes()
+	blobSize := len(blobBytes)
+	msgID, err := p.uploader.UploadDocument(context.Background(), bytes.NewReader(blobBytes), name, "")
 	if err != nil {
 		metrics.UploadErrors.Inc()
-		fmt.Fprintf(os.Stderr, "[packer] upload (%d chunks, %d bytes): %v\n", len(batch), buf.Len(), err)
+		fmt.Fprintf(os.Stderr, "[packer] upload (%d chunks, %d bytes): %v\n", len(batch), blobSize, err)
 		for _, r := range batch {
 			r.result <- packResult{err: fmt.Errorf("packer upload: %w", err)}
 			close(r.result)
@@ -241,7 +250,7 @@ func (p *Packer) flush() {
 		return
 	}
 	metrics.ChunksUploaded.Add(int64(len(batch)))
-	metrics.BytesUploaded.Add(int64(buf.Len()))
+	metrics.BytesUploaded.Add(int64(blobSize))
 	// Write chunk_map rows in a single transaction so a partial
 	// failure doesn't leave half the batch's writers waiting for a
 	// row that never lands. PutChunk uses Background ctx so a

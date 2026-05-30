@@ -1189,3 +1189,74 @@ func TestDedupOverwritePreservesUnpackedFields(t *testing.T) {
 		t.Fatalf("read-back after overwrite: n=%d err=%v match=%v", n, err, bytes.Equal(dest, X))
 	}
 }
+
+// TestPackRouteReleasesPoolSemEarly verifies that pack-routed
+// uploadOne calls ReleaseSem() BEFORE waiting on the packer's result
+// chan, so a single packer batch can aggregate more than
+// DefaultUploadConcurrency wires. Without the early release, the
+// pool sem caps the batch at the number of concurrent pool slots.
+func TestPackRouteReleasesPoolSemEarly(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	up := newSlowUploader()
+	cache := newTestCache(t, slowFetcher{up: up})
+	// Pool with only 1 slot — without the early release, only one
+	// pack-route writer can dispatch at a time, capping the batch.
+	pool := NewUploadPool(1)
+	// Packer with a 100ms window so the test runs fast.
+	packer := NewPacker(m, up, 1024, 1<<20, 100*time.Millisecond)
+	defer packer.Close()
+
+	const N = 8 // way over the pool's capacity
+	inos := make([]int64, N)
+	for i := range inos {
+		ino, _ := m.CreateChild(ctx, meta.RootIno, fmt.Sprintf("p%d", i), meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+		inos[i] = ino
+	}
+	var wg sync.WaitGroup
+	for i, ino := range inos {
+		wg.Add(1)
+		go func(i int, ino int64) {
+			defer wg.Done()
+			w, err := NewWriter(ctx, m, cache, up, nil, nil, pool, packer, ino, 4096, 0)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if _, err := w.WriteAt(ctx, []byte(fmt.Sprintf("file %d", i)), 0); err != nil {
+				t.Error(err)
+				return
+			}
+			// Just Flush (async) — no Sync — the result chan fires
+			// when the packer flushes. Without ReleaseSem, only 1
+			// writer at a time dispatches, so 8 of them would take
+			// >= 8 windows (800ms+) to all reach Submit.
+			if err := w.Flush(ctx); err != nil {
+				t.Error(err)
+				return
+			}
+		}(i, ino)
+	}
+	wg.Wait()
+	// Release the slow uploader so the packer's flush completes.
+	up.release()
+	// Drain so chunk_map rows land before assertions.
+	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if !pool.Drain(drainCtx) {
+		t.Fatal("pool drain timed out")
+	}
+	// Assert all chunks landed in ONE blob (or close to it). Without
+	// the early release, batches would each contain ~1 chunk.
+	seen := map[int64]int{}
+	for _, ino := range inos {
+		chunks, _ := m.ListChunks(ctx, ino)
+		if len(chunks) != 1 || !chunks[0].IsPacked() {
+			t.Fatalf("ino %d not packed: %+v", ino, chunks)
+		}
+		seen[chunks[0].TGMessageID]++
+	}
+	if len(seen) > 2 {
+		t.Fatalf("packer made too many batches (%d) — early sem release didn't kick in: %v", len(seen), seen)
+	}
+}
