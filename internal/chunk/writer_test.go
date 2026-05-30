@@ -105,7 +105,14 @@ func setupWriter(t *testing.T, chunkSize int64) (*Writer, *meta.Store, *fakeUplo
 	t.Helper()
 	m := newTestMeta(t)
 	ctx := context.Background()
-	ino, err := m.CreateChild(ctx, meta.RootIno, "f", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	// Tests use artificially small chunk sizes (10, 16, 64 bytes) to
+	// exercise multi-chunk paths without 4 MiB allocations. Stamp the
+	// per-inode chunk_size at create so NewWriter picks it up; without
+	// this, multi-tier promotion would bump w.chunkSz to the small
+	// tier (4 MiB) and collapse the test payload into one chunk.
+	ino, err := m.CreateChild(ctx, meta.RootIno, "f", meta.Inode{
+		Kind: meta.KindFile, Mode: 0o100644, ChunkSize: chunkSize,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1471,5 +1478,94 @@ func TestPackerCapsFlushBatch(t *testing.T) {
 				msgID, len(blob.data), 100, 100+wireSize)
 		}
 		_ = count
+	}
+}
+
+// TestTierPromotion exercises the multi-tier chunk-size picker:
+// a fresh writer with the FS-default 4 MiB chunkSz, writing past
+// the mid threshold (64 MiB), must promote to 16 MiB chunks
+// BEFORE first dispatch — and the inode row + dispatched chunks
+// must reflect the new size.
+func TestTierPromotion(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	// Create inode at FS-default (4 MiB) — the tier-small floor.
+	ino, _ := m.CreateChild(ctx, meta.RootIno, "big", meta.Inode{
+		Kind: meta.KindFile, Mode: 0o100644, ChunkSize: TierSmallChunkSize,
+	})
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, nil, ino, TierSmallChunkSize, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write 80 MiB — above TierMidThreshold (64 MiB) → mid tier.
+	payload := bytes.Repeat([]byte{'A'}, 80<<20)
+	if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := m.GetInode(ctx, ino)
+	if in.ChunkSize != TierMidChunkSize {
+		t.Fatalf("inode chunk_size = %d, want mid tier %d", in.ChunkSize, TierMidChunkSize)
+	}
+	chunks, _ := m.ListChunks(ctx, ino)
+	wantChunks := int((80 << 20) / TierMidChunkSize)
+	if (80<<20)%TierMidChunkSize != 0 {
+		wantChunks++
+	}
+	if len(chunks) != wantChunks {
+		t.Fatalf("chunk count = %d, want %d (80 MiB at mid tier)", len(chunks), wantChunks)
+	}
+	// Verify reader round-trips through the new tier.
+	r := NewReader(m, cache, nil, TierSmallChunkSize) // FS default fallback
+	got := make([]byte, len(payload))
+	n, err := r.ReadAt(ctx, ino, got, 0)
+	if err != nil || n != len(payload) || !bytes.Equal(got, payload) {
+		t.Fatalf("read-back: n=%d err=%v equal=%v", n, err, bytes.Equal(got, payload))
+	}
+}
+
+// TestTierNoDowngradeAfterDispatch: once chunks have been dispatched
+// at one tier, subsequent writes (even very large) must not promote.
+// The reader's offset math depends on a stable per-inode chunk_size.
+func TestTierNoDowngradeAfterDispatch(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino, _ := m.CreateChild(ctx, meta.RootIno, "grow", meta.Inode{
+		Kind: meta.KindFile, Mode: 0o100644, ChunkSize: TierSmallChunkSize,
+	})
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, nil, ino, TierSmallChunkSize, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First Sync at 5 MiB — well under mid threshold, no promotion.
+	small := bytes.Repeat([]byte{'a'}, 5<<20)
+	if _, err := w.WriteAt(ctx, small, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := m.GetInode(ctx, ino)
+	if in.ChunkSize != TierSmallChunkSize {
+		t.Fatalf("after small sync, chunk_size = %d, want small %d", in.ChunkSize, TierSmallChunkSize)
+	}
+	// Now write a LOT more — past mid threshold. But chunks are
+	// already dispatched, so we must NOT promote.
+	more := bytes.Repeat([]byte{'b'}, 100<<20)
+	if _, err := w.WriteAt(ctx, more, int64(len(small))); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	in, _ = m.GetInode(ctx, ino)
+	if in.ChunkSize != TierSmallChunkSize {
+		t.Fatalf("after large append, chunk_size silently changed to %d (must stay locked at small after dispatch)", in.ChunkSize)
 	}
 }

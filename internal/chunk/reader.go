@@ -90,8 +90,25 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 			return 0, err
 		}
 	}
-	startIdx := int32(off / r.chunkSize)
-	endIdx := int32((off + int64(len(dest)) - 1) / r.chunkSize)
+	// Per-inode chunk size: each file picks its tier at first
+	// dispatch; the value is stored on the inode row. Look it up
+	// once per ReadAt and use that for idx math (instead of the
+	// reader's FS-default chunkSize). One extra GetInode per
+	// ReadAt — comparable to the per-chunk GetChunk cost already
+	// in the loop below.
+	in, err := r.meta.GetInode(ctx, ino)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read get inode %d: %w", ino, err)
+	}
+	chunkSize := in.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = r.chunkSize
+	}
+	startIdx := int32(off / chunkSize)
+	endIdx := int32((off + int64(len(dest)) - 1) / chunkSize)
 
 	written := 0
 	cur := off
@@ -115,7 +132,7 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 		if err != nil {
 			return written, err
 		}
-		chunkStart := int64(idx) * r.chunkSize
+		chunkStart := int64(idx) * chunkSize
 		relStart := cur - chunkStart
 		// relEnd is bounded by both the requested range AND the actual
 		// chunk size (the last chunk is short).
@@ -132,7 +149,7 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 		// If we got less than the full requested range from this chunk
 		// (because the chunk was short — last chunk of file), we're at
 		// EOF regardless of dest's remaining space.
-		if int64(len(data)) < r.chunkSize && relEnd == int64(len(data)) {
+		if int64(len(data)) < chunkSize && relEnd == int64(len(data)) {
 			break
 		}
 	}

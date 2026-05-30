@@ -34,11 +34,11 @@ func lookup(ctx context.Context, e execQuerier, parent int64, name string) (Inod
 	var kind string
 	var target sql.NullString
 	err := e.QueryRowContext(ctx,
-		`SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.nlink, i.mtime, i.ctime, i.symlink_target
+		`SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.nlink, i.mtime, i.ctime, i.symlink_target, i.chunk_size
 		   FROM dirents d JOIN inodes i ON i.ino = d.child_ino
 		  WHERE d.parent_ino = ? AND d.name = ?`,
 		parent, name,
-	).Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target)
+	).Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target, &in.ChunkSize)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Inode{}, ErrNotFound
 	}

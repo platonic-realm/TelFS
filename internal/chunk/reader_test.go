@@ -29,8 +29,16 @@ func (f *fakeFetcher) Fetch(_ context.Context, _ Key, msgID int64) ([]byte, erro
 func seedFile(t *testing.T, m *meta.Store, name string, chunks [][]byte, baseMsgID int64) (int64, *fakeFetcher) {
 	t.Helper()
 	ctx := context.Background()
+	// Tests use an artificially small chunk size (10 here) — without
+	// the per-inode ChunkSize stamp, Reader.ReadAt would pull the
+	// FS-default (4 MiB) from the inode and our offset/idx math
+	// would mis-route into the wrong chunk.
+	var chunkSize int64 = 10
+	if len(chunks) > 0 && int64(len(chunks[0])) > chunkSize {
+		chunkSize = int64(len(chunks[0]))
+	}
 	ino, err := m.CreateChild(ctx, meta.RootIno, name, meta.Inode{
-		Kind: meta.KindFile, Mode: 0o100644,
+		Kind: meta.KindFile, Mode: 0o100644, ChunkSize: chunkSize,
 	})
 	if err != nil {
 		t.Fatalf("CreateChild: %v", err)

@@ -88,6 +88,12 @@ type Writer struct {
 	dirtyOrder []int32 // FIFO insertion order — eager-dispatch victims pop from front
 	size       int64
 	closed     bool
+	// hasDispatched is true once at least one chunk has been
+	// dispatched (or the inode already had chunks at NewWriter
+	// time). Once set, chunkSz is locked — promoting would
+	// invalidate the (ino, idx) → file-offset arithmetic for
+	// rows that are already on the channel.
+	hasDispatched bool
 
 	// Per-handle upload bookkeeping. uploading tracks chunks whose data
 	// is no longer in `dirty` but whose upload hasn't finished — both
@@ -140,20 +146,38 @@ func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher 
 	if err != nil {
 		return nil, fmt.Errorf("writer: get inode %d: %w", ino, err)
 	}
+	// Per-inode chunk size takes precedence: it's the per-file tier
+	// (multi-tier sizing) and the authoritative value the reader
+	// uses too. The FS-default `chunkSize` parameter is only the
+	// fallback when an inode predates the column (shouldn't happen
+	// after the schema migration, but cheap to keep).
+	if in.ChunkSize > 0 {
+		chunkSize = in.ChunkSize
+	}
+	// hasChunksAlready: if the inode already has at least one
+	// chunk_map row, we cannot promote chunk_size — the (ino, idx) →
+	// offset arithmetic for existing rows depends on it. Marking
+	// dispatched=true achieves the same lock without a separate flag.
+	chunks, err := m.ListChunks(ctx, ino)
+	if err != nil {
+		return nil, fmt.Errorf("writer: list chunks %d: %w", ino, err)
+	}
+	hasDispatched := len(chunks) > 0
 	return &Writer{
-		meta:      m,
-		cache:     c,
-		uploader:  u,
-		cipher:    cipher,
-		codec:     codec,
-		pool:      pool,
-		packer:    packer,
-		chunkSz:   chunkSize,
-		dirtyCap:  dirtyCap,
-		ino:       ino,
-		dirty:     make(map[int32]*dirtyChunk),
-		size:      in.Size,
-		uploading: make(map[int32]chan struct{}),
+		meta:          m,
+		cache:         c,
+		uploader:      u,
+		cipher:        cipher,
+		codec:         codec,
+		pool:          pool,
+		packer:        packer,
+		chunkSz:       chunkSize,
+		dirtyCap:      dirtyCap,
+		ino:           ino,
+		dirty:         make(map[int32]*dirtyChunk),
+		size:          in.Size,
+		uploading:     make(map[int32]chan struct{}),
+		hasDispatched: hasDispatched,
 	}, nil
 }
 
@@ -221,6 +245,14 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 		if cur > w.size {
 			w.size = cur
 		}
+	}
+
+	// Multi-tier: promote chunk_size to a bigger tier if the file
+	// has grown past a tier threshold and we haven't dispatched
+	// yet. Runs BEFORE eager-dispatch so the first dispatch sees
+	// the final layout.
+	if err := w.maybePromoteLocked(ctx); err != nil {
+		return written, err
 	}
 
 	// Eager DISPATCH if we're over the cap. Drains oldest dirty chunks
@@ -310,6 +342,78 @@ func (w *Writer) growChunk(dc *dirtyChunk, need int64) {
 	delta := need - int64(len(dc.data))
 	dc.data = append(dc.data, make([]byte, delta)...)
 	w.dirtyBytes += delta
+}
+
+// maybePromoteLocked promotes w.chunkSz to a higher tier if (a) no
+// chunks have been dispatched yet AND (b) the dirty buffer has
+// crossed a tier threshold. Re-chunks dirty into the new layout in
+// place. Persists the new size to meta so the reader can find
+// chunks correctly. Caller holds w.mu.
+//
+// Why "before dispatch only": once any chunk_map row exists at the
+// old chunkSz, changing the per-inode chunk_size would silently
+// mis-map every existing row (offset = idx * chunk_size). Locking
+// at first dispatch is the simplest safe rule; growing past tier
+// thresholds AFTER first dispatch just leaves you stuck at the
+// originally-chosen tier (acceptable for fresh cp; mid-edit growth
+// is an unusual workload).
+func (w *Writer) maybePromoteLocked(ctx context.Context) error {
+	if w.hasDispatched {
+		return nil
+	}
+	// Don't auto-promote artificially small chunk sizes — those are
+	// either tests exercising multi-chunk paths with toy sizes, or
+	// user overrides from `telfs init --chunk-size N` that should
+	// be honored. Production filesystems start at TierSmallChunkSize
+	// (4 MiB) by default.
+	if w.chunkSz < TierSmallChunkSize {
+		return nil
+	}
+	target := PickTierChunkSize(w.size)
+	if target <= w.chunkSz {
+		return nil
+	}
+	// Materialize one contiguous buffer of size w.size, then re-split.
+	// At first-dispatch time w.dirtyBytes is bounded by the dirtyCap
+	// (256 MiB by default), so the temporary allocation is bounded
+	// too — same order of magnitude as the existing dirty footprint.
+	buf := make([]byte, w.size)
+	for idx, dc := range w.dirty {
+		off := int64(idx) * w.chunkSz
+		if off >= int64(len(buf)) {
+			continue
+		}
+		end := off + int64(len(dc.data))
+		if end > int64(len(buf)) {
+			end = int64(len(buf))
+		}
+		copy(buf[off:end], dc.data[:end-off])
+	}
+	// Replace dirty layout with target-sized chunks.
+	w.dirty = make(map[int32]*dirtyChunk)
+	w.dirtyOrder = w.dirtyOrder[:0]
+	w.dirtyBytes = 0
+	w.chunkSz = target
+	for off := int64(0); off < w.size; off += target {
+		end := off + target
+		if end > w.size {
+			end = w.size
+		}
+		idx := int32(off / target)
+		data := make([]byte, end-off)
+		copy(data, buf[off:end])
+		w.dirty[idx] = &dirtyChunk{data: data}
+		w.dirtyOrder = append(w.dirtyOrder, idx)
+		w.dirtyBytes += int64(len(data))
+	}
+	// Persist the promoted size so subsequent Open + Reader see the
+	// right value. SetInodeChunkSize refuses if chunk_map already
+	// has rows for this ino, which our hasDispatched guard above
+	// already ensures isn't the case.
+	if err := w.meta.SetInodeChunkSize(ctx, w.ino, target); err != nil {
+		return fmt.Errorf("promote chunk_size to %d: %w", target, err)
+	}
+	return nil
 }
 
 // materializeZeros zero-fills the region [from, to). Caller holds w.mu.
@@ -441,6 +545,14 @@ func (w *Writer) Flush(ctx context.Context) error {
 	}
 	prevErr := w.uploadErr
 	w.uploadErr = nil // retry-with-clean-slate
+	// Multi-tier: if we still haven't dispatched, this is our last
+	// chance to promote chunk_size from the observed total file
+	// size. For files that never crossed dirtyCap (most small/mid
+	// files) this is the ONLY promotion site.
+	if err := w.maybePromoteLocked(ctx); err != nil {
+		w.mu.Unlock()
+		return err
+	}
 	toFlush := make([]int32, len(w.dirtyOrder))
 	copy(toFlush, w.dirtyOrder)
 	for _, idx := range toFlush {
@@ -470,6 +582,10 @@ func (w *Writer) Sync(ctx context.Context) error {
 		return fmt.Errorf("writer: handle closed")
 	}
 	w.uploadErr = nil
+	if err := w.maybePromoteLocked(ctx); err != nil {
+		w.mu.Unlock()
+		return err
+	}
 	toFlush := make([]int32, len(w.dirtyOrder))
 	copy(toFlush, w.dirtyOrder)
 	for _, idx := range toFlush {
@@ -513,6 +629,10 @@ func (w *Writer) dispatchFlushLocked(ctx context.Context, idx int32) error {
 		w.removeFromOrderLocked(idx)
 		return nil
 	}
+	// Lock chunkSz: from this point forward the writer can't promote
+	// to a bigger tier because chunk_map will have a row at the
+	// current chunkSz, and changing it would mis-map this row.
+	w.hasDispatched = true
 	delete(w.dirty, idx)
 	w.removeFromOrderLocked(idx)
 	w.dirtyBytes -= int64(len(dc.data))

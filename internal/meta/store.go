@@ -82,7 +82,12 @@ CREATE TABLE IF NOT EXISTS inodes (
   nlink          INTEGER NOT NULL DEFAULT 1,
   mtime          INTEGER NOT NULL DEFAULT 0,
   ctime          INTEGER NOT NULL DEFAULT 0,
-  symlink_target TEXT
+  symlink_target TEXT,
+  -- chunk_size: per-inode chunk size in bytes, set at create from
+  -- FS default (meta_kv:chunk_size) and possibly promoted by the
+  -- writer at first dispatch when the workload warrants bigger
+  -- chunks (multi-tier). Always non-zero for files.
+  chunk_size     INTEGER NOT NULL DEFAULT 4194304
 );
 
 CREATE TABLE IF NOT EXISTS dirents (
@@ -202,9 +207,10 @@ func (s *Store) initSchema(ctx context.Context) error {
 	for _, alter := range []string{
 		`ALTER TABLE chunk_map ADD COLUMN pack_offset INTEGER`,
 		`ALTER TABLE chunk_map ADD COLUMN pack_size INTEGER`,
+		`ALTER TABLE inodes ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 4194304`,
 	} {
 		if _, err := s.db.ExecContext(ctx, alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-			return fmt.Errorf("migrate chunk_map: %w", err)
+			return fmt.Errorf("migrate schema: %w", err)
 		}
 	}
 	// Seed root inode if missing. Using explicit ino=1 ensures auto-increment

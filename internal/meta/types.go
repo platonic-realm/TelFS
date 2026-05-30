@@ -24,6 +24,12 @@ type Inode struct {
 	Nlink         uint32
 	Mtime, Ctime  int64
 	SymlinkTarget string // empty unless Kind == KindSymlink
+	// ChunkSize is the per-inode chunk size, in bytes. Set at
+	// inode creation to the FS default; the writer may promote it
+	// to a higher tier (16/32/64 MiB) at first dispatch when it
+	// sees that the in-flight write is large enough to warrant
+	// fewer, bigger chunks. Always non-zero.
+	ChunkSize int64
 }
 
 // Dirent is a row in the `dirents` table — a (parent, name) → child link.

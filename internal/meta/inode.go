@@ -35,10 +35,18 @@ func createInode(ctx context.Context, e execQuerier, in Inode) (int64, error) {
 	if in.SymlinkTarget != "" {
 		st = in.SymlinkTarget
 	}
+	// If caller didn't specify chunk_size, leave the column default
+	// to take effect (4 MiB).
+	var chunkSize any
+	if in.ChunkSize > 0 {
+		chunkSize = in.ChunkSize
+	} else {
+		chunkSize = nil
+	}
 	res, err := e.ExecContext(ctx,
-		`INSERT INTO inodes(kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target)
-		 VALUES (?,?,?,?,?,?,?,?,?)`,
-		string(in.Kind), in.Mode, in.UID, in.GID, in.Size, in.Nlink, in.Mtime, in.Ctime, st)
+		`INSERT INTO inodes(kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target, chunk_size)
+		 VALUES (?,?,?,?,?,?,?,?,?,COALESCE(?,4194304))`,
+		string(in.Kind), in.Mode, in.UID, in.GID, in.Size, in.Nlink, in.Mtime, in.Ctime, st, chunkSize)
 	if err != nil {
 		return 0, fmt.Errorf("insert inode: %w", err)
 	}
@@ -55,9 +63,9 @@ func getInode(ctx context.Context, e execQuerier, ino int64) (Inode, error) {
 	var kind string
 	var target sql.NullString
 	err := e.QueryRowContext(ctx,
-		`SELECT ino, kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target
+		`SELECT ino, kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target, chunk_size
 		   FROM inodes WHERE ino = ?`, ino).
-		Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target)
+		Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target, &in.ChunkSize)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Inode{}, ErrNotFound
 	}
@@ -67,6 +75,26 @@ func getInode(ctx context.Context, e execQuerier, ino int64) (Inode, error) {
 	in.Kind = Kind(kind)
 	in.SymlinkTarget = target.String
 	return in, nil
+}
+
+// SetInodeChunkSize updates the per-inode chunk size. Called by the
+// writer on first dispatch when it picks a tier larger than the
+// default. Refuses if the inode already has chunks (changing would
+// invalidate the (ino, idx) → offset arithmetic for existing rows).
+func (s *Store) SetInodeChunkSize(ctx context.Context, ino int64, size int64) error {
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		var n int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM chunk_map WHERE ino = ?`, ino).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return fmt.Errorf("set chunk_size: inode %d already has %d chunk(s)", ino, n)
+		}
+		_, err := tx.ExecContext(ctx,
+			`UPDATE inodes SET chunk_size = ? WHERE ino = ?`, size, ino)
+		return err
+	})
 }
 
 // SetAttrs updates the mutable attributes of an inode. Pass nil for fields
