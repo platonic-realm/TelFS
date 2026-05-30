@@ -1,0 +1,115 @@
+package tg
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
+)
+
+// fakeInvoker counts how many times it was called and can be
+// configured to fail with a FLOOD_WAIT first N times.
+type fakeInvoker struct {
+	calls int
+	wait  []time.Duration // wait[i] is the FLOOD_WAIT to return on call i; nil = no error
+	err   error           // final non-flood error to return after walking wait
+}
+
+func (f *fakeInvoker) Invoke(_ context.Context, _ bin.Encoder, _ bin.Decoder) error {
+	idx := f.calls
+	f.calls++
+	if idx < len(f.wait) {
+		d := f.wait[idx]
+		// gotd's tgerr.Error with Type "FLOOD_WAIT" + ms argument is
+		// what AsFloodWait parses. Use a constructor for a fake error.
+		return &tgerr.Error{
+			Type:     "FLOOD_WAIT",
+			Argument: int(d / time.Second),
+			Message:  "FLOOD_WAIT_X",
+		}
+	}
+	return f.err
+}
+
+// invokerAdapter wraps fakeInvoker so it satisfies tg.Invoker.
+type invokerAdapter struct{ f *fakeInvoker }
+
+func (a *invokerAdapter) Invoke(ctx context.Context, in bin.Encoder, out bin.Decoder) error {
+	return a.f.Invoke(ctx, in, out)
+}
+
+var _ tg.Invoker = (*invokerAdapter)(nil)
+
+// TestFloodWaiterShortWaitSleeps: a 1-second FLOOD_WAIT should be
+// honored — the middleware retries the next call after sleeping.
+func TestFloodWaiterShortWaitSleeps(t *testing.T) {
+	fi := &fakeInvoker{wait: []time.Duration{1 * time.Second}}
+	w := &FloodWaiter{max: MaxFloodWait}
+	start := time.Now()
+	if err := w.Handle(&invokerAdapter{f: fi})(context.Background(), nil, nil); err != nil {
+		t.Fatalf("expected retry to succeed, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Fatalf("did not sleep through the wait (elapsed %v)", elapsed)
+	}
+	if fi.calls != 2 {
+		t.Fatalf("expected 2 calls (1 fail, 1 succeed), got %d", fi.calls)
+	}
+}
+
+// TestFloodWaiterOverCap: a wait that exceeds the configured cap is
+// returned as an error (not silently honored), so the caller can
+// surface it as a real failure instead of hanging.
+func TestFloodWaiterOverCap(t *testing.T) {
+	fi := &fakeInvoker{wait: []time.Duration{10 * time.Second}}
+	w := &FloodWaiter{max: 5 * time.Second}
+	err := w.Handle(&invokerAdapter{f: fi})(context.Background(), nil, nil)
+	if err == nil {
+		t.Fatal("expected over-cap wait to error, got nil")
+	}
+	if fi.calls != 1 {
+		t.Fatalf("expected exactly 1 call before bailing, got %d", fi.calls)
+	}
+}
+
+// TestFloodWaiterContextCancel: ctx.Done firing during the sleep
+// unwinds with ctx.Err, not a retry-loop error.
+func TestFloodWaiterContextCancel(t *testing.T) {
+	fi := &fakeInvoker{wait: []time.Duration{60 * time.Second}} // long enough to outlast the test
+	w := &FloodWaiter{max: MaxFloodWait}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Handle(&invokerAdapter{f: fi})(ctx, nil, nil)
+	}()
+	// Give the middleware a moment to enter sleep.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("middleware did not unwind on ctx cancel within 2 s")
+	}
+}
+
+// TestFloodWaiterPassesThroughNonFlood: a regular error (not a
+// FLOOD_WAIT) returns unchanged; the middleware does NOT retry.
+func TestFloodWaiterPassesThroughNonFlood(t *testing.T) {
+	target := errors.New("not a flood wait")
+	fi := &fakeInvoker{err: target}
+	w := &FloodWaiter{max: MaxFloodWait}
+	err := w.Handle(&invokerAdapter{f: fi})(context.Background(), nil, nil)
+	if !errors.Is(err, target) {
+		t.Fatalf("expected wrapped target, got %v", err)
+	}
+	if fi.calls != 1 {
+		t.Fatalf("expected exactly 1 call for non-retryable error, got %d", fi.calls)
+	}
+}
