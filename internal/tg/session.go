@@ -20,29 +20,63 @@ import (
 	"telfs/internal/config"
 )
 
-// Session is a live MTProto context handed to a callback by
-// Client.RunSession. All Telegram operations within a session share the
-// same underlying connection — no per-call handshake — which is what the
-// FUSE daemon needs.
+// ErrNotConnected is returned by Session methods called while no
+// gotd client is bound (during a reconnect window, or before the
+// SessionManager has performed its first connect). Callers should
+// treat this as transient and retry — the next call after the
+// reconnect lands will succeed.
+var ErrNotConnected = errors.New("tg: session not connected")
+
+// Session is a stable handle to an MTProto context. Used by the
+// short-lived `RunSession` (one-shot CLI ops) AND by the long-lived
+// daemon's SessionManager, which atomically swaps the underlying
+// *tg.Client across reconnects so callers don't need to re-create
+// their references.
 //
-// Sessions are NOT safe to use after the RunSession callback returns; the
-// underlying telegram.Client is torn down at that point and any further
-// RPCs fail with "client already closed". Lifecycle owners (e.g. the
-// mount daemon) must ensure their consumers — in-flight FUSE Read
-// goroutines, in particular — have drained before returning from the
-// callback.
+// Concurrency: reads of the api pointer use apiMu (RWMutex). Reads
+// are common (every Session method); swaps happen on reconnect only.
 type Session struct {
-	api     *tg.Client
 	cfg     *config.Config
 	tracker *Tracker
+
+	apiMu sync.RWMutex
+	api   *tg.Client
 }
 
 // Tracker returns the request log this session writes to (shared
 // with the parent Client). Used by the web /telegram handler.
 func (s *Session) Tracker() *Tracker { return s.tracker }
 
-// API returns the live gotd *tg.Client.
-func (s *Session) API() *tg.Client { return s.api }
+// API returns the current live gotd *tg.Client, or nil if no client
+// is bound (reconnect window).
+func (s *Session) API() *tg.Client {
+	s.apiMu.RLock()
+	defer s.apiMu.RUnlock()
+	return s.api
+}
+
+// currentAPI is the internal helper for session methods: returns the
+// live *tg.Client OR an error if no client is bound. Use this instead
+// of touching s.api directly so reconnect swaps are race-free.
+func (s *Session) currentAPI() (*tg.Client, error) {
+	s.apiMu.RLock()
+	defer s.apiMu.RUnlock()
+	if s.api == nil {
+		return nil, ErrNotConnected
+	}
+	return s.api, nil
+}
+
+// swapAPI installs a new live gotd client (or nil to mark the session
+// as disconnected). Called by the SessionManager's run loop on each
+// reconnect. In-flight callers reading via currentAPI will get the
+// pre-swap value and may complete or fail naturally; calls that start
+// AFTER the swap pick up the new client.
+func (s *Session) swapAPI(api *tg.Client) {
+	s.apiMu.Lock()
+	s.api = api
+	s.apiMu.Unlock()
+}
 
 // Config returns the configuration the session was opened with.
 func (s *Session) Config() *config.Config { return s.cfg }
@@ -65,7 +99,11 @@ func (s *Session) channelPeer() (*tg.InputPeerChannel, *tg.InputChannel, error) 
 // ListChannels enumerates the user's channels from their dialogs. Includes
 // both channels they own and channels they're a member of.
 func (s *Session) ListChannels(ctx context.Context) ([]ChannelInfo, error) {
-	res, err := s.api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+	api, err := s.currentAPI()
+	if err != nil {
+		return nil, err
+	}
+	res, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
 		OffsetPeer: &tg.InputPeerEmpty{},
 		Limit:      200,
 	})
@@ -185,7 +223,11 @@ func (s *Session) PostMessage(ctx context.Context, text string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	upd, err := s.api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+	api, err := s.currentAPI()
+	if err != nil {
+		return 0, err
+	}
+	upd, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 		Peer:     peer,
 		Message:  text,
 		RandomID: rid,
@@ -259,7 +301,11 @@ func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, cap
 }
 
 func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, r io.Reader, filename, caption string) (int, error) {
-	u := uploader.NewUploader(s.api)
+	api, err := s.currentAPI()
+	if err != nil {
+		return 0, err
+	}
+	u := uploader.NewUploader(api)
 	uf, err := u.FromReader(ctx, filename, r)
 	if err != nil {
 		return 0, fmt.Errorf("upload bytes: %w", err)
@@ -275,7 +321,7 @@ func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, 
 	if err != nil {
 		return 0, err
 	}
-	upd, err := s.api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+	upd, err := api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
 		Peer:     peer,
 		Media:    media,
 		RandomID: rid,
@@ -387,6 +433,10 @@ func (s *Session) DownloadDocumentRange(ctx context.Context, msgID int, w io.Wri
 }
 
 func (s *Session) streamDocumentRange(ctx context.Context, doc *tg.Document, w io.Writer, offset, length int64) (int64, error) {
+	api, err := s.currentAPI()
+	if err != nil {
+		return 0, err
+	}
 	loc := &tg.InputDocumentFileLocation{
 		ID:            doc.ID,
 		AccessHash:    doc.AccessHash,
@@ -414,7 +464,7 @@ func (s *Session) streamDocumentRange(ctx context.Context, doc *tg.Document, w i
 			Offset:   cur,
 			Limit:    int(limit),
 		}
-		res, err := s.api.UploadGetFile(ctx, req)
+		res, err := api.UploadGetFile(ctx, req)
 		if err != nil {
 			return written, err
 		}
@@ -480,9 +530,13 @@ func (s *Session) streamDocument(ctx context.Context, doc *tg.Document, w io.Wri
 	// so we use a growable bufferWriterAt that allocates on first
 	// non-contiguous write. After download completes, we copy the
 	// resulting bytes into the caller's io.Writer.
+	api, err := s.currentAPI()
+	if err != nil {
+		return 0, err
+	}
 	buf := &bufferWriterAt{}
 	d := downloader.NewDownloader()
-	if _, err := d.Download(s.api, loc).WithThreads(downloadThreads).Parallel(ctx, buf); err != nil {
+	if _, err := d.Download(api, loc).WithThreads(downloadThreads).Parallel(ctx, buf); err != nil {
 		return 0, err
 	}
 	n, err := w.Write(buf.bytes())
@@ -533,7 +587,11 @@ func (s *Session) getMessage(ctx context.Context, msgID int) (*tg.Message, error
 	if err != nil {
 		return nil, err
 	}
-	res, err := s.api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+	api, err := s.currentAPI()
+	if err != nil {
+		return nil, err
+	}
+	res, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 		Channel: inCh,
 		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}},
 	})

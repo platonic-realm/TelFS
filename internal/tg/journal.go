@@ -73,11 +73,15 @@ func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq in
 	if err != nil {
 		return nil, err
 	}
+	api, err := s.currentAPI()
+	if err != nil {
+		return nil, err
+	}
 	out := make([]JournalMessage, 0, 64)
 	offsetID := 0
 	const pageLimit = 100 // up to 10000 messages of scrollback
 	for page := 0; page < pageLimit && len(out) < max; page++ {
-		res, err := s.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		res, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:     peer,
 			OffsetID: offsetID,
 			Limit:    100,

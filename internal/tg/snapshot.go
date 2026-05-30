@@ -60,9 +60,13 @@ func (s *Session) FindLatestSnapshot(ctx context.Context, fsUUID string, pageLim
 	if err != nil {
 		return nil, err
 	}
+	api, err := s.currentAPI()
+	if err != nil {
+		return nil, err
+	}
 	offsetID := 0
 	for page := 0; page < pageLimit; page++ {
-		res, err := s.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		res, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:     peer,
 			OffsetID: offsetID,
 			Limit:    100,
@@ -113,11 +117,15 @@ func (s *Session) ListSnapshots(ctx context.Context, fsUUID string, max int) ([]
 	if err != nil {
 		return nil, err
 	}
+	api, err := s.currentAPI()
+	if err != nil {
+		return nil, err
+	}
 	out := make([]LatestSnapshot, 0, 16)
 	offsetID := 0
 	const pageLimit = 50 // 5000 messages of history before we give up
 	for page := 0; page < pageLimit && len(out) < max; page++ {
-		res, err := s.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		res, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:     peer,
 			OffsetID: offsetID,
 			Limit:    100,
@@ -165,7 +173,11 @@ func (s *Session) DeleteChannelMessages(ctx context.Context, ids ...int) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
+	api, err := s.currentAPI()
+	if err != nil {
+		return err
+	}
+	if _, err := api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
 		Channel: inCh,
 		ID:      ids,
 	}); err != nil {

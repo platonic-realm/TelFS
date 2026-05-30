@@ -517,7 +517,51 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}
 	}
 
-	err = client.RunSession(context.Background(), func(sessCtx context.Context, sess *tg.Session) error {
+	// Long-lived session manager: keeps a stable *tg.Session whose
+	// underlying gotd client can be torn down + re-established
+	// without disturbing the mount above. The stall watchdog (below)
+	// signals Reconnect when no upload progress for 90 s; in the
+	// wedged-TCP scenario this auto-recovers within seconds instead
+	// of waiting for the kernel's TCP timeout (~15 min).
+	mgr := client.NewSessionManager()
+	sess := mgr.Session()
+	mgrCtx, stopMgr := context.WithCancel(context.Background())
+	firstConnect := make(chan error, 1)
+	mgrDone := make(chan error, 1)
+	go func() {
+		err := mgr.Run(mgrCtx, func() error {
+			select {
+			case firstConnect <- nil:
+			default:
+			}
+			return nil
+		})
+		// Surface a pre-first-connect exit so the wait below
+		// unblocks; non-blocking so a successful first-connect
+		// path doesn't double-send.
+		select {
+		case firstConnect <- err:
+		default:
+		}
+		mgrDone <- err
+	}()
+	select {
+	case err := <-firstConnect:
+		if err != nil {
+			stopMgr()
+			<-mgrDone
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+	case <-signalCtx.Done():
+		stopMgr()
+		<-mgrDone
+		return nil
+	}
+
+	err = func() error {
 		fetcher := &chunk.TGFetcher{Session: sess}
 		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher, cipher, codec)
 		if err != nil {
@@ -600,10 +644,10 @@ func cmdMount(signalCtx context.Context, args []string) error {
 
 		// Snapshot cadence: takes one snapshot immediately (so a
 		// freshly-recovered DB is re-baselined) then every interval.
-		// We pass sessCtx — the goroutine exits when the gotd session
+		// We pass signalCtx — the goroutine exits when the gotd session
 		// tears down. The user-stop signal stops it via snapCtx below.
 		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher}
-		snapCtx, stopSnap := context.WithCancel(sessCtx)
+		snapCtx, stopSnap := context.WithCancel(signalCtx)
 		snapDone := make(chan struct{})
 		go func() {
 			_ = snapMgr.Run(snapCtx)
@@ -617,7 +661,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// cadences — narrowing the crash data-loss window from
 		// 5 min (snapshot interval) to ~5 s (poster interval).
 		journalPoster := &snapshot.Poster{Meta: metaStore, Session: sess}
-		journalCtx, stopJournal := context.WithCancel(sessCtx)
+		journalCtx, stopJournal := context.WithCancel(signalCtx)
 		journalDone := make(chan struct{})
 		go func() {
 			_ = journalPoster.Run(journalCtx)
@@ -627,9 +671,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// Trash GC: reads ttl on every tick so changes via
 		// `telfs trash enable --ttl <D>` take effect without remount.
 		if trashIno != 0 {
-			go trash.Run(sessCtx, metaStore, trashIno,
+			go trash.Run(signalCtx, metaStore, trashIno,
 				func() time.Duration {
-					d, err := metaStore.TrashTTL(sessCtx)
+					d, err := metaStore.TrashTTL(signalCtx)
 					if err != nil {
 						return time.Duration(meta.DefaultTrashTTLSecs) * time.Second
 					}
@@ -647,16 +691,14 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// delay the "Mounted at" line. Errors are logged but not
 		// fatal — they don't break the mount, just leave staged
 		// wires for the next attempt.
-		go recoverPending(sessCtx, pendingDir, packer)
+		go recoverPending(signalCtx, pendingDir, packer)
 
 		// Stall watchdog: if there's chunk work pending but no
 		// upload completion has registered in metrics for a while,
-		// surface a loud log line. Without this, the wedged-TCP
-		// scenario looks identical to "idle" — same metric values,
-		// same lack of error. Soft (logs only) for now; hard auto-
-		// reconnect requires a session-holder refactor and is its
-		// own commit.
-		go stallWatchdog(sessCtx, pool)
+		// fire the SessionManager's Reconnect signal so a wedged
+		// MTProto connection auto-recovers without manual restart.
+		// Also logs the event so it's visible in stderr + /telegram.
+		go stallWatchdog(signalCtx, pool, mgr)
 
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		<-signalCtx.Done()
@@ -730,7 +772,12 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			os.Exit(1)
 		}
 		return nil
-	})
+	}()
+	// Stop the session manager AFTER the shutdown sequence ran the
+	// final snapshot. The manager's goroutine then unwinds; mgrDone
+	// signals when the gotd client's run loop has fully torn down.
+	stopMgr()
+	<-mgrDone
 	// Treat clean cancellation as success — the user asked for unmount.
 	if errors.Is(err, context.Canceled) {
 		return nil
@@ -739,22 +786,26 @@ func cmdMount(signalCtx context.Context, args []string) error {
 }
 
 // stallWatchdog periodically samples chunks_uploaded + pending and
-// logs a loud warning when there's pending work but no progress.
-// 90 seconds is the threshold — short enough that a real stall is
-// surfaced before the user notices, long enough that a slow but
-// progressing upload doesn't trigger false alarms.
+// triggers a session reconnect when there's pending work but no
+// upload completion in the last stallThreshold. 90 seconds is the
+// threshold — short enough that a real stall is surfaced before
+// the user notices, long enough that a slow but progressing upload
+// doesn't trigger false alarms.
 //
-// This is a SOFT watchdog. It doesn't tear down the session or
-// restart the daemon. The intent is: make the wedge visible (in
-// stderr + /telegram + web UI) so the user knows to restart while
-// persistence keeps their data safe.
-func stallWatchdog(ctx context.Context, pool *chunk.UploadPool) {
+// On stall: logs to stderr (visible in daemon log) + calls
+// mgr.Reconnect (tears down the gotd session, re-establishes via
+// the SessionManager's run loop). Both pool.Pending count and
+// last_uploaded reset naturally as the new session lands the
+// retried wires. Cooldown between reconnects prevents a thrash
+// loop if the underlying network is genuinely down.
+func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionManager) {
 	const sampleInterval = 30 * time.Second
 	const stallThreshold = 90 * time.Second
+	const reconnectCooldown = 2 * time.Minute
 	var (
 		lastUploaded   int64
 		stalledSince   time.Time
-		warnedAtStall  bool
+		lastReconnect  time.Time
 	)
 	tick := time.NewTicker(sampleInterval)
 	defer tick.Stop()
@@ -768,7 +819,6 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool) {
 			if pending == 0 || uploaded != lastUploaded {
 				// Idle (nothing pending) OR making progress.
 				stalledSince = time.Time{}
-				warnedAtStall = false
 				lastUploaded = uploaded
 				continue
 			}
@@ -781,14 +831,16 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool) {
 			if elapsed < stallThreshold {
 				continue
 			}
-			if !warnedAtStall {
-				fmt.Fprintf(os.Stderr,
-					"[watchdog] STALL: %d chunks pending, no upload progress for %v. "+
-						"TCP connection to Telegram may be wedged. "+
-						"Persistence is on — pending wires are safe on disk; consider restart.\n",
-					pending, elapsed.Round(time.Second))
-				warnedAtStall = true
+			if time.Since(lastReconnect) < reconnectCooldown {
+				continue // already kicked the session recently
 			}
+			fmt.Fprintf(os.Stderr,
+				"[watchdog] STALL: %d chunks pending, no upload progress for %v. "+
+					"Forcing MTProto reconnect.\n",
+				pending, elapsed.Round(time.Second))
+			mgr.Reconnect()
+			lastReconnect = time.Now()
+			stalledSince = time.Time{} // give the new session a chance
 		}
 	}
 }

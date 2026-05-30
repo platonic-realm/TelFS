@@ -43,9 +43,13 @@ func (s *Session) WalkChannelMessages(ctx context.Context, pageLimit int, fn fun
 	if err != nil {
 		return err
 	}
+	api, err := s.currentAPI()
+	if err != nil {
+		return err
+	}
 	offsetID := 0
 	for page := 0; page < pageLimit; page++ {
-		res, err := s.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		res, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:     peer,
 			OffsetID: offsetID,
 			Limit:    100,
