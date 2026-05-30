@@ -14,22 +14,19 @@ import (
 
 // DefaultPackThreshold is the chunk-payload size at-or-below which
 // chunks are aggregated by the Packer instead of each getting their
-// own TG message. Set high enough to capture full-size chunks too —
-// a 1.5 GB file at the default 4 MiB chunk size is 384 chunks, which
-// would land as 384 TG messages without packing. With packing at
-// this threshold, those 384 chunks coalesce into ~12 packed blobs
-// of 32 MiB each (DefaultPackTarget), which is the real intent of
-// the packer: reduce message count, not just amortize RTT for tiny
-// files. Ranged downloads in the read path (cache.go's RangedFetcher
-// dispatch) keep random access cheap regardless of how big the
-// shared blob ends up.
+// own TG message. Set low: the packer's value is amortizing the
+// per-message round-trip for truly small chunks (tiny files); for
+// full 4 MiB chunks the per-message overhead is already negligible
+// vs the payload, and routing them through the serial packer
+// flusher would needlessly bottleneck big-file uploads on a single
+// goroutine instead of the pool's 4-way parallelism.
 //
-// The throughput trade-off: packed uploads serialize through one
-// flusher goroutine, so total wall-clock for a multi-GB write may
-// be longer than the previous 4-way-parallel pool path. The win is
-// that the channel ends up with O(file_size / pack_target) messages
-// instead of O(file_size / chunk_size).
-const DefaultPackThreshold int32 = 8 << 20
+// Bug history: was briefly raised to 8 MiB to "reduce message count
+// for big files" — combined with the (then-unbounded) flush batch
+// this funneled multi-GB worth of wires into one giant blob that
+// timed out. Big files belong in the parallel pool; the packer is
+// for tiny ones only.
+const DefaultPackThreshold int32 = 256 << 10
 
 // DefaultPackTarget is the soft cap on the bytes a single packed
 // blob upload will carry. 32 MiB is the sweet spot: large enough to
@@ -225,19 +222,55 @@ func (p *Packer) loop() {
 	}
 }
 
-// flush takes the current pending batch and uploads it as one blob.
-// Distributes per-chunk results so waiters unblock. No-op if the
-// buffer is empty.
+// flush takes UP TO p.target bytes of pending wires and uploads them
+// as one blob. Wires beyond the target stay in p.pending for the
+// next flush; if any remain, we re-signal wake so the loop runs
+// again promptly instead of waiting for the next window tick.
+//
+// Always takes at least one wire so an oversized single wire still
+// makes progress (would otherwise stall forever if its size alone
+// exceeded target).
+//
+// Bug history: an earlier version drained the entire pending slice
+// in one shot. Fast burst submits + recovery (recoverPending feeding
+// in 173 wires in a tight loop) coalesced into one 689 MiB blob
+// that couldn't finish inside the 5-min upload timeout — and on
+// each retry the same 689 MiB blob got rebuilt. The bound fixes
+// both the steady-state and the recovery path.
 func (p *Packer) flush() {
 	p.mu.Lock()
 	if len(p.pending) == 0 {
 		p.mu.Unlock()
 		return
 	}
-	batch := p.pending
-	p.pending = nil
-	p.bufBytes = 0
+	var batch []packReq
+	var batchBytes int64
+	taken := 0
+	for i, r := range p.pending {
+		w := int64(len(r.wire))
+		// Take at least one — even if it alone exceeds target —
+		// so we always make progress.
+		if i > 0 && batchBytes+w > p.target {
+			break
+		}
+		batch = append(batch, r)
+		batchBytes += w
+		taken = i + 1
+	}
+	// Slide the tail forward instead of allocating; len(p.pending)
+	// here is bounded by the dispatch rate, not unbounded growth.
+	p.pending = p.pending[taken:]
+	p.bufBytes -= batchBytes
+	morePending := len(p.pending) > 0
 	p.mu.Unlock()
+	if morePending {
+		// Wake the loop again so the residual drains promptly
+		// instead of waiting another p.window tick.
+		select {
+		case p.wake <- struct{}{}:
+		default:
+		}
+	}
 
 	// Assemble blob. Per-chunk pack_offset is the running prefix sum.
 	var buf bytes.Buffer

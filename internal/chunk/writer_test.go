@@ -1400,3 +1400,76 @@ func TestUnpackedChunkUsesFullFetch(t *testing.T) {
 		t.Fatalf("FetchRange called %d times for unpacked chunk (want 0)", got)
 	}
 }
+
+// TestPackerCapsFlushBatch is the regression guard for the
+// unbounded-batch bug that turned 173 recovered wires into one
+// 689 MiB blob: flush must take at most ~target bytes of wires
+// per call, with the rest staying in pending and re-signaling
+// wake.
+func TestPackerCapsFlushBatch(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	up := newFakeUploader()
+	cache := newTestCache(t, writerFetcher{uploader: up})
+	// Target is small (100 bytes) so we can produce many "wires"
+	// well under DefaultPackThreshold and reason about batching.
+	packer := NewPacker(m, up, 1024, 100, 50*time.Millisecond)
+	defer packer.Close()
+
+	const N = 10
+	const wireSize = 40 // each wire is 40 B; target=100 → ~2-3 wires per blob
+	inos := make([]int64, N)
+	for i := range inos {
+		ino, _ := m.CreateChild(ctx, meta.RootIno, fmt.Sprintf("p%d", i), meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+		inos[i] = ino
+	}
+	// Submit all wires in a tight loop BEFORE the window fires, so a
+	// buggy flush would coalesce them into one blob.
+	var wg sync.WaitGroup
+	for i, ino := range inos {
+		wg.Add(1)
+		go func(i int, ino int64) {
+			defer wg.Done()
+			w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, ino, 4096, 0)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			payload := bytes.Repeat([]byte{'x'}, wireSize)
+			if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := w.Sync(ctx); err != nil {
+				t.Error(err)
+				return
+			}
+		}(i, ino)
+	}
+	wg.Wait()
+
+	// Count distinct blob msg_ids. With cap working, we should see
+	// multiple blobs (~N×wireSize / target = 4-ish). With the bug,
+	// all 10 land in one blob.
+	seen := map[int64]int{}
+	for _, ino := range inos {
+		chunks, _ := m.ListChunks(ctx, ino)
+		if len(chunks) != 1 || !chunks[0].IsPacked() {
+			t.Fatalf("ino %d not packed: %+v", ino, chunks)
+		}
+		seen[chunks[0].TGMessageID]++
+	}
+	if len(seen) < 2 {
+		t.Fatalf("packer fused all %d wires into one blob (saw %d distinct msg_ids); flush cap not respected", N, len(seen))
+	}
+	// And no blob should exceed target by more than one wire's worth
+	// (the "always take at least 1" allowance).
+	for msgID, count := range seen {
+		blob, _ := up.get(int(msgID))
+		if int64(len(blob.data)) > 100+wireSize {
+			t.Fatalf("blob %d is %d bytes (target=%d, max-overhead=%d) — cap broken",
+				msgID, len(blob.data), 100, 100+wireSize)
+		}
+		_ = count
+	}
+}
