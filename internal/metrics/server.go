@@ -18,17 +18,35 @@ import (
 // Bind addr is up to the caller; 127.0.0.1:9090 is the default in
 // `telfs mount --metrics-addr`. Off by default; opt-in keeps the
 // surface of the mount daemon small.
+//
+// Extra handlers (e.g. /telegram for the request log) can be added
+// via RegisterHandler — composes nicely with the daemon's
+// per-feature endpoints without coupling this package to internal/tg.
 type Server struct {
 	addr   string
 	srv    *http.Server
 	done   chan struct{}
 	listen net.Listener
+	extra  []extraHandler
+}
+
+type extraHandler struct {
+	path    string
+	handler http.HandlerFunc
 }
 
 // NewServer constructs an unstarted Server bound to addr. Use
 // Start to actually listen; Shutdown to drain.
 func NewServer(addr string) *Server {
 	return &Server{addr: addr, done: make(chan struct{})}
+}
+
+// RegisterHandler adds an HTTP handler at the given path. Must be
+// called before Start. Useful for the daemon to plug in /telegram
+// (the request-log handler) without this package depending on
+// internal/tg.
+func (s *Server) RegisterHandler(path string, h http.HandlerFunc) {
+	s.extra = append(s.extra, extraHandler{path: path, handler: h})
 }
 
 // Start opens the listener and begins serving in a goroutine. Returns
@@ -40,9 +58,13 @@ func (s *Server) Start() error {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_ = Default.WriteProm(w)
 	})
+	for _, e := range s.extra {
+		mux.HandleFunc(e.path, e.handler)
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "telfs metrics — see /metrics")
+		fmt.Fprintln(w, "telfs telegram request log — see /telegram")
 	})
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {

@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -576,10 +577,17 @@ func cmdMount(signalCtx context.Context, args []string) error {
 				"In-flight chunk uploads (detached + still in flight).",
 				func() int64 { return pool.Pending.Total() })
 			metricsSrv = metrics.NewServer(*metricsAddr)
+			// /telegram exposes the gotd request log + last-success
+			// timestamps so the web UI (and curl) can see why an
+			// upload isn't progressing — was Telegram acking? are
+			// we stuck in FLOOD_WAIT? did we get FILE_PART_MISSING?
+			// JSON only for now; rendering is the web's problem.
+			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker()))
 			if err := metricsSrv.Start(); err != nil {
 				return err
 			}
 			fmt.Printf("Metrics: http://%s/metrics\n", metricsSrv.Addr())
+			fmt.Printf("Telegram log: http://%s/telegram\n", metricsSrv.Addr())
 		}
 		server, err := telfsfs.Mount(telfsfs.MountOptions{
 			MountPoint: mountpoint,
@@ -640,6 +648,15 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// fatal — they don't break the mount, just leave staged
 		// wires for the next attempt.
 		go recoverPending(sessCtx, pendingDir, packer)
+
+		// Stall watchdog: if there's chunk work pending but no
+		// upload completion has registered in metrics for a while,
+		// surface a loud log line. Without this, the wedged-TCP
+		// scenario looks identical to "idle" — same metric values,
+		// same lack of error. Soft (logs only) for now; hard auto-
+		// reconnect requires a session-holder refactor and is its
+		// own commit.
+		go stallWatchdog(sessCtx, pool)
 
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		<-signalCtx.Done()
@@ -719,6 +736,99 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return nil
 	}
 	return err
+}
+
+// stallWatchdog periodically samples chunks_uploaded + pending and
+// logs a loud warning when there's pending work but no progress.
+// 90 seconds is the threshold — short enough that a real stall is
+// surfaced before the user notices, long enough that a slow but
+// progressing upload doesn't trigger false alarms.
+//
+// This is a SOFT watchdog. It doesn't tear down the session or
+// restart the daemon. The intent is: make the wedge visible (in
+// stderr + /telegram + web UI) so the user knows to restart while
+// persistence keeps their data safe.
+func stallWatchdog(ctx context.Context, pool *chunk.UploadPool) {
+	const sampleInterval = 30 * time.Second
+	const stallThreshold = 90 * time.Second
+	var (
+		lastUploaded   int64
+		stalledSince   time.Time
+		warnedAtStall  bool
+	)
+	tick := time.NewTicker(sampleInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			pending := pool.Pending.Total()
+			uploaded := metrics.ChunksUploaded.Load()
+			if pending == 0 || uploaded != lastUploaded {
+				// Idle (nothing pending) OR making progress.
+				stalledSince = time.Time{}
+				warnedAtStall = false
+				lastUploaded = uploaded
+				continue
+			}
+			// pending > 0, uploaded didn't move.
+			if stalledSince.IsZero() {
+				stalledSince = time.Now()
+				continue
+			}
+			elapsed := time.Since(stalledSince)
+			if elapsed < stallThreshold {
+				continue
+			}
+			if !warnedAtStall {
+				fmt.Fprintf(os.Stderr,
+					"[watchdog] STALL: %d chunks pending, no upload progress for %v. "+
+						"TCP connection to Telegram may be wedged. "+
+						"Persistence is on — pending wires are safe on disk; consider restart.\n",
+					pending, elapsed.Round(time.Second))
+				warnedAtStall = true
+			}
+		}
+	}
+}
+
+// telegramJSONHandler returns an http.HandlerFunc that renders the
+// tracker's current state as JSON. Format is intentionally simple so
+// the web UI can fetch + render with a few lines of JS, and curl
+// pipes nicely through jq.
+func telegramJSONHandler(tr *tg.Tracker) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		snap := tr.Snapshot()
+		// Hand-roll the JSON so we don't pull in encoding/json's
+		// generic reflection cost on every poll and so the shape is
+		// stable across gotd revs.
+		fmt.Fprintln(w, "{")
+		fmt.Fprintf(w, "  \"in_flight\": %d,\n", snap.InFlight)
+		if !snap.LastSuccess.IsZero() {
+			fmt.Fprintf(w, "  \"last_success_unix\": %d,\n", snap.LastSuccess.Unix())
+			fmt.Fprintf(w, "  \"last_success_age_seconds\": %d,\n", int64(time.Since(snap.LastSuccess).Seconds()))
+		}
+		if !snap.LastError.IsZero() {
+			fmt.Fprintf(w, "  \"last_error_unix\": %d,\n", snap.LastError.Unix())
+			fmt.Fprintf(w, "  \"last_error_age_seconds\": %d,\n", int64(time.Since(snap.LastError).Seconds()))
+			fmt.Fprintf(w, "  \"last_error_message\": %q,\n", snap.LastErrorMsg)
+		}
+		fmt.Fprintln(w, "  \"requests\": [")
+		for i, r := range snap.Requests {
+			sep := ","
+			if i == len(snap.Requests)-1 {
+				sep = ""
+			}
+			fmt.Fprintf(w, "    {\"id\":%d,\"method\":%q,\"started_unix\":%d,\"duration_ms\":%d,\"bytes\":%d,\"in_flight\":%t,\"err\":%q,\"flood_wait_seconds\":%d}%s\n",
+				r.ID, r.Method, r.Started.Unix(),
+				r.Duration.Milliseconds(), r.Bytes, r.InFlight,
+				r.Err, int(r.FloodWait.Seconds()), sep)
+		}
+		fmt.Fprintln(w, "  ]")
+		fmt.Fprintln(w, "}")
+	}
 }
 
 // recoverPending scans the pending-uploads directory and submits any

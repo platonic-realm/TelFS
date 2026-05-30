@@ -32,9 +32,14 @@ import (
 // goroutines, in particular — have drained before returning from the
 // callback.
 type Session struct {
-	api *tg.Client
-	cfg *config.Config
+	api     *tg.Client
+	cfg     *config.Config
+	tracker *Tracker
 }
+
+// Tracker returns the request log this session writes to (shared
+// with the parent Client). Used by the web /telegram handler.
+func (s *Session) Tracker() *Tracker { return s.tracker }
 
 // API returns the live gotd *tg.Client.
 func (s *Session) API() *tg.Client { return s.api }

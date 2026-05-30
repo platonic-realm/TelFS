@@ -55,6 +55,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /encrypt/init", s.encryptInitForm)
 	s.mux.HandleFunc("POST /encrypt/init", s.encryptInitSubmit)
 
+	// Telegram connection state + recent requests.
+	s.mux.HandleFunc("GET /telegram", s.telegramPage)
+
 	// Mount supervisor.
 	s.mux.HandleFunc("GET /mount", s.mountList)
 	s.mux.HandleFunc("GET /mount/new", s.mountNewForm)

@@ -29,7 +29,8 @@ import (
 // drained before they return from the callback. After return, the
 // Session's underlying client is closed and any further use will fail.
 type Client struct {
-	cfg *config.Config
+	cfg     *config.Config
+	tracker *Tracker
 }
 
 // ErrNotAuthorized is returned by RunSession when no valid local session
@@ -42,8 +43,12 @@ func New(cfg *config.Config) (*Client, error) {
 	if err := cfg.RequireAPI(); err != nil {
 		return nil, err
 	}
-	return &Client{cfg: cfg}, nil
+	return &Client{cfg: cfg, tracker: NewTracker(128)}, nil
 }
+
+// Tracker returns the request log + connection-state tracker. The
+// daemon hands this to the web layer for /telegram visibility.
+func (c *Client) Tracker() *Tracker { return c.tracker }
 
 // newTG builds a fresh underlying gotd client honoring cfg.DC and the
 // session storage path. Our FloodWaiter (internal/tg/floodwait.go)
@@ -54,9 +59,18 @@ func New(cfg *config.Config) (*Client, error) {
 // visible in the daemon log instead of looking wedged.
 func (c *Client) newTG() *telegram.Client {
 	storage := &session.FileStorage{Path: c.cfg.SessionPath()}
+	// Middleware order is bottom-up: the LAST entry in the slice
+	// wraps the lowest level. TrackingMiddleware sits BELOW
+	// FloodWaiter so it records the raw FLOOD_WAIT response (before
+	// the waiter swallows it via retry). That way the request log
+	// shows every wire-level attempt, not just the user-facing
+	// outcome.
 	opts := telegram.Options{
 		SessionStorage: storage,
-		Middlewares:    []telegram.Middleware{NewFloodWaiter()},
+		Middlewares: []telegram.Middleware{
+			NewFloodWaiter(),
+			&TrackingMiddleware{Tracker: c.tracker},
+		},
 	}
 	if c.cfg.DC != 0 {
 		opts.DC = c.cfg.DC
@@ -85,7 +99,7 @@ func (c *Client) RunSession(ctx context.Context, fn func(ctx context.Context, se
 		if !status.Authorized {
 			return ErrNotAuthorized
 		}
-		return fn(ctx, &Session{api: tgc.API(), cfg: c.cfg})
+		return fn(ctx, &Session{api: tgc.API(), cfg: c.cfg, tracker: c.tracker})
 	})
 	if err == nil && ctx.Err() != nil {
 		return ctx.Err()
