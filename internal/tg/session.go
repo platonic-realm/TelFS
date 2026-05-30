@@ -334,6 +334,126 @@ func (s *Session) DownloadDocument(ctx context.Context, msgID int, w io.Writer) 
 	return s.streamDocument(ctx, doc, w)
 }
 
+// rangePartSize is the size of each upload.getFile request when
+// fetching a byte range. Telegram caps a single getFile response at
+// 1 MiB, and offset+limit must each be a multiple of 4 KiB. Using
+// 1 MiB minimizes the round-trip count for cross-MiB ranges.
+const rangePartSize = 1 << 20
+
+// rangeAlignment is the byte-alignment Telegram requires for offset
+// and limit fields in upload.getFile. Reads not aligned on this
+// boundary must round outward and slice the surplus client-side.
+const rangeAlignment = 4096
+
+// DownloadDocumentRange fetches a byte range [offset, offset+length)
+// of the document attached to msgID, streaming it to w. Uses the
+// Precise flag on upload.getFile so non-keyframe-aligned offsets are
+// accepted (otherwise Telegram is restrictive about where you can
+// seek for media files).
+//
+// The caller can ask for any (offset, length); this method handles
+// the 4 KiB alignment + 1 MiB-per-request constraints by rounding
+// the request outward and slicing the surplus before writing to w.
+//
+// Sequential reads are issued serially (no parallelism inside one
+// range request). For random reads of a small slice this is the
+// expected pattern; large sequential reads should still use the
+// whole-document Download* APIs.
+func (s *Session) DownloadDocumentRange(ctx context.Context, msgID int, w io.Writer, offset, length int64) (int64, error) {
+	if length <= 0 {
+		return 0, nil
+	}
+	doc, err := s.fetchDocument(ctx, msgID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := s.streamDocumentRange(ctx, doc, w, offset, length)
+	if err == nil {
+		return n, nil
+	}
+	if !tgerr.Is(err, "FILE_REFERENCE_EXPIRED") {
+		return n, err
+	}
+	doc, err = s.fetchDocument(ctx, msgID)
+	if err != nil {
+		return 0, fmt.Errorf("refresh file_reference: %w", err)
+	}
+	return s.streamDocumentRange(ctx, doc, w, offset, length)
+}
+
+func (s *Session) streamDocumentRange(ctx context.Context, doc *tg.Document, w io.Writer, offset, length int64) (int64, error) {
+	loc := &tg.InputDocumentFileLocation{
+		ID:            doc.ID,
+		AccessHash:    doc.AccessHash,
+		FileReference: doc.FileReference,
+	}
+	// Round the request outward so offset+limit are 4 KiB-aligned;
+	// slice the surplus before returning. End = first multiple of
+	// rangeAlignment >= offset+length.
+	alignedStart := (offset / rangeAlignment) * rangeAlignment
+	end := offset + length
+	alignedEnd := ((end + rangeAlignment - 1) / rangeAlignment) * rangeAlignment
+	startOffsetInResult := offset - alignedStart
+	wanted := length
+
+	var written int64
+	cur := alignedStart
+	for cur < alignedEnd {
+		limit := int64(rangePartSize)
+		if cur+limit > alignedEnd {
+			limit = alignedEnd - cur
+		}
+		req := &tg.UploadGetFileRequest{
+			Precise:  true,
+			Location: loc,
+			Offset:   cur,
+			Limit:    int(limit),
+		}
+		res, err := s.api.UploadGetFile(ctx, req)
+		if err != nil {
+			return written, err
+		}
+		f, ok := res.(*tg.UploadFile)
+		if !ok {
+			return written, fmt.Errorf("unexpected getFile response %T", res)
+		}
+		// Drop the leading surplus on the first part (caller didn't
+		// want bytes [alignedStart, offset)), and the trailing surplus
+		// on the last part once we've satisfied `wanted` bytes.
+		bytes := f.Bytes
+		if cur == alignedStart && startOffsetInResult > 0 {
+			if int64(len(bytes)) <= startOffsetInResult {
+				cur += int64(len(bytes))
+				continue
+			}
+			bytes = bytes[startOffsetInResult:]
+		}
+		if int64(len(bytes)) > wanted {
+			bytes = bytes[:wanted]
+		}
+		if len(bytes) == 0 {
+			break
+		}
+		n, err := w.Write(bytes)
+		written += int64(n)
+		wanted -= int64(n)
+		if err != nil {
+			return written, err
+		}
+		if wanted <= 0 {
+			break
+		}
+		// If Telegram returned fewer bytes than the request limit,
+		// we've hit EOF on the file; stop early instead of looping
+		// forever asking for bytes that don't exist.
+		if int64(len(f.Bytes)) < limit {
+			break
+		}
+		cur += limit
+	}
+	return written, nil
+}
+
 // downloadThreads is the parallelism inside ONE document download.
 // gotd's Builder.Parallel splits the file into 512 KiB parts (the
 // downloader's default part size) and fetches `threads` of them at

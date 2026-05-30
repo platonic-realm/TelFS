@@ -1260,3 +1260,143 @@ func TestPackRouteReleasesPoolSemEarly(t *testing.T) {
 		t.Fatalf("packer made too many batches (%d) — early sem release didn't kick in: %v", len(seen), seen)
 	}
 }
+
+// rangedFetcher implements both Fetcher and RangedFetcher against the
+// fakeUploader's recorded blobs. Used to exercise the cache's
+// preference for ranged fetches on packed chunks.
+type rangedFetcher struct {
+	up         *fakeUploader
+	rangeCalls atomic.Int64
+	fullCalls  atomic.Int64
+}
+
+func (f *rangedFetcher) Fetch(_ context.Context, _ Key, msgID int64) ([]byte, error) {
+	f.fullCalls.Add(1)
+	blob, ok := f.up.get(int(msgID))
+	if !ok {
+		return nil, errors.New("no such msg")
+	}
+	out := make([]byte, len(blob.data))
+	copy(out, blob.data)
+	return out, nil
+}
+
+func (f *rangedFetcher) FetchRange(_ context.Context, _ Key, msgID int64, offset, length int64) ([]byte, error) {
+	f.rangeCalls.Add(1)
+	blob, ok := f.up.get(int(msgID))
+	if !ok {
+		return nil, errors.New("no such msg")
+	}
+	if offset+length > int64(len(blob.data)) {
+		return nil, errors.New("range past EOF")
+	}
+	out := make([]byte, length)
+	copy(out, blob.data[offset:offset+length])
+	return out, nil
+}
+
+// TestPackedChunkUsesRangedFetcher: a packed chunk should be fetched
+// via FetchRange (not full-blob Fetch), and the read-back bytes must
+// match what was written. Unpacked chunks should still use Fetch.
+func TestPackedChunkUsesRangedFetcher(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	up := newFakeUploader()
+	rf := &rangedFetcher{up: up}
+	cache, err := NewCache(t.TempDir(), 1<<20, rf, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Aggressive window so the test runs fast.
+	packer := NewPacker(m, up, 1024, 1<<20, 50*time.Millisecond)
+	defer packer.Close()
+
+	const N = 3
+	inos := make([]int64, N)
+	payloads := make([][]byte, N)
+	for i := range inos {
+		ino, _ := m.CreateChild(ctx, meta.RootIno, fmt.Sprintf("p%d", i), meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+		inos[i] = ino
+		payloads[i] = []byte(fmt.Sprintf("packed-file-%d-content", i))
+	}
+	var wg sync.WaitGroup
+	for i, ino := range inos {
+		wg.Add(1)
+		go func(i int, ino int64) {
+			defer wg.Done()
+			w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, packer, ino, 4096, 0)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if _, err := w.WriteAt(ctx, payloads[i], 0); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := w.Sync(ctx); err != nil {
+				t.Error(err)
+				return
+			}
+		}(i, ino)
+	}
+	wg.Wait()
+
+	// Sanity: all three packed into the same blob (or close to it).
+	r := NewReader(m, cache, nil, 4096)
+	for i, ino := range inos {
+		chunks, _ := m.ListChunks(ctx, ino)
+		if len(chunks) != 1 || !chunks[0].IsPacked() {
+			t.Fatalf("ino %d not packed: %+v", ino, chunks)
+		}
+		dest := make([]byte, len(payloads[i]))
+		n, err := r.ReadAt(ctx, ino, dest, 0)
+		if err != nil || n != len(payloads[i]) || !bytes.Equal(dest, payloads[i]) {
+			t.Fatalf("read-back %d: n=%d err=%v match=%v", i, n, err, bytes.Equal(dest, payloads[i]))
+		}
+	}
+	if got := rf.rangeCalls.Load(); got != int64(N) {
+		t.Fatalf("FetchRange called %d times, want %d (one per packed chunk read)", got, N)
+	}
+	if got := rf.fullCalls.Load(); got != 0 {
+		t.Fatalf("Fetch called %d times for packed chunks (want 0 — RangedFetcher should be preferred)", got)
+	}
+}
+
+// TestUnpackedChunkUsesFullFetch keeps the inverse honest: when
+// chunk_map has no pack fields, we should use plain Fetch (not
+// FetchRange), so legacy chunks keep their existing path.
+func TestUnpackedChunkUsesFullFetch(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino, _ := m.CreateChild(ctx, meta.RootIno, "big", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	up := newFakeUploader()
+	rf := &rangedFetcher{up: up}
+	cache, err := NewCache(t.TempDir(), 1<<20, rf, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Large chunk (above packer threshold), so it doesn't pack.
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, nil, ino, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("A"), 4000) // above DefaultPackThreshold? No, 256 KB. Just no packer wired anyway.
+	if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReader(m, cache, nil, 4096)
+	dest := make([]byte, len(payload))
+	n, err := r.ReadAt(ctx, ino, dest, 0)
+	if err != nil || n != len(payload) || !bytes.Equal(dest, payload) {
+		t.Fatalf("read-back: n=%d err=%v match=%v", n, err, bytes.Equal(dest, payload))
+	}
+	if got := rf.fullCalls.Load(); got != 1 {
+		t.Fatalf("Fetch called %d times, want 1", got)
+	}
+	if got := rf.rangeCalls.Load(); got != 0 {
+		t.Fatalf("FetchRange called %d times for unpacked chunk (want 0)", got)
+	}
+}

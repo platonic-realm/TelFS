@@ -28,3 +28,19 @@ func (f *TGFetcher) Fetch(ctx context.Context, key Key, tgMessageID int64) ([]by
 	}
 	return buf.Bytes(), nil
 }
+
+// FetchRange downloads bytes [offset, offset+length) of the message.
+// Used by Cache when a packed extent's slice is wanted, so a large
+// shared blob doesn't have to be downloaded in full for each chunk
+// row that references it. Round-trip count is ceil(length / 1 MiB).
+func (f *TGFetcher) FetchRange(ctx context.Context, key Key, tgMessageID int64, offset, length int64) ([]byte, error) {
+	var buf bytes.Buffer
+	n, err := f.Session.DownloadDocumentRange(ctx, int(tgMessageID), &buf, offset, length)
+	if err != nil {
+		return nil, fmt.Errorf("download msg %d [%d:%d]: %w", tgMessageID, offset, offset+length, err)
+	}
+	if int64(buf.Len()) != n {
+		return nil, fmt.Errorf("ranged download size mismatch: reported %d, buffered %d", n, buf.Len())
+	}
+	return buf.Bytes(), nil
+}

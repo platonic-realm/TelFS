@@ -20,14 +20,14 @@ import (
 const DefaultPackThreshold int32 = 256 << 10
 
 // DefaultPackTarget is the soft cap on the bytes a single packed
-// blob upload will carry. 2 MiB is small enough that flush latency
-// stays sub-second on typical uplinks, large enough to amortize
-// the RTT across many small files. The packer flushes whenever
-// the next wire would push the buffer past this number — single
-// wires larger than this still pack alone (which is fine; the
-// packer-vs-direct decision happens at submit, and the caller has
-// already decided "small file").
-const DefaultPackTarget int64 = 2 << 20
+// blob upload will carry. 32 MiB is the sweet spot: large enough to
+// collapse hundreds of sub-256-KB files into a handful of TG
+// messages and reduce per-file round-trip cost meaningfully, small
+// enough that one flush completes in seconds on a typical residential
+// uplink. With RangedFetcher in the read path, a large blob doesn't
+// hurt random-access reads — each chunk's extent is fetched
+// independently via upload.getFile(offset, limit).
+const DefaultPackTarget int64 = 32 << 20
 
 // DefaultPackWindow is how long the packer will wait for more
 // wires before flushing what it has. Async close makes 200 ms

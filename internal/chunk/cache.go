@@ -34,8 +34,21 @@ func (k Key) fileName() string {
 // Fetcher is the upstream from which the Cache pulls chunks on miss.
 // Implementations are typically backed by tg.Session in production and a
 // fake in tests.
+//
+// Fetch downloads the entire message. Most callers should prefer
+// RangedFetcher when one is available — for packed chunks where many
+// rows share a TG message, fetching just the relevant extent avoids
+// downloading the entire blob on every cache miss.
 type Fetcher interface {
 	Fetch(ctx context.Context, key Key, tgMessageID int64) ([]byte, error)
+}
+
+// RangedFetcher is the optional ranged variant. Cache type-asserts
+// for this on every miss; if absent, falls back to whole-message
+// Fetch + client-side slice. Implementations include tg.TGFetcher;
+// fake fetchers in tests may omit it.
+type RangedFetcher interface {
+	FetchRange(ctx context.Context, key Key, tgMessageID int64, offset, length int64) ([]byte, error)
 }
 
 type entry struct {
@@ -184,24 +197,60 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset 
 	//
 	//   wire ── decrypt ──▶ compressed ── decompress ──▶ plaintext
 	//
-	// We persist plaintext so cache hits skip both costs.
-	fetched, err := c.fetcher.Fetch(ctx, key, tgMessageID)
-	if err != nil {
-		return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
+	// For packed chunks we prefer a RangedFetcher (one upload.getFile
+	// per ~1 MiB) so we don't download the entire shared blob just to
+	// access one extent — that scaling matters as the packer batches
+	// more chunks per message. RangedFetcher is optional; if absent,
+	// we fall back to whole-message Fetch + client-side slice.
+	var fetched []byte
+	if packSize > 0 {
+		if rf, ok := c.fetcher.(RangedFetcher); ok {
+			b, err := rf.FetchRange(ctx, key, tgMessageID, packOffset, int64(packSize))
+			if err != nil {
+				return nil, fmt.Errorf("ranged fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
+			}
+			fetched = b
+			metrics.ChunksDownloaded.Inc()
+			metrics.BytesDownloaded.Add(int64(len(b)))
+		} else {
+			b, err := c.fetcher.Fetch(ctx, key, tgMessageID)
+			if err != nil {
+				return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
+			}
+			metrics.ChunksDownloaded.Inc()
+			metrics.BytesDownloaded.Add(int64(len(b)))
+			fetched = b
+		}
+	} else {
+		b, err := c.fetcher.Fetch(ctx, key, tgMessageID)
+		if err != nil {
+			return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
+		}
+		metrics.ChunksDownloaded.Inc()
+		metrics.BytesDownloaded.Add(int64(len(b)))
+		fetched = b
 	}
-	metrics.ChunksDownloaded.Inc()
-	metrics.BytesDownloaded.Add(int64(len(fetched)))
 	// Slice if packed: the fetched blob holds many chunks back-to-back.
 	// packSize > 0 marks this chunk as a sub-extent. packOffset == 0 is
 	// valid (start-of-blob); packSize is the load-bearing signal.
+	// When we used the ranged fetcher above, `fetched` already
+	// contains exactly the extent's bytes (offset 0 in the buffer),
+	// so we adjust the slice base accordingly.
+	var packBase int64
+	if packSize > 0 {
+		if _, ranged := c.fetcher.(RangedFetcher); !ranged {
+			packBase = packOffset
+		}
+	}
 	var ciphertext []byte
 	if packSize > 0 {
-		end := packOffset + int64(packSize)
-		if end > int64(len(fetched)) {
-			return nil, fmt.Errorf("packed extent out of range for chunk %d/%d: blob=%d bytes, want [%d:%d]",
-				key.Ino, key.Idx, len(fetched), packOffset, end)
+		sliceStart := packBase
+		sliceEnd := packBase + int64(packSize)
+		if sliceEnd > int64(len(fetched)) {
+			return nil, fmt.Errorf("packed extent out of range for chunk %d/%d: buf=%d bytes, want [%d:%d]",
+				key.Ino, key.Idx, len(fetched), sliceStart, sliceEnd)
 		}
-		ciphertext = fetched[packOffset:end]
+		ciphertext = fetched[sliceStart:sliceEnd]
 	} else {
 		ciphertext = fetched
 	}
