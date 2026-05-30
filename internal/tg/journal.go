@@ -1,8 +1,10 @@
 package tg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -14,15 +16,50 @@ import (
 // channel can carry both without ambiguity.
 const MessageKindJournal = "j"
 
-// JournalCaption is the JSON envelope around a meta journal op.
-// Seq is the local journal's autoincrement primary key — recovery
-// uses it to skip ops that are already part of the restored snapshot.
+// JournalCaption is the JSON envelope around a meta journal op (or
+// batch of ops). Recovery reads this without downloading the body,
+// so it can cheaply decide whether the batch overlaps with seqs it
+// still needs.
+//
+// Two shapes share this struct (the JSON tags use omitempty so a
+// reader sees the right "is this a batch?" signal):
+//
+//   batch (post-2026 default):
+//     {k: "j", fs_uuid, ts, first_seq, last_seq, count}    ← in caption
+//     {ops: [{seq, op}, ...]}                               ← in body
+//
+//   single-op (legacy — kept for read compat with old channels):
+//     {k: "j", fs_uuid, ts, seq, op: <op-json>}             ← all in caption
+//
+// The discriminator is `count > 0` (batch) vs `len(payload) > 0`
+// (single). Either one fully identifies the shape.
 type JournalCaption struct {
-	Kind    string          `json:"k"`       // always "j"
-	Seq     int64           `json:"seq"`     // local journal.seq
-	TSUnix  int64           `json:"ts"`      // wall-clock at post
-	FSUUID  string          `json:"fs_uuid"` // identifies the originating TelFS instance
-	Payload json.RawMessage `json:"op"`      // the meta.JournalOp shape
+	Kind     string          `json:"k"`
+	TSUnix   int64           `json:"ts"`
+	FSUUID   string          `json:"fs_uuid"`
+	Seq      int64           `json:"seq,omitempty"`        // single-op only
+	Payload  json.RawMessage `json:"op,omitempty"`         // single-op only
+	FirstSeq int64           `json:"first_seq,omitempty"` // batch only
+	LastSeq  int64           `json:"last_seq,omitempty"`  // batch only
+	Count    int             `json:"count,omitempty"`     // batch only
+}
+
+// IsBatch reports whether this caption describes a multi-op batch
+// (body must be fetched to recover the ops) vs a single-op caption
+// with the op inline.
+func (c JournalCaption) IsBatch() bool { return c.Count > 0 }
+
+// JournalBatchBody is the document body schema for a batched
+// journal-op message. Concatenation of (seq, op) pairs ordered by
+// seq ascending.
+type JournalBatchBody struct {
+	Ops []JournalBatchEntry `json:"ops"`
+}
+
+// JournalBatchEntry is one (seq, op) pair inside a batch body.
+type JournalBatchEntry struct {
+	Seq int64           `json:"seq"`
+	Op  json.RawMessage `json:"op"`
 }
 
 // JournalMessage describes a single journal-op message found on the
@@ -33,41 +70,79 @@ type JournalMessage struct {
 	Caption   JournalCaption
 }
 
-// UploadJournalOp posts a journal-op message to the configured channel.
-// The op body is sent as a 0-byte document with the JSON caption
-// carrying the actual payload — using a document message (not just
-// MessagesSendMessage) keeps journal ops and snapshots on the same
-// "documents that scroll past in the channel" surface for tooling
-// like ListSnapshots / ListJournalOps.
+// UploadJournalOpBatch posts MANY journal entries as a SINGLE TG
+// channel message. Caption carries a small marker (kind, fs_uuid,
+// seq range, count) so recovery can decide whether to download the
+// body. Body is a JSON `{ops:[{seq,op}, ...]}` array so recovery
+// reconstructs every op the batch covers in one MTProto round trip
+// per batch message instead of one per op.
 //
-// Returns the new channel message id, which the caller persists via
-// MarkJournalPosted so we don't re-post after restart.
-func (s *Session) UploadJournalOp(ctx context.Context, opJSON []byte, seq, ts int64, fsUUID string) (int, error) {
-	cap := JournalCaption{
-		Kind: MessageKindJournal, Seq: seq, TSUnix: ts, FSUUID: fsUUID,
-		Payload: json.RawMessage(opJSON),
+// This is the load-bearing fix for the "many small messages"
+// observation: 10k FS mutations no longer become 10k TG messages.
+// At ~200 bytes per op + JSON overhead, ~1000 ops fit comfortably
+// in a 256 KB body that uploads in 1–2 SaveFilePart calls.
+//
+// Caller passes the seq + opJSON pairs newest-last (ascending by
+// seq); the schema preserves that ordering so recovery replays in
+// the right order.
+//
+// Returns the new channel message id; caller persists posted_at
+// for every seq in the batch via Meta.MarkJournalPosted.
+func (s *Session) UploadJournalOpBatch(ctx context.Context, ops []JournalBatchEntry, ts int64, fsUUID string) (int, error) {
+	if len(ops) == 0 {
+		return 0, errors.New("UploadJournalOpBatch: empty batch")
 	}
-	payload, err := json.Marshal(cap)
+	body, err := json.Marshal(JournalBatchBody{Ops: ops})
 	if err != nil {
-		return 0, fmt.Errorf("encode journal caption: %w", err)
+		return 0, fmt.Errorf("encode journal batch body: %w", err)
 	}
-	// Compact document name — journal ops are tiny and we don't need
-	// a per-op filename to mean anything beyond grouping in tooling.
-	name := fmt.Sprintf("telfs-jop-%s-%d.json", fsUUID, seq)
-	return s.UploadDocument(ctx, strings.NewReader(string(opJSON)), name, string(payload))
+	cap := JournalCaption{
+		Kind:     MessageKindJournal,
+		TSUnix:   ts,
+		FSUUID:   fsUUID,
+		FirstSeq: ops[0].Seq,
+		LastSeq:  ops[len(ops)-1].Seq,
+		Count:    len(ops),
+	}
+	capJSON, err := json.Marshal(cap)
+	if err != nil {
+		return 0, fmt.Errorf("encode journal batch caption: %w", err)
+	}
+	name := fmt.Sprintf("telfs-jbatch-%s-%d-%d.json", fsUUID, cap.FirstSeq, cap.LastSeq)
+	return s.UploadDocument(ctx, strings.NewReader(string(body)), name, string(capJSON))
+}
+
+// DownloadJournalBatchBody fetches the body of a journal-batch
+// message and parses it. Used by recovery when a batch's seq range
+// overlaps with seqs the caller hasn't replayed yet.
+func (s *Session) DownloadJournalBatchBody(ctx context.Context, msgID int) ([]JournalBatchEntry, error) {
+	var buf bytes.Buffer
+	if _, err := s.DownloadDocument(ctx, msgID, &buf); err != nil {
+		return nil, fmt.Errorf("download journal batch body msg=%d: %w", msgID, err)
+	}
+	var body JournalBatchBody
+	if err := json.Unmarshal(buf.Bytes(), &body); err != nil {
+		return nil, fmt.Errorf("parse journal batch body msg=%d: %w", msgID, err)
+	}
+	return body.Ops, nil
 }
 
 // ListJournalOps scans the channel newest-first and returns every
-// journal-op message with seq > sinceSeq (matching fsUUID if
-// non-empty). Newest-first is convenient for ListSnapshots
-// symmetry; the caller sorts ascending before replaying.
+// journal op (single or expanded from a batch) with seq > sinceSeq
+// (matching fsUUID if non-empty). Newest-first is convenient for
+// ListSnapshots symmetry; the caller sorts ascending before
+// replaying.
+//
+// For batch messages, the caption alone is enough to decide
+// whether the batch overlaps with sinceSeq (LastSeq > sinceSeq);
+// if it does, the body is downloaded and parsed for the ops.
+// Single-op messages (legacy format) are decoded inline.
 //
 // max caps the number of entries returned so a misbehaving caller
-// can't stream the entire channel into memory; 0 means use 1000
-// (covering ~4h at 1op/15s — generous for a typical workload).
+// can't stream the entire channel into memory; 0 means use 10000.
 func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq int64, max int) ([]JournalMessage, error) {
 	if max <= 0 {
-		max = 1000
+		max = 10000
 	}
 	peer, _, err := s.channelPeer()
 	if err != nil {
@@ -106,10 +181,39 @@ func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq in
 			if fsUUID != "" && cap.FSUUID != fsUUID {
 				continue
 			}
+			if cap.IsBatch() {
+				if cap.LastSeq <= sinceSeq {
+					// Whole batch is older than what we need — stop.
+					stop = true
+					break
+				}
+				// Download body, expand into per-seq messages.
+				entries, err := s.DownloadJournalBatchBody(ctx, msg.ID)
+				if err != nil {
+					return nil, err
+				}
+				for _, e := range entries {
+					if e.Seq <= sinceSeq {
+						continue
+					}
+					out = append(out, JournalMessage{
+						MessageID: msg.ID,
+						Caption: JournalCaption{
+							Kind:    MessageKindJournal,
+							TSUnix:  cap.TSUnix,
+							FSUUID:  cap.FSUUID,
+							Seq:     e.Seq,
+							Payload: e.Op,
+						},
+					})
+					if len(out) >= max {
+						return out, nil
+					}
+				}
+				continue
+			}
+			// Legacy single-op caption.
 			if cap.Seq <= sinceSeq {
-				// Older than what we already have — stop scanning;
-				// channel order matches seq order well enough that
-				// further pages would only contain even older entries.
 				stop = true
 				break
 			}

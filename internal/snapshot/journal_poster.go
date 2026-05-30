@@ -25,14 +25,23 @@ import (
 // lost on crash, narrowing the window from 5 minutes to ~5 seconds.
 const DefaultPosterInterval = 5 * time.Second
 
+// DefaultPosterBatchSize is how many journal entries get packed
+// into one TG channel message. ~200 bytes per op + JSON overhead
+// means 1000 ops ≈ 250 KB body — small enough that one batch
+// upload finishes in well under a second on residential uplinks,
+// large enough that a 10k-file unzip becomes 10 channel messages
+// instead of 10000.
+const DefaultPosterBatchSize = 1000
+
 // Poster posts pending journal entries to the channel. One Poster
 // per FS; co-runs alongside the snapshot Manager on the same gotd
 // session.
 type Poster struct {
-	Meta     *meta.Store
-	Session  *tg.Session
-	Interval time.Duration
-	Logger   *log.Logger
+	Meta      *meta.Store
+	Session   *tg.Session
+	Interval  time.Duration
+	BatchSize int // 0 → DefaultPosterBatchSize
+	Logger    *log.Logger
 }
 
 // Run drains the local journal periodically until ctx is canceled.
@@ -71,11 +80,17 @@ func (p *Poster) Run(ctx context.Context) error {
 	}
 }
 
-// drainOnce reads every pending journal entry and posts them to the
-// channel, marking each posted before moving on. We post serially —
-// gotd serializes RPCs at the connection layer anyway, and journal
-// entries are tiny enough that parallel uploads wouldn't meaningfully
-// speed this up.
+// drainOnce reads pending journal entries and posts them to the
+// channel in BATCHES — one TG message per batch instead of one per
+// op. A 10k-file unzip used to generate 10k+ TG messages here;
+// with batching it's ~10 (depending on BatchSize).
+//
+// Each batch is one UploadJournalOpBatch call. If a batch fails
+// mid-loop, the entries in batches BEFORE the failure are already
+// marked posted; the failed batch's entries stay unposted and the
+// next tick retries them. Per-batch (not per-op) granularity means
+// up to BatchSize ops might be re-posted after a transient error,
+// which is acceptable: recovery dedupes by seq.
 func (p *Poster) drainOnce(ctx context.Context) error {
 	pending, err := p.Meta.PendingJournal(ctx)
 	if err != nil {
@@ -88,15 +103,35 @@ func (p *Poster) drainOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fs_uuid: %w", err)
 	}
-	for _, e := range pending {
-		_, err := p.Session.UploadJournalOp(ctx, e.OpJSON, e.Seq, time.Now().Unix(), fsUUID)
-		if err != nil {
-			// Stop on first error — likely transient (network blip,
-			// FLOOD_WAIT). Next tick will retry from where we stopped.
-			return fmt.Errorf("post seq=%d: %w", e.Seq, err)
+	batchSize := p.BatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultPosterBatchSize
+	}
+	for start := 0; start < len(pending); start += batchSize {
+		end := start + batchSize
+		if end > len(pending) {
+			end = len(pending)
 		}
-		if err := p.Meta.MarkJournalPosted(ctx, e.Seq, time.Now().Unix()); err != nil {
-			return fmt.Errorf("mark posted seq=%d: %w", e.Seq, err)
+		batch := pending[start:end]
+		entries := make([]tg.JournalBatchEntry, len(batch))
+		for i, e := range batch {
+			entries[i] = tg.JournalBatchEntry{Seq: e.Seq, Op: e.OpJSON}
+		}
+		if _, err := p.Session.UploadJournalOpBatch(ctx, entries, time.Now().Unix(), fsUUID); err != nil {
+			return fmt.Errorf("post batch first_seq=%d last_seq=%d: %w",
+				batch[0].Seq, batch[len(batch)-1].Seq, err)
+		}
+		// Mark every seq in the batch posted. We do this serially
+		// after the upload returns success; if MarkJournalPosted
+		// fails partway, the next tick re-posts the not-yet-marked
+		// tail (same recovery model as per-op behavior). At most
+		// batchSize ops are duplicated on the channel for a single
+		// crash — orphan dedup is `gc`'s job.
+		nowUnix := time.Now().Unix()
+		for _, e := range batch {
+			if err := p.Meta.MarkJournalPosted(ctx, e.Seq, nowUnix); err != nil {
+				return fmt.Errorf("mark posted seq=%d: %w", e.Seq, err)
+			}
 		}
 	}
 	return nil
