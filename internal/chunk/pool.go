@@ -29,6 +29,12 @@ type UploadPool struct {
 	sem          chan struct{}
 	wg           sync.WaitGroup
 	Pending      *PendingInodes
+	// PendingDir is the on-disk staging directory for wires awaiting
+	// upload. Writers PersistPending here BEFORE Submitting to the
+	// packer; packer flush DeletePending here AFTER the chunk_map
+	// row lands. Empty string disables persistence (used by tests
+	// that mock the uploader and don't care about restart recovery).
+	PendingDir string
 }
 
 // NewUploadPool constructs a pool with the given concurrency cap.

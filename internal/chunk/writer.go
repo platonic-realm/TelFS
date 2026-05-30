@@ -659,6 +659,21 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	// qualify for packing. Larger chunks still flow through the
 	// dedup + direct-upload path unchanged.
 	if w.packer != nil && int32(len(dc.data)) < w.packer.Threshold() {
+		// Persist wire to disk BEFORE submitting to packer so a
+		// hard daemon kill (or panic) between here and the
+		// packer's chunk_map write doesn't lose the bytes. The
+		// pending dir lives under the cache root; restart scans
+		// it and re-submits via Backend.RecoverPending.
+		var pendingPath string
+		if dir := w.pool.PendingDir; dir != "" {
+			p, perr := PersistPending(dir, w.ino, idx, int32(len(dc.data)), wire)
+			if perr != nil {
+				restore = true
+				w.recordError(fmt.Errorf("persist pending chunk %d: %w", idx, perr))
+				return
+			}
+			pendingPath = p
+		}
 		// Release the upload SEM slot before waiting on the packer's
 		// result chan — the packer runs its own serialized flusher,
 		// so holding a pool slot through the pack wait would cap
@@ -667,7 +682,7 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		// Pending + wg stay held until res.Release() at the bottom
 		// of this function, so reader-side R-A-W barrier remains
 		// honored.
-		resultCh := w.packer.Submit(w.ino, idx, int32(len(dc.data)), wire)
+		resultCh := w.packer.Submit(w.ino, idx, int32(len(dc.data)), wire, pendingPath)
 		res.ReleaseSem()
 		select {
 		case packRes := <-resultCh:

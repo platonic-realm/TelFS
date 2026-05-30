@@ -99,7 +99,13 @@ type packReq struct {
 	idx           int32
 	plaintextSize int32
 	wire          []byte
-	result        chan packResult
+	// pendingPath, when non-empty, points at this wire's on-disk
+	// staging file. Flush deletes it AFTER PutChunk lands so a
+	// daemon kill mid-upload doesn't drop the chunk — the next
+	// startup scans the pending dir and re-submits any leftover
+	// wires to the packer.
+	pendingPath string
+	result      chan packResult
 }
 
 type packResult struct {
@@ -145,17 +151,21 @@ func (p *Packer) Threshold() int32 { return p.threshold }
 // the upload lands. The caller MUST receive on the chan — otherwise
 // the flusher's distribution goroutine leaks.
 //
+// pendingPath, when non-empty, is the on-disk staging file for this
+// wire. Flush deletes it after PutChunk lands.
+//
 // Submit only blocks long enough to append; the flush window is in
 // a separate goroutine. If the new wire would push the buffer past
 // the target, Submit wakes the flusher immediately (a "trigger
 // flush" condition complementing the window-elapsed condition).
-func (p *Packer) Submit(ino int64, idx int32, plaintextSize int32, wire []byte) <-chan packResult {
+func (p *Packer) Submit(ino int64, idx int32, plaintextSize int32, wire []byte, pendingPath string) <-chan packResult {
 	ch := make(chan packResult, 1)
 	req := packReq{
 		ino:           ino,
 		idx:           idx,
 		plaintextSize: plaintextSize,
 		wire:          wire,
+		pendingPath:   pendingPath,
 		result:        ch,
 	}
 	p.mu.Lock()
@@ -238,10 +248,16 @@ func (p *Packer) flush() {
 	}
 
 	name := fmt.Sprintf("pack-%d", time.Now().UnixNano())
-	// Uploads use context.Background() — the buffered batch must
-	// survive Close (final drain) to avoid the torn-snapshot
-	// scenario where inode.size persisted but chunk_map didn't.
-	// The 30s shutdown watchdog in cmdMount is the backstop.
+	// Uploads use a long-deadline context (not Background) so a
+	// stuck MTProto connection — where TCP send buffer is queued
+	// but Telegram isn't acking, gotd has no app-level timeout —
+	// doesn't wedge the packer indefinitely. After this fires, the
+	// batch fails, wires stay in the pending dir (PendingPath !=
+	// "" branch below skips DeletePending on err), and the next
+	// daemon startup or retry picks them up. 5 min is generous
+	// enough to ride through normal network glitches.
+	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancelUpload()
 	//
 	// Snapshot the assembled body via bytes.NewReader so the size
 	// log line below stays meaningful AFTER UploadDocument's
@@ -251,7 +267,7 @@ func (p *Packer) flush() {
 	// the bytes.Buffer was drained.
 	blobBytes := buf.Bytes()
 	blobSize := len(blobBytes)
-	msgID, err := p.uploader.UploadDocument(context.Background(), bytes.NewReader(blobBytes), name, "")
+	msgID, err := p.uploader.UploadDocument(uploadCtx, bytes.NewReader(blobBytes), name, "")
 	if err != nil {
 		metrics.UploadErrors.Inc()
 		fmt.Fprintf(os.Stderr, "[packer] upload (%d chunks, %d bytes): %v\n", len(batch), blobSize, err)
@@ -281,6 +297,12 @@ func (p *Packer) flush() {
 			r.result <- packResult{err: fmt.Errorf("packer put_chunk: %w", err)}
 			close(r.result)
 			continue
+		}
+		// chunk_map row landed — safe to drop the on-disk staging
+		// copy. Leaving it would re-upload on next startup (which
+		// would orphan the just-landed message on the channel).
+		if r.pendingPath != "" {
+			_ = DeletePending(r.pendingPath)
 		}
 		r.result <- packResult{msgID: int64(msgID), packOff: offsets[i]}
 		close(r.result)

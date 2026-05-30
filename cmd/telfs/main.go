@@ -529,6 +529,18 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// any single handle. Drained at unmount before tearing down
 		// the gotd session.
 		pool := chunk.NewUploadPool(chunk.DefaultUploadConcurrency)
+		// Pending staging dir lives under the cache root; the upload
+		// pool carries the path so Writer.uploadOne can persist
+		// wires before dispatch and Packer.flush can clean them up
+		// after PutChunk lands. A SIGKILL between dispatch and
+		// PutChunk leaves the wire on disk; cmdMount's pre-mount
+		// recovery (below) re-submits it on next startup.
+		pendingDir, err := chunk.EnsurePendingDir(cache.Dir())
+		if err != nil {
+			return err
+		}
+		chunk.CleanupPendingTmp(pendingDir)
+		pool.PendingDir = pendingDir
 		reader := chunk.NewReader(metaStore, cache, pool.Pending, chunkSize)
 		// Small-file packer: aggregates chunks smaller than
 		// chunk.DefaultPackThreshold into shared TG blobs to amortize
@@ -617,6 +629,18 @@ func cmdMount(signalCtx context.Context, args []string) error {
 				}, trash.DefaultGCInterval)
 		}
 
+		// Pending-uploads recovery: a previous daemon may have left
+		// wires on disk between PersistPending and Packer.flush's
+		// DeletePending (e.g., killed mid-upload). Read each one and
+		// re-submit via the packer; on success the file is removed
+		// the normal way. Done after the snapshot manager + journal
+		// poster start so any in-flight startup work isn't blocked,
+		// and runs in a goroutine so a large pending dir doesn't
+		// delay the "Mounted at" line. Errors are logged but not
+		// fatal — they don't break the mount, just leave staged
+		// wires for the next attempt.
+		go recoverPending(sessCtx, pendingDir, packer)
+
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		<-signalCtx.Done()
 
@@ -695,6 +719,46 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return nil
 	}
 	return err
+}
+
+// recoverPending scans the pending-uploads directory and submits any
+// staged wires back to the packer. Each entry corresponds to a chunk
+// whose previous daemon process died between PersistPending and the
+// packer's chunk_map write — without this, those bytes would be
+// silently dropped (the kernel page cache is gone after unmount).
+//
+// Runs in a goroutine so it doesn't delay the "Mounted at" message.
+// Errors from individual entries are logged but don't abort the
+// recovery — leftover entries will be retried on the next startup.
+func recoverPending(ctx context.Context, dir string, packer *chunk.Packer) {
+	entries, err := chunk.ScanPending(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pending: scan:", err)
+		return
+	}
+	if len(entries) == 0 {
+		return
+	}
+	fmt.Printf("Recovering %d pending upload(s) from %s…\n", len(entries), dir)
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		wire, err := os.ReadFile(e.Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "pending: read %s: %v\n", e.Path, err)
+			continue
+		}
+		// Submit blocks only on enqueue. The packer's flusher
+		// processes the batch normally; on success it deletes the
+		// pending file. We discard the result chan — fire-and-
+		// forget is appropriate since this code path is background
+		// recovery and the packer already logs flush errors to
+		// stderr; a failed retry leaves the pending file in place
+		// for the NEXT startup scan to retry again.
+		ch := packer.Submit(e.Ino, e.Idx, e.PlaintextSize, wire, e.Path)
+		go func() { <-ch }()
+	}
 }
 
 // armForceExit installs a signal handler that force-exits the process
