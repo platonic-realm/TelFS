@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"telfs/internal/compress"
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
 )
@@ -109,7 +110,7 @@ func setupWriter(t *testing.T, chunkSize int64) (*Writer, *meta.Store, *fakeUplo
 	}
 	up := newFakeUploader()
 	cache := newTestCache(t, writerFetcher{uploader: up})
-	w, err := NewWriter(ctx, m, cache, up, nil, nil, ino, chunkSize, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, nil, ino, chunkSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +473,7 @@ func TestDedupReusesIdenticalContent(t *testing.T) {
 	payload := []byte("the same content twice")
 
 	// Write to ino1 → first upload.
-	w1, err := NewWriter(ctx, m, cache, up, nil, nil, ino1, 1024, 0)
+	w1, err := NewWriter(ctx, m, cache, up, nil, nil, nil, ino1, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +489,7 @@ func TestDedupReusesIdenticalContent(t *testing.T) {
 	}
 
 	// Write IDENTICAL content to ino2 → must reuse, no new upload.
-	w2, err := NewWriter(ctx, m, cache, up, nil, nil, ino2, 1024, 0)
+	w2, err := NewWriter(ctx, m, cache, up, nil, nil, nil, ino2, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +535,7 @@ func TestDedupSkippedWhenEncrypted(t *testing.T) {
 
 	payload := []byte("encrypted content")
 	for _, ino := range []int64{ino1, ino2} {
-		w, err := NewWriter(ctx, m, cache, up, cipher, nil, ino, 1024, 0)
+		w, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, ino, 1024, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -581,7 +582,7 @@ func TestDedupWithConvergentCipher(t *testing.T) {
 	payload := []byte("identical plaintext under convergent v3 — dedup must collapse")
 
 	// Write payload to ino1 via convergent cipher.
-	w1, err := NewWriter(ctx, m, cache, up, cipher, nil, ino1, 1024, 0)
+	w1, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, ino1, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +600,7 @@ func TestDedupWithConvergentCipher(t *testing.T) {
 	// Write IDENTICAL payload to ino2 — dedup MUST kick in (zero new
 	// uploads) because the convergent cipher produces the same
 	// ciphertext bytes.
-	w2, err := NewWriter(ctx, m, cache, up, cipher, nil, ino2, 1024, 0)
+	w2, err := NewWriter(ctx, m, cache, up, cipher, nil, nil, ino2, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,7 +710,7 @@ func TestFlushIsAsync(t *testing.T) {
 	up := newSlowUploader()
 	cache := newTestCache(t, slowFetcher{up: up})
 	pool := NewUploadPool(4)
-	w, err := NewWriter(ctx, m, cache, up, nil, pool, ino, 10, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, pool, ino, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +768,7 @@ func TestReadAfterAsyncCloseWaits(t *testing.T) {
 	up := newSlowUploader()
 	cache := newTestCache(t, slowFetcher{up: up})
 	pool := NewUploadPool(4)
-	w, err := NewWriter(ctx, m, cache, up, nil, pool, ino, 10, 0)
+	w, err := NewWriter(ctx, m, cache, up, nil, nil, pool, ino, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,11 +819,11 @@ func TestPoolGlobalConcurrency(t *testing.T) {
 	up := newSlowUploader()
 	cache := newTestCache(t, slowFetcher{up: up})
 	pool := NewUploadPool(1) // only one upload at a time globally
-	w1, err := NewWriter(ctx, m, cache, up, nil, pool, ino1, 10, 0)
+	w1, err := NewWriter(ctx, m, cache, up, nil, nil, pool, ino1, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	w2, err := NewWriter(ctx, m, cache, up, nil, pool, ino2, 10, 0)
+	w2, err := NewWriter(ctx, m, cache, up, nil, nil, pool, ino2, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -852,5 +853,64 @@ func TestPoolGlobalConcurrency(t *testing.T) {
 	defer cancel()
 	if !pool.Drain(drainCtx) {
 		t.Fatal("pool drain timed out")
+	}
+}
+
+// TestCompressionRoundTrip exercises the full plaintext → compress →
+// encrypt → upload → fetch → decrypt → decompress → plaintext pipeline.
+// The on-wire bytes (what the fakeUploader saw) must DIFFER from the
+// plaintext — otherwise compression isn't engaged — while the reader
+// returns the original payload byte-perfect.
+func TestCompressionRoundTrip(t *testing.T) {
+	codec, err := compress.New(compress.NameZstd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestMeta(t)
+	ctx := context.Background()
+	ino, err := m.CreateChild(ctx, meta.RootIno, "f", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := newFakeUploader()
+	// Cache must know the codec too, otherwise it can't decompress
+	// what the writer compressed.
+	dir := t.TempDir()
+	cache, err := NewCache(dir, 1<<20, writerFetcher{uploader: up}, nil, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWriter(ctx, m, cache, up, nil, codec, nil, ino, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Highly compressible payload so size diff is unambiguous.
+	payload := bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog "), 64)
+	if _, err := w.WriteAt(ctx, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	chunks, _ := m.ListChunks(ctx, ino)
+	if len(chunks) != 1 {
+		t.Fatalf("want 1 chunk, got %d", len(chunks))
+	}
+	uploaded, _ := up.get(int(chunks[0].TGMessageID))
+	if bytes.Equal(uploaded.data, payload) {
+		t.Fatal("on-wire bytes equal plaintext — codec wasn't engaged")
+	}
+	if len(uploaded.data) >= len(payload)/2 {
+		t.Fatalf("on-wire %d B vs plaintext %d B — zstd should compress this >2x", len(uploaded.data), len(payload))
+	}
+	// Reader path — must round-trip to plaintext.
+	r := NewReader(m, cache, nil, 4096)
+	dest := make([]byte, len(payload))
+	n, err := r.ReadAt(ctx, ino, dest, 0)
+	if err != nil || n != len(payload) {
+		t.Fatalf("ReadAt: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(dest, payload) {
+		t.Fatal("read-back differs from original plaintext")
 	}
 }

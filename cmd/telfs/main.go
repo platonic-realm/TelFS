@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"telfs/internal/chunk"
+	"telfs/internal/compress"
 	"telfs/internal/config"
 	"telfs/internal/crypto"
 	telfsfs "telfs/internal/fs"
@@ -317,8 +318,9 @@ func cmdChannelPing(ctx context.Context, cfg *config.Config) error {
 func cmdInit(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	chunkSize := fs.Int64("chunk-size", meta.DefaultChunkSize, "chunk size in bytes (power of 2, 64KiB..1.5GiB)")
+	compression := fs.String("compression", "", "chunk-payload compression codec: none, zstd. Empty leaves existing setting unchanged.")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: telfs init [--chunk-size BYTES]")
+		fmt.Fprintln(os.Stderr, "usage: telfs init [--chunk-size BYTES] [--compression CODEC]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -338,27 +340,51 @@ func cmdInit(ctx context.Context, args []string) error {
 	}
 	defer metaStore.Close()
 
-	current, err := metaStore.ChunkSize(ctx)
-	if err != nil {
-		return err
-	}
-	if current == *chunkSize {
-		fmt.Printf("chunk_size already set to %d bytes (%s). No change.\n", current, humanBytes(current))
-		return nil
-	}
 	refs, err := metaStore.AllChunkMessageIDs(ctx)
 	if err != nil {
 		return err
 	}
-	if len(refs) > 0 {
-		return fmt.Errorf("init: refuses to change chunk_size from %d to %d while %d chunk(s) exist; "+
-			"start a fresh TelFS instance with a new channel to use a different chunk size",
-			current, *chunkSize, len(refs))
-	}
-	if err := metaStore.SetChunkSize(ctx, *chunkSize); err != nil {
+
+	current, err := metaStore.ChunkSize(ctx)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("chunk_size set to %d bytes (%s)\n", *chunkSize, humanBytes(*chunkSize))
+	if current != *chunkSize {
+		if len(refs) > 0 {
+			return fmt.Errorf("init: refuses to change chunk_size from %d to %d while %d chunk(s) exist; "+
+				"start a fresh TelFS instance with a new channel to use a different chunk size",
+				current, *chunkSize, len(refs))
+		}
+		if err := metaStore.SetChunkSize(ctx, *chunkSize); err != nil {
+			return err
+		}
+		fmt.Printf("chunk_size set to %d bytes (%s)\n", *chunkSize, humanBytes(*chunkSize))
+	} else {
+		fmt.Printf("chunk_size already set to %d bytes (%s). No change.\n", current, humanBytes(current))
+	}
+
+	if *compression != "" {
+		if _, err := compress.New(*compression); err != nil {
+			return err
+		}
+		currentCodec, err := metaStore.CompressionCodec(ctx)
+		if err != nil {
+			return err
+		}
+		if currentCodec == *compression {
+			fmt.Printf("compression already set to %q. No change.\n", currentCodec)
+		} else {
+			if len(refs) > 0 {
+				return fmt.Errorf("init: refuses to change compression from %q to %q while %d chunk(s) exist; "+
+					"start a fresh TelFS instance with a new channel to use a different codec",
+					currentCodec, *compression, len(refs))
+			}
+			if err := metaStore.SetCompressionCodec(ctx, *compression); err != nil {
+				return err
+			}
+			fmt.Printf("compression set to %q\n", *compression)
+		}
+	}
 	return nil
 }
 
@@ -458,6 +484,20 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return err
 	}
 
+	// Per-FS compression codec — was committed at `telfs init`.
+	// Default "none" for filesystems initialized before compression
+	// support. compress.New errors on an unknown name, so a binary
+	// older than the FS can't silently feed a no-op decompressor a
+	// zstd frame.
+	codecName, err := metaStore.CompressionCodec(signalCtx)
+	if err != nil {
+		return err
+	}
+	codec, err := compress.New(codecName)
+	if err != nil {
+		return err
+	}
+
 	// Trash safety-net. Bootstrap /.trash if enabled; the inode is
 	// passed to the FUSE backend so Unlink/Rmdir reroute into it. The
 	// GC goroutine is spawned inside RunSession below so its ctx ties
@@ -476,7 +516,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 
 	err = client.RunSession(context.Background(), func(sessCtx context.Context, sess *tg.Session) error {
 		fetcher := &chunk.TGFetcher{Session: sess}
-		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher, cipher)
+		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher, cipher, codec)
 		if err != nil {
 			return err
 		}
@@ -496,6 +536,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			Uploader:  sess,
 			Pool:      pool,
 			Cipher:    cipher,
+			Codec:     codec,
 			ChunkSize: chunkSize,
 			ReadOnly:  *readonly,
 			TrashIno:  trashIno,

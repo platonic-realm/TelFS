@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"telfs/internal/compress"
 	"telfs/internal/crypto"
 )
 
@@ -48,11 +49,17 @@ type entry struct {
 //
 // Safe for concurrent use. The LRU mutation is serialized by mu; the disk
 // I/O happens outside the lock so a slow fetch doesn't block readers.
+//
+// The cache holds PLAINTEXT bytes on disk and in returns from Get. On a
+// miss, the upstream Fetcher returns ciphertext; Cache decrypts and
+// decompresses (in that order — compression happens before encryption
+// on the write side) before persisting, so cache hits skip both costs.
 type Cache struct {
-	dir      string
-	capBytes int64
-	fetcher  Fetcher
-	cipher   crypto.Cipher // never nil; defaults to NoopCipher
+	dir       string
+	capBytes  int64
+	fetcher   Fetcher
+	cipher    crypto.Cipher    // never nil; defaults to NoopCipher
+	codec     compress.Codec   // never nil; defaults to compress.None
 
 	mu        sync.Mutex
 	entries   map[Key]*entry
@@ -68,16 +75,20 @@ type Cache struct {
 // because we can't recover the original access order; chunks fetched
 // after startup move to MRU normally.
 //
-// cipher may be nil — in that case we wire NoopCipher and the cache
-// stores raw bytes. When non-nil, the Cache assumes the upstream
-// Fetcher returns CIPHERTEXT and the cache stores PLAINTEXT (so reads
-// don't pay decrypt cost on cache hits).
-func NewCache(dir string, capBytes int64, fetcher Fetcher, cipher crypto.Cipher) (*Cache, error) {
+// cipher and codec may be nil — defaults are NoopCipher (raw bytes
+// on the wire) and compress.None (no compression). When set, the
+// upstream Fetcher returns ciphertext; the Cache decrypts then
+// decompresses before persisting plaintext, so cache hits skip both
+// costs.
+func NewCache(dir string, capBytes int64, fetcher Fetcher, cipher crypto.Cipher, codec compress.Codec) (*Cache, error) {
 	if capBytes <= 0 {
 		capBytes = DefaultCacheCapBytes
 	}
 	if cipher == nil {
 		cipher = crypto.NoopCipher{}
+	}
+	if codec == nil {
+		codec = compress.None{}
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("chunk: mkdir cache %s: %w", dir, err)
@@ -87,6 +98,7 @@ func NewCache(dir string, capBytes int64, fetcher Fetcher, cipher crypto.Cipher)
 		capBytes: capBytes,
 		fetcher:  fetcher,
 		cipher:   cipher,
+		codec:    codec,
 		entries:  make(map[Key]*entry),
 		order:    list.New(),
 	}
@@ -151,15 +163,22 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64) ([]byte, er
 
 	// Miss path: fetch outside the lock. Fetcher returns the bytes
 	// stored in TG (ciphertext if encryption is enabled, plaintext
-	// otherwise). We decrypt before storing so cache hits skip the
-	// decrypt cost.
+	// otherwise). Inverse of the write-side pipeline:
+	//
+	//   wire ── decrypt ──▶ compressed ── decompress ──▶ plaintext
+	//
+	// We persist plaintext so cache hits skip both costs.
 	ciphertext, err := c.fetcher.Fetch(ctx, key, tgMessageID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
 	}
-	data, err := c.cipher.Open(key.Ino, key.Idx, ciphertext)
+	compressed, err := c.cipher.Open(key.Ino, key.Idx, ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt chunk %d/%d: %w", key.Ino, key.Idx, err)
+	}
+	data, err := c.codec.Decompress(compressed)
+	if err != nil {
+		return nil, fmt.Errorf("decompress chunk %d/%d: %w", key.Ino, key.Idx, err)
 	}
 	// Persist to disk, then insert into the LRU.
 	path := filepath.Join(c.dir, key.fileName())

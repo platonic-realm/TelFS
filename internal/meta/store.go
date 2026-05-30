@@ -162,6 +162,14 @@ const (
 	MaxChunkSize int64 = 1536 << 20 // 1.5 GiB
 )
 
+// KVCompressionCodec records the per-FS chunk-payload compression
+// codec ("none" or "zstd"). IMMUTABLE once chunks exist — a reader
+// that switches codecs mid-FS would feed a zstd frame to a no-op
+// decompressor (or vice versa) and shred every chunk. `telfs init`
+// is the only setter; the writer refuses to change it when
+// chunk_map is non-empty.
+const KVCompressionCodec = "compression_codec"
+
 // Trash safety-net KV keys. When KVTrashEnabled is set to "1", every
 // kernel-issued unlink/rmdir from FUSE is rerouted to a top-level
 // `.trash/` directory; a TTL GC unlinks them for real after
@@ -260,6 +268,31 @@ func (s *Store) SetChunkSize(ctx context.Context, n int64) error {
 		return err
 	}
 	return s.PutKV(ctx, KVChunkSize, []byte(strconv.FormatInt(n, 10)))
+}
+
+// CompressionCodec returns the per-FS chunk-payload compression
+// codec name ("none" or "zstd"). Returns "none" when the kv is
+// missing — that's how legacy filesystems (pre-compression support)
+// report through the same API.
+func (s *Store) CompressionCodec(ctx context.Context) (string, error) {
+	v, err := s.GetKV(ctx, KVCompressionCodec)
+	if errors.Is(err, ErrNotFound) {
+		return "none", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(v), nil
+}
+
+// SetCompressionCodec writes the codec kv. Caller is responsible for
+// refusing the change when chunks already exist — switching codecs
+// mid-FS would shred every chunk written under the old one.
+func (s *Store) SetCompressionCodec(ctx context.Context, name string) error {
+	if name != "none" && name != "zstd" {
+		return fmt.Errorf("meta: unknown compression codec %q (want none or zstd)", name)
+	}
+	return s.PutKV(ctx, KVCompressionCodec, []byte(name))
 }
 
 // TrashEnabled reports whether the trash safety-net is active for this

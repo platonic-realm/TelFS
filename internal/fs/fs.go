@@ -10,6 +10,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"telfs/internal/chunk"
+	"telfs/internal/compress"
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
 	"telfs/internal/trash"
@@ -27,6 +28,7 @@ type Backend struct {
 	Uploader  chunk.Uploader
 	Pool      *chunk.UploadPool // backend-global upload concurrency + per-ino R-A-W barrier
 	Cipher    crypto.Cipher     // nil → NoopCipher (plaintext mode)
+	Codec     compress.Codec    // nil → compress.None (no compression)
 	ChunkSize int64
 	ReadOnly  bool
 
@@ -200,7 +202,7 @@ func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
 	if !n.backend.canWrite() {
 		return syscall.EROFS
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Pool, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -252,7 +254,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 		}
 		return nil, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Pool, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
@@ -310,7 +312,7 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 		return nil, nil, 0, syscall.EIO
 	}
 	childInode := n.newChildInode(ctx, child)
-	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Pool, ino, n.backend.chunkSize(), 0)
+	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, ino, n.backend.chunkSize(), 0)
 	if werr != nil {
 		return nil, nil, 0, syscall.EIO
 	}

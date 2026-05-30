@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 
+	"telfs/internal/compress"
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
 )
@@ -72,7 +73,8 @@ type Writer struct {
 	meta     *meta.Store
 	cache    *Cache
 	uploader Uploader
-	cipher   crypto.Cipher // never nil; defaults to NoopCipher
+	cipher   crypto.Cipher  // never nil; defaults to NoopCipher
+	codec    compress.Codec // never nil; defaults to None
 	pool     *UploadPool
 	chunkSz  int64
 	dirtyCap int64
@@ -104,15 +106,16 @@ type dirtyChunk struct {
 
 // NewWriter constructs a Writer for an open file handle. chunkSize and
 // dirtyCap may be zero, in which case the package defaults apply. If
-// cipher is nil, NoopCipher is used (plaintext on the wire). pool may
-// also be nil — in that case a single-handle pool is created on the
-// fly, useful for transient writers (truncate-without-handle, tests).
+// cipher is nil, NoopCipher is used (plaintext on the wire). If codec
+// is nil, compress.None is used (no compression). pool may also be
+// nil — in that case a single-handle pool is created on the fly,
+// useful for transient writers (truncate-without-handle, tests).
 //
 // New blocks on the pool's per-ino Pending barrier before reading the
 // initial size from meta, so a freshly-opened writer sees the size that
 // previously-detached writers committed via SetSize even if their
 // chunk uploads are still in flight.
-func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher crypto.Cipher, pool *UploadPool, ino int64, chunkSize, dirtyCap int64) (*Writer, error) {
+func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher crypto.Cipher, codec compress.Codec, pool *UploadPool, ino int64, chunkSize, dirtyCap int64) (*Writer, error) {
 	if chunkSize <= 0 {
 		chunkSize = ChunkSize
 	}
@@ -121,6 +124,9 @@ func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher 
 	}
 	if cipher == nil {
 		cipher = crypto.NoopCipher{}
+	}
+	if codec == nil {
+		codec = compress.None{}
 	}
 	if pool == nil {
 		pool = NewUploadPool(DefaultUploadConcurrency)
@@ -137,6 +143,7 @@ func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher 
 		cache:     c,
 		uploader:  u,
 		cipher:    cipher,
+		codec:     codec,
 		pool:      pool,
 		chunkSz:   chunkSize,
 		dirtyCap:  dirtyCap,
@@ -621,7 +628,19 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		}
 	}
 
-	wire, err := w.cipher.Seal(w.ino, idx, dc.data)
+	// Pipeline: plaintext → compress → encrypt → wire. Compress before
+	// encrypt because (a) ciphertext is high-entropy and would defeat
+	// the compressor, (b) modern zstd is faster than AES-GCM so the
+	// order saves wall-clock too. The chunk_blob dedup hash is over
+	// PLAINTEXT (above), so switching codecs in a fresh FS doesn't
+	// fragment the dedup index.
+	compressed, err := w.codec.Compress(dc.data)
+	if err != nil {
+		restore = true
+		w.recordError(fmt.Errorf("compress chunk %d: %w", idx, err))
+		return
+	}
+	wire, err := w.cipher.Seal(w.ino, idx, compressed)
 	if err != nil {
 		restore = true
 		w.recordError(fmt.Errorf("encrypt chunk %d: %w", idx, err))

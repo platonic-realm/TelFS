@@ -68,7 +68,7 @@ func newTestMeta(t *testing.T) *meta.Store {
 
 func newTestCache(t *testing.T, fetcher Fetcher) *Cache {
 	t.Helper()
-	c, err := NewCache(filepath.Join(t.TempDir(), "cache"), 100<<10, fetcher, nil)
+	c, err := NewCache(filepath.Join(t.TempDir(), "cache"), 100<<10, fetcher, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestCacheAdoptsExistingFilesOnRestart(t *testing.T) {
 	m := newTestMeta(t)
 	ino, ff := seedFile(t, m, "x", [][]byte{[]byte("HelloWorld")}, 1)
 	dir := t.TempDir()
-	cache1, err := NewCache(dir, 100<<10, ff, nil)
+	cache1, err := NewCache(dir, 100<<10, ff, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestCacheAdoptsExistingFilesOnRestart(t *testing.T) {
 		t.Fatalf("warm-up fetch count = %d, want 1", ff.calls.Load())
 	}
 	// Simulate restart: spin up a fresh cache on the same dir.
-	cache2, err := NewCache(dir, 100<<10, ff, nil)
+	cache2, err := NewCache(dir, 100<<10, ff, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
