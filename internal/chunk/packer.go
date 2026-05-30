@@ -12,12 +12,24 @@ import (
 	"telfs/internal/metrics"
 )
 
-// DefaultPackThreshold is the chunk-payload size below which the
-// backend's Packer aggregates instead of uploading directly.
-// 256 KiB is one-sixteenth of the standard 4 MiB chunk; below this
-// the per-message RTT dominates the actual data cost (a 1 KiB file
-// pays the same 300-700 ms RTT as a 4 MiB file when uploaded alone).
-const DefaultPackThreshold int32 = 256 << 10
+// DefaultPackThreshold is the chunk-payload size at-or-below which
+// chunks are aggregated by the Packer instead of each getting their
+// own TG message. Set high enough to capture full-size chunks too —
+// a 1.5 GB file at the default 4 MiB chunk size is 384 chunks, which
+// would land as 384 TG messages without packing. With packing at
+// this threshold, those 384 chunks coalesce into ~12 packed blobs
+// of 32 MiB each (DefaultPackTarget), which is the real intent of
+// the packer: reduce message count, not just amortize RTT for tiny
+// files. Ranged downloads in the read path (cache.go's RangedFetcher
+// dispatch) keep random access cheap regardless of how big the
+// shared blob ends up.
+//
+// The throughput trade-off: packed uploads serialize through one
+// flusher goroutine, so total wall-clock for a multi-GB write may
+// be longer than the previous 4-way-parallel pool path. The win is
+// that the channel ends up with O(file_size / pack_target) messages
+// instead of O(file_size / chunk_size).
+const DefaultPackThreshold int32 = 8 << 20
 
 // DefaultPackTarget is the soft cap on the bytes a single packed
 // blob upload will carry. 32 MiB is the sweet spot: large enough to
