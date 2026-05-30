@@ -26,6 +26,7 @@ import (
 type dashboardData struct {
 	CSRF      string
 	Flash     flashData
+	Path      string // layout uses this to highlight the active nav tab
 	Profile   string
 	DataDir   string
 	Channel   channelView
@@ -221,7 +222,7 @@ func atoiSafe(s string) int {
 }
 
 func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *http.Request) dashboardData {
-	d := dashboardData{
+	d := dashboardData{Path: r.URL.Path,
 		CSRF: s.state.EnsureCSRF(w, r),
 	}
 	kind, msg := ConsumeFlash(w, r)
@@ -479,6 +480,7 @@ func humanBytesTpl(n int64) string {
 type profilesListData struct {
 	CSRF     string
 	Flash    flashData
+	Path     string
 	Active   string
 	Profiles []string
 }
@@ -488,6 +490,7 @@ func (s *Server) profilesList(w http.ResponseWriter, r *http.Request) {
 	d := profilesListData{
 		CSRF:     s.state.EnsureCSRF(w, r),
 		Flash:    flashData{kind, msg},
+		Path:     r.URL.Path,
 		Active:   config.ActiveProfile(),
 		Profiles: listProfileNames(),
 	}
@@ -496,9 +499,14 @@ func (s *Server) profilesList(w http.ResponseWriter, r *http.Request) {
 
 // pageBase is what every full-page template needs from the layout.
 // Embedded in per-page data structs so we don't repeat ourselves.
+//
+// Path is the request's URL.Path used by the layout to highlight
+// the active nav tab. Using path rather than a per-page constant
+// keeps handlers from having to remember to set the tab name.
 type pageBase struct {
 	CSRF  string
 	Flash flashData
+	Path  string
 }
 
 func (s *Server) basePage(w http.ResponseWriter, r *http.Request) pageBase {
@@ -506,6 +514,7 @@ func (s *Server) basePage(w http.ResponseWriter, r *http.Request) pageBase {
 	return pageBase{
 		CSRF:  s.state.EnsureCSRF(w, r),
 		Flash: flashData{Kind: kind, Msg: msg},
+		Path:  r.URL.Path,
 	}
 }
 
@@ -551,6 +560,7 @@ func (s *Server) profilesCreate(w http.ResponseWriter, r *http.Request) {
 type profileShowData struct {
 	CSRF      string
 	Flash     flashData
+	Path      string
 	Name      string
 	Active    string
 	Dir       string
@@ -572,6 +582,7 @@ func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
 	}
 	d := profileShowData{
 		CSRF:   s.state.EnsureCSRF(w, r),
+		Path:   r.URL.Path,
 		Name:   name,
 		Active: config.ActiveProfile(),
 	}

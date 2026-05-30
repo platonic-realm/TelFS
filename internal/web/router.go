@@ -170,5 +170,23 @@ func tmplFuncs() template.FuncMap {
 			}
 			return fmt.Sprintf("%.2fs", float64(ms)/1000.0)
 		},
+		// activeNav returns "active" when the current request
+		// path matches the given nav tab prefix. Used by the
+		// layout to mark the selected tab via CSS class. Matches
+		// by prefix so /profiles/new and /profiles/<name> both
+		// highlight the "Profiles" tab.
+		"activeNav": func(currentPath, tabPath string) string {
+			if tabPath == "/" {
+				if currentPath == "/" {
+					return "active"
+				}
+				return ""
+			}
+			if currentPath == tabPath ||
+				(len(currentPath) > len(tabPath) && currentPath[:len(tabPath)] == tabPath && currentPath[len(tabPath)] == '/') {
+				return "active"
+			}
+			return ""
+		},
 	}
 }

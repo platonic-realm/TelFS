@@ -161,6 +161,15 @@ header nav a:hover {
   background: var(--bg-subtle);
   color: var(--fg);
 }
+header nav a.active {
+  background: var(--accent, #2563eb);
+  color: #ffffff;
+}
+header nav a.active:hover {
+  background: var(--accent, #2563eb);
+  color: #ffffff;
+  filter: brightness(0.95);
+}
 
 /* ─── main / footer ─────────────────────────────────────────────── */
 main {
