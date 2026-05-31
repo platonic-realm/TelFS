@@ -300,6 +300,10 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 	// explicitly encrypted OR has chunks already (so opting in later
 	// is no longer possible).
 	encryptionOK := d.Crypto.Enabled || hasChunksFor(cfg)
+	// Compression is OPTIONAL — same lock-after-first-chunk rule.
+	// "Done" means either non-default codec chosen OR chunks already
+	// exist (so the codec is now immutable).
+	compressionOK := compressionConfigured(cfg) || hasChunksFor(cfg)
 	// "Mount it" is done when THIS profile has written chunks — a
 	// reliable signal that the FS has been mounted at some point.
 	// (Checking active /proc/mounts entries is unreliable because
@@ -346,6 +350,16 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 			CTA:      "Set a passphrase",
 		},
 		{
+			Label:    "Pick a compression codec",
+			Done:     compressionOK,
+			Href:     "/compression",
+			Why:      "Default is none. Zstd saves bandwidth/storage on compressible data; the choice locks once chunks exist.",
+			Detail:   "Compression runs before encryption + upload. None keeps bytes as-is (zero CPU cost). Zstd usually pays for itself on logs, text, code, JSON, and uncompressed media; binary or already-compressed formats (JPEG/MP4/zip) get marginal-to-no win. The choice is recorded in meta_kv and becomes immutable as soon as the first chunk is written.",
+			Outcome:  "/compression reports the chosen codec; subsequent writes feed through it.",
+			Optional: true,
+			CTA:      "Choose a codec",
+		},
+		{
 			Label:   "Mount it",
 			Done:    mountedOK,
 			Href:    "/mount/new",
@@ -370,6 +384,24 @@ func fileExists(path string) bool {
 		return false
 	}
 	_, err := os.Stat(path)
+	return err == nil
+}
+
+// compressionConfigured reports whether the profile's DB has the
+// compression_codec kv set to a non-default value — i.e. the user has
+// made an explicit choice. "none" written explicitly still counts as
+// configured (matches the dashboard checklist semantics: any explicit
+// codec decision marks the step done).
+func compressionConfigured(cfg *config.Config) bool {
+	if cfg == nil || !fileExists(cfg.DBPath()) {
+		return false
+	}
+	m, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return false
+	}
+	defer m.Close()
+	_, err = m.GetKV(context.Background(), meta.KVCompressionCodec)
 	return err == nil
 }
 

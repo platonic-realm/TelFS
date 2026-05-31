@@ -1,31 +1,41 @@
 {{define "content"}}
 <h2>Dashboard</h2>
 
-{{if not .Setup.Complete}}
 <section class="card" id="setup-checklist">
-  <h3>Get started <small>— complete these to start using TelFS</small></h3>
-  <p><a href="/setup" class="btn primary">Open the guided setup →</a></p>
+  {{if .Setup.Complete}}
+    <h3>Setup &amp; configuration <small>— <span class="pill ok">all set</span> revisit any step below</small></h3>
+  {{else}}
+    <h3>Setup &amp; configuration <small>— complete these to start using TelFS</small></h3>
+    <p><a href="/setup" class="btn primary">Open the guided setup →</a></p>
+  {{end}}
   <ol class="plain">
     {{$nextSurfaced := false}}
     {{range .Setup.Steps}}
     <li class="setup-step">
       {{if .Done}}
         <span class="pill ok">done</span>
-        <span class="setup-label">{{.Label}}</span>
+        <a href="{{.Href}}" class="setup-label">{{.Label}}</a>
+        {{if .Optional}}<span class="pill muted">optional</span>{{end}}
       {{else if $nextSurfaced}}
         <span class="pill muted">pending</span>
-        <span class="setup-label">{{.Label}}</span>
+        <a href="{{.Href}}" class="setup-label">{{.Label}}</a>
+        {{if .Optional}}<span class="pill muted">optional</span>{{end}}
       {{else}}
         <span class="pill acc">next</span>
-        <a href="/setup" class="setup-label setup-next"><strong>{{.Label}}</strong></a>
+        <a href="{{.Href}}" class="setup-label setup-next"><strong>{{.Label}}</strong></a>
+        {{if .Optional}}<span class="pill muted">optional</span>{{end}}
         {{if .Why}}<div class="setup-why"><small>{{.Why}}</small></div>{{end}}
+        {{if .Detail}}<div class="setup-detail"><small>{{.Detail}}</small></div>{{end}}
+        <div class="setup-cta">
+          <a href="{{.Href}}" class="btn primary">{{if .CTA}}{{.CTA}}{{else}}Open this step{{end}} →</a>
+          <a href="/setup" class="btn muted">Use the full wizard</a>
+        </div>
         {{$nextSurfaced = true}}
       {{end}}
     </li>
     {{end}}
   </ol>
 </section>
-{{end}}
 
 <section class="card">
   <h3>Profile</h3>

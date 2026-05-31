@@ -488,6 +488,21 @@ ul.plain li:last-child { border-bottom: none; }
   margin-top: .15rem;
   color: var(--fg-muted);
 }
+.setup-detail {
+  flex-basis: 100%;
+  padding-left: 4.5rem;
+  margin-top: .25rem;
+  color: var(--fg-muted);
+  line-height: 1.45;
+}
+.setup-cta {
+  flex-basis: 100%;
+  padding-left: 4.5rem;
+  margin-top: .5rem;
+  display: flex;
+  gap: .5rem;
+  align-items: center;
+}
 
 /* ─── /setup wizard ──────────────────────────────────────────────── */
 ol.wizard-stepper {
