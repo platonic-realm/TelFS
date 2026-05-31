@@ -36,34 +36,14 @@
             <button type="submit" class="small">Save</button>
           </form>
         </details>
-        {{if .IsDir}}
-          <form method="post" action="/browse/delete" class="inline-form"
-                onsubmit="return confirm('Delete directory {{.Name}}/ — empty only. Cancel and use the “recursive” form below to wipe contents.');">
-            <input type="hidden" name="csrf" value="{{$.CSRF}}">
-            <input type="hidden" name="at" value="{{$.At}}">
-            <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
-            <button type="submit" class="small danger">Delete (empty)</button>
-          </form>
-          <details class="row-action">
-            <summary class="btn small danger">Delete (recursive)</summary>
-            <form method="post" action="/browse/delete" class="inline-form"
-                  onsubmit="return confirm('Recursively delete {{.Name}}/ AND every file inside? This cannot be undone.');">
-              <input type="hidden" name="csrf" value="{{$.CSRF}}">
-              <input type="hidden" name="at" value="{{$.At}}">
-              <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
-              <input type="hidden" name="recursive" value="1">
-              <button type="submit" class="small danger">Wipe {{.Name}}/</button>
-            </form>
-          </details>
-        {{else}}
-          <form method="post" action="/browse/delete" class="inline-form"
-                onsubmit="return confirm('Delete {{.Name}}?');">
-            <input type="hidden" name="csrf" value="{{$.CSRF}}">
-            <input type="hidden" name="at" value="{{$.At}}">
-            <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
-            <button type="submit" class="small danger">Delete</button>
-          </form>
-        {{end}}
+        <form method="post" action="/browse/delete" class="inline-form"
+              onsubmit="return confirm('{{if .IsDir}}Delete directory {{.Name}}/ and everything inside? This cannot be undone.{{else}}Delete {{.Name}}?{{end}}');">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="at" value="{{$.At}}">
+          <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
+          {{if .IsDir}}<input type="hidden" name="recursive" value="1">{{end}}
+          <button type="submit" class="small danger">Delete</button>
+        </form>
       </td>
     </tr>
     {{else}}
