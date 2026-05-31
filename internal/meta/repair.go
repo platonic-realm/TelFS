@@ -19,6 +19,90 @@ type RepairReport struct {
 	FirstGapAt int32 // first chunk_map idx that was missing
 }
 
+// ScanPartialFiles returns the list of candidate inodes that
+// RepairPartialFiles would touch, without modifying anything. Used by
+// the web UI to surface "would-repair" state before the user clicks
+// the repair button. The shape mirrors RepairReport but with the
+// fields the dry-run can derive cheaply.
+func (s *Store) ScanPartialFiles(ctx context.Context) ([]RepairReport, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ino FROM chunk_map
+		   GROUP BY ino
+		   HAVING MAX(idx) + 1 != COUNT(*)
+		   ORDER BY ino`)
+	if err != nil {
+		return nil, fmt.Errorf("scan partials: %w", err)
+	}
+	defer rows.Close()
+	var inos []int64
+	for rows.Next() {
+		var ino int64
+		if err := rows.Scan(&ino); err != nil {
+			return nil, err
+		}
+		inos = append(inos, ino)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []RepairReport
+	for _, ino := range inos {
+		chunkRows, err := s.db.QueryContext(ctx,
+			`SELECT idx, size FROM chunk_map WHERE ino = ? ORDER BY idx`, ino)
+		if err != nil {
+			return nil, fmt.Errorf("scan chunks for ino %d: %w", ino, err)
+		}
+		type chunkRow struct {
+			Idx  int32
+			Size int32
+		}
+		var chunks []chunkRow
+		for chunkRows.Next() {
+			var c chunkRow
+			if err := chunkRows.Scan(&c.Idx, &c.Size); err != nil {
+				chunkRows.Close()
+				return nil, err
+			}
+			chunks = append(chunks, c)
+		}
+		chunkRows.Close()
+		if len(chunks) == 0 {
+			continue
+		}
+		firstGap := int32(-1)
+		for i, c := range chunks {
+			if c.Idx != int32(i) {
+				firstGap = int32(i)
+				break
+			}
+		}
+		if firstGap < 0 {
+			continue
+		}
+		var newSize int64
+		for _, c := range chunks[:firstGap] {
+			newSize += int64(c.Size)
+		}
+		var oldSize int64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT size FROM inodes WHERE ino = ?`, ino).Scan(&oldSize); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, RepairReport{
+			Ino:        ino,
+			OldSize:    oldSize,
+			NewSize:    newSize,
+			OldChunks:  len(chunks),
+			NewChunks:  int(firstGap),
+			FirstGapAt: firstGap,
+		})
+	}
+	return out, nil
+}
+
 // RepairPartialFiles scans every file inode for chunk_map
 // inconsistencies left by a previous daemon crash mid-write and
 // truncates the inode to its largest contiguous chunk prefix. Two

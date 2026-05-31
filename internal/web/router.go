@@ -66,6 +66,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /telegram", s.telegramPage)
 	s.mux.HandleFunc("GET /partials/telegram", s.telegramPartial)
 
+	// FS state + repair.
+	s.mux.HandleFunc("GET /state", s.stateShow)
+	s.mux.HandleFunc("POST /state/repair", s.stateRepair)
+
 	// Mount supervisor.
 	s.mux.HandleFunc("GET /mount", s.mountList)
 	s.mux.HandleFunc("GET /mount/new", s.mountNewForm)

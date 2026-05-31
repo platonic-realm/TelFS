@@ -1,0 +1,121 @@
+{{define "content"}}
+<h2>FS state</h2>
+
+<section class="card">
+  <h3>Profile</h3>
+  <dl>
+    <dt>Active</dt><dd><strong>{{.Profile}}</strong></dd>
+    <dt>Data dir</dt><dd><code>{{.DataDir}}</code></dd>
+    <dt>DB</dt><dd><code>{{.DBPath}}</code> — {{humanBytes .DBSize}}</dd>
+    <dt>Cache</dt><dd><code>{{.CachePath}}</code> — {{humanBytes .CacheSize}} across {{.CacheN}} file(s)</dd>
+    <dt>Pending wires</dt><dd>{{.PendingCount}} staged ({{humanBytes .PendingBytes}}) under <code>{{.PendingDir}}</code></dd>
+  </dl>
+</section>
+
+{{if not .HasMeta}}
+<section class="card">
+  <p><em>No metadata DB yet for this profile.</em></p>
+</section>
+{{else}}
+
+<section class="card">
+  <h3>Inodes</h3>
+  <dl>
+    <dt>total</dt><dd>{{.Stats.InodesTotal}}</dd>
+    <dt>files</dt><dd>{{.Stats.InodesFiles}}</dd>
+    <dt>dirs</dt><dd>{{.Stats.InodesDirs}}</dd>
+    <dt>symlinks</dt><dd>{{.Stats.InodesSymlinks}}</dd>
+  </dl>
+</section>
+
+<section class="card">
+  <h3>Chunks</h3>
+  <dl>
+    <dt>chunk_map rows</dt><dd>{{.Stats.ChunkRows}}</dd>
+    <dt>distinct (ino, idx)</dt><dd>{{.Stats.DistinctChunks}}</dd>
+    <dt>distinct TG messages</dt><dd>{{.Stats.DistinctTGMsgs}} <small>(packing → many chunks share a message)</small></dd>
+    <dt>total chunk bytes</dt><dd>{{humanBytes .Stats.TotalChunkBytes}}</dd>
+    <dt>chunk_blob dedup entries</dt><dd>{{.Stats.ChunkBlobs}} <small>(content-addressed dedup — plaintext only)</small></dd>
+  </dl>
+</section>
+
+<section class="card">
+  <h3>Journal &amp; snapshot</h3>
+  <dl>
+    <dt>journal rows</dt><dd>{{.Stats.JournalRows}}</dd>
+    <dt>unposted</dt><dd>
+      {{.Stats.JournalUnposted}}
+      {{if gt .Stats.JournalUnposted 0}}<span class="pill muted">queued for next batch</span>{{end}}
+    </dd>
+    <dt>highest seq</dt><dd>{{.Stats.LastJournalSeq}}</dd>
+    {{if gt .Stats.LastPostedAt 0}}<dt>last post</dt><dd>{{formatTime .Stats.LastPostedAt}}</dd>{{end}}
+    {{if .Stats.LastSnapshotMsgID}}<dt>last snapshot msg_id</dt><dd><code>{{.Stats.LastSnapshotMsgID}}</code></dd>{{end}}
+  </dl>
+</section>
+
+<section class="card" id="repair-card">
+  <h3>Repair</h3>
+  {{if .Partials}}
+    <p>Found <strong>{{len .Partials}}</strong> file(s) with non-contiguous chunk_map (gap from a daemon crash mid-upload). Each will be truncated to its largest contiguous prefix; tail TG messages become orphans for <code>telfs gc</code>.</p>
+    <table>
+      <thead>
+        <tr>
+          <th>ino</th>
+          <th>first gap</th>
+          <th>chunks before → after</th>
+          <th class="num">size before</th>
+          <th class="num">size after</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Partials}}
+        <tr>
+          <td><code>{{.Ino}}</code></td>
+          <td>idx {{.FirstGapAt}}</td>
+          <td>{{.OldChunks}} → {{.NewChunks}}</td>
+          <td class="num">{{humanBytes .OldSize}}</td>
+          <td class="num">{{humanBytes .NewSize}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  {{else}}
+    <p><span class="pill ok">clean</span> No partial-upload artifacts to repair. The scan covers every chunk_map row; if a daemon crashes mid-upload, the next startup pass will surface it here.</p>
+  {{end}}
+  {{if .MountActive}}
+    <p><strong>Heads up:</strong> a <code>fuse.telfs</code> mount is currently active on this host. Repair while writes are in flight can race with the daemon's own DB writes — stop the mount from the <a href="/mount">Mounts page</a> first when possible.</p>
+  {{end}}
+  <form method="post" action="/state/repair">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    {{if .MountActive}}
+      <label>
+        <input type="checkbox" name="force" value="1">
+        Run anyway (a mount is active — accept the risk).
+      </label>
+    {{end}}
+    <button type="submit" {{if not .Partials}}disabled{{end}}>Run repair</button>
+    <small>The startup pass also runs this automatically; this button lets you trigger it without remounting.</small>
+  </form>
+</section>
+
+<section class="card">
+  <h3>meta_kv <small>— raw keys and values</small></h3>
+  {{if .KV}}
+  <table>
+    <thead><tr><th>key</th><th>value</th><th class="num">bytes</th></tr></thead>
+    <tbody>
+      {{range .KV}}
+      <tr>
+        <td><code>{{.Key}}</code></td>
+        <td><code>{{.Value}}</code></td>
+        <td class="num">{{.Bytes}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+    <p><em>Empty.</em></p>
+  {{end}}
+</section>
+{{end}}
+{{end}}
