@@ -43,7 +43,19 @@ func Open(path string) (*Store, error) {
 	// SQLITE_BUSY to the caller — which under load surfaces as EIO
 	// to userspace (rm/tar). Plain "wait it out" is fine; SQLite is
 	// honest about busy and doesn't deadlock.
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(60000)"
+	//
+	// _txlock=immediate makes every BeginTx use BEGIN IMMEDIATE
+	// instead of the default DEFERRED. This is the critical knob for
+	// SQLITE_BUSY_SNAPSHOT (517) — a deferred transaction that reads
+	// before writing can have its snapshot invalidated by a
+	// concurrent writer, and busy_timeout DOES NOT retry on 517
+	// (only on plain SQLITE_BUSY / 5). With IMMEDIATE the writer
+	// grabs the write lock up front: concurrent writers wait at
+	// busy_timeout (which DOES handle that case), no snapshot
+	// invalidation ever happens, and 517 disappears. Read-only
+	// QueryContext calls outside of BeginTx are unaffected and stay
+	// parallel.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(60000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("meta: open %s: %w", path, err)
@@ -480,7 +492,14 @@ func firstLine(s string) string {
 // is a self-contained set of inserts/updates wrapped in BEGIN, and a
 // rolled-back tx leaves no observable state behind).
 func (s *Store) WithTx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
-	const txMaxAttempts = 5
+	// 10 attempts × exponential backoff (10ms → 2s cap) = up to ~10s
+	// of patience before surfacing SQLITE_BUSY. With _txlock=immediate
+	// in the DSN, SQLITE_BUSY_SNAPSHOT (517) shouldn't fire at all;
+	// this retry mainly absorbs the plain BUSY (5) that busy_timeout
+	// already handles internally, plus any edge cases where two
+	// writers race for the IMMEDIATE write-lock and lose under
+	// sustained contention.
+	const txMaxAttempts = 10
 	backoff := 10 * time.Millisecond
 	for attempt := 1; ; attempt++ {
 		err = s.withTxOnce(ctx, fn)
@@ -498,8 +517,8 @@ func (s *Store) WithTx(ctx context.Context, fn func(*sql.Tx) error) (err error) 
 		case <-time.After(backoff):
 		}
 		backoff *= 2
-		if backoff > 500*time.Millisecond {
-			backoff = 500 * time.Millisecond
+		if backoff > 2*time.Second {
+			backoff = 2 * time.Second
 		}
 	}
 }
