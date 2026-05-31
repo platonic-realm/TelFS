@@ -1,7 +1,6 @@
 package chunk
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -824,7 +823,7 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	}
 
 	name := fmt.Sprintf("ino%d-idx%d", w.ino, idx)
-	msgID, err := w.uploader.UploadDocument(ctx, bytes.NewReader(wire), name, "")
+	msgID, err := uploadWithRetry(ctx, w.uploader, wire, name, "")
 	if err != nil {
 		restore = true
 		metrics.UploadErrors.Inc()

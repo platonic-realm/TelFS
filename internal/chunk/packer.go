@@ -302,7 +302,7 @@ func (p *Packer) flush() {
 	// the bytes.Buffer was drained.
 	blobBytes := buf.Bytes()
 	blobSize := len(blobBytes)
-	msgID, err := p.uploader.UploadDocument(uploadCtx, bytes.NewReader(blobBytes), name, "")
+	msgID, err := uploadWithRetry(uploadCtx, p.uploader, blobBytes, name, "")
 	if err != nil {
 		metrics.UploadErrors.Inc()
 		fmt.Fprintf(os.Stderr, "[packer] upload (%d chunks, %d bytes): %v\n", len(batch), blobSize, err)
