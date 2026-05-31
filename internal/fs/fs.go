@@ -178,8 +178,9 @@ func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAt
 		t := mtime.Unix()
 		patch.Mtime = &t
 	}
+	mctx := metaCtx(ctx)
 	if patch.Mode != nil || patch.UID != nil || patch.GID != nil || patch.Mtime != nil {
-		if err := n.backend.Meta.SetAttrs(ctx, n.ino, patch); err != nil {
+		if err := n.backend.Meta.SetAttrs(mctx, n.ino, patch); err != nil {
 			return logMetaErr("Setattr.SetAttrs", n.ino, err)
 		}
 	}
@@ -188,15 +189,15 @@ func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAt
 		// dirty chunks). Otherwise mint a transient Writer for the
 		// truncate.
 		if h, ok := fh.(*fileHandle); ok && h != nil {
-			if err := h.writer.Truncate(ctx, int64(size)); err != nil {
+			if err := h.writer.Truncate(mctx, int64(size)); err != nil {
 				log.Printf("fs.Setattr.Truncate(ino=%d, size=%d): %v", n.ino, size, err)
 				return syscall.EIO
 			}
-		} else if errno := n.truncate(ctx, int64(size)); errno != 0 {
+		} else if errno := n.truncate(mctx, int64(size)); errno != 0 {
 			return errno
 		}
 	}
-	final, err := n.backend.Meta.GetInode(ctx, n.ino)
+	final, err := n.backend.Meta.GetInode(mctx, n.ino)
 	if err != nil {
 		return logMetaErr("Setattr.GetInode", n.ino, err)
 	}
@@ -311,22 +312,24 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 	if !n.backend.canWrite() {
 		return nil, nil, 0, syscall.EROFS
 	}
-	ino, err := n.backend.Meta.CreateChild(ctx, n.ino, name, meta.Inode{
+	mctx := metaCtx(ctx)
+	ino, err := n.backend.Meta.CreateChild(mctx, n.ino, name, meta.Inode{
 		Kind: meta.KindFile,
 		Mode: mode | uint32(syscall.S_IFREG),
 		UID:  callerUID(ctx),
 		GID:  callerGID(ctx),
 	})
 	if err != nil {
-		return nil, nil, 0, mapMetaErr(err)
+		return nil, nil, 0, logMetaErr("Create.CreateChild", n.ino, err)
 	}
-	child, err := n.backend.Meta.GetInode(ctx, ino)
+	child, err := n.backend.Meta.GetInode(mctx, ino)
 	if err != nil {
 		return nil, nil, 0, logMetaErr("Create.GetInode", ino, err)
 	}
 	childInode := n.newChildInode(ctx, child)
-	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, ino, n.backend.chunkSize(), 0)
+	w, werr := chunk.NewWriter(mctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, ino, n.backend.chunkSize(), 0)
 	if werr != nil {
+		log.Printf("fs.Create.NewWriter(ino=%d): %v", ino, werr)
 		return nil, nil, 0, syscall.EIO
 	}
 	h := &fileHandle{node: childInode.Operations().(*Node), writer: w}
@@ -339,18 +342,19 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	if errno := n.requireWrite(); errno != 0 {
 		return nil, errno
 	}
-	ino, err := n.backend.Meta.CreateChild(ctx, n.ino, name, meta.Inode{
+	mctx := metaCtx(ctx)
+	ino, err := n.backend.Meta.CreateChild(mctx, n.ino, name, meta.Inode{
 		Kind: meta.KindDir,
 		Mode: mode | uint32(syscall.S_IFDIR),
 		UID:  callerUID(ctx),
 		GID:  callerGID(ctx),
 	})
 	if err != nil {
-		return nil, mapMetaErr(err)
+		return nil, logMetaErr("Mkdir.CreateChild", n.ino, err)
 	}
-	child, err := n.backend.Meta.GetInode(ctx, ino)
+	child, err := n.backend.Meta.GetInode(mctx, ino)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, logMetaErr("Mkdir.GetInode", ino, err)
 	}
 	childInode := n.newChildInode(ctx, child)
 	fillAttr(&out.Attr, child)
@@ -362,7 +366,8 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 	if errno := n.requireWrite(); errno != 0 {
 		return nil, errno
 	}
-	ino, err := n.backend.Meta.CreateChild(ctx, n.ino, name, meta.Inode{
+	mctx := metaCtx(ctx)
+	ino, err := n.backend.Meta.CreateChild(mctx, n.ino, name, meta.Inode{
 		Kind:          meta.KindSymlink,
 		Mode:          0o777 | uint32(syscall.S_IFLNK),
 		SymlinkTarget: target,
@@ -370,11 +375,11 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 		GID:           callerGID(ctx),
 	})
 	if err != nil {
-		return nil, mapMetaErr(err)
+		return nil, logMetaErr("Symlink.CreateChild", n.ino, err)
 	}
-	child, err := n.backend.Meta.GetInode(ctx, ino)
+	child, err := n.backend.Meta.GetInode(mctx, ino)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, logMetaErr("Symlink.GetInode", ino, err)
 	}
 	childInode := n.newChildInode(ctx, child)
 	fillAttr(&out.Attr, child)
@@ -391,15 +396,16 @@ func (n *Node) Link(ctx context.Context, target gofuse.InodeEmbedder, name strin
 	if !ok {
 		return nil, syscall.EXDEV
 	}
-	if err := n.backend.Meta.Link(ctx, n.ino, name, tn.ino); err != nil {
+	mctx := metaCtx(ctx)
+	if err := n.backend.Meta.Link(mctx, n.ino, name, tn.ino); err != nil {
 		if errors.Is(err, meta.ErrIsDir) {
 			return nil, syscall.EPERM
 		}
-		return nil, mapMetaErr(err)
+		return nil, logMetaErr("Link.Link", n.ino, err)
 	}
-	in, err := n.backend.Meta.GetInode(ctx, tn.ino)
+	in, err := n.backend.Meta.GetInode(mctx, tn.ino)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, logMetaErr("Link.GetInode", tn.ino, err)
 	}
 	childInode := n.newChildInode(ctx, in)
 	fillAttr(&out.Attr, in)
@@ -423,17 +429,18 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if n.ino == meta.RootIno && in.Ino == n.backend.TrashIno {
 		return syscall.EPERM
 	}
+	mctx := metaCtx(ctx)
 	// Trash intercept: reroute the unlink to /.trash unless we're
 	// already inside /.trash (where unlinks really delete, so the GC
 	// and `telfs trash empty` can clean up).
 	if n.backend.TrashIno != 0 && n.ino != n.backend.TrashIno {
-		if err := trashRename(ctx, n.backend, n.ino, name); err != nil {
-			return mapMetaErr(err)
+		if err := trashRename(mctx, n.backend, n.ino, name); err != nil {
+			return logMetaErr("Unlink.trash", n.ino, err)
 		}
 		return 0
 	}
-	if err := n.backend.Meta.Unlink(ctx, n.ino, name); err != nil {
-		return mapMetaErr(err)
+	if err := n.backend.Meta.Unlink(mctx, n.ino, name); err != nil {
+		return logMetaErr("Unlink", n.ino, err)
 	}
 	return 0
 }
@@ -443,7 +450,8 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if errno := n.requireWrite(); errno != 0 {
 		return errno
 	}
-	in, err := n.backend.Meta.Lookup(ctx, n.ino, name)
+	mctx := metaCtx(ctx)
+	in, err := n.backend.Meta.Lookup(mctx, n.ino, name)
 	if err != nil {
 		return logMetaErr("Rmdir.lookup", n.ino, err)
 	}
@@ -461,13 +469,13 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	// files — a flat layout that's slightly less ergonomic than a
 	// preserved tree but bounded scope for v1.
 	if n.backend.TrashIno != 0 && n.ino != n.backend.TrashIno {
-		if err := trashRename(ctx, n.backend, n.ino, name); err != nil {
-			return mapMetaErr(err)
+		if err := trashRename(mctx, n.backend, n.ino, name); err != nil {
+			return logMetaErr("Rmdir.trash", n.ino, err)
 		}
 		return 0
 	}
-	if err := n.backend.Meta.Unlink(ctx, n.ino, name); err != nil {
-		return mapMetaErr(err)
+	if err := n.backend.Meta.Unlink(mctx, n.ino, name); err != nil {
+		return logMetaErr("Rmdir", n.ino, err)
 	}
 	return 0
 }
@@ -488,8 +496,8 @@ func (n *Node) Rename(ctx context.Context, oldName string, newParent gofuse.Inod
 	if !ok {
 		return syscall.EXDEV
 	}
-	if err := n.backend.Meta.Rename(ctx, n.ino, oldName, np.ino, newName); err != nil {
-		return mapMetaErr(err)
+	if err := n.backend.Meta.Rename(metaCtx(ctx), n.ino, oldName, np.ino, newName); err != nil {
+		return logMetaErr("Rename", n.ino, err)
 	}
 	return 0
 }
@@ -504,8 +512,8 @@ func (n *Node) Setxattr(ctx context.Context, attr string, data []byte, _ uint32)
 	if !isUserXattr(attr) {
 		return syscall.EOPNOTSUPP
 	}
-	if err := n.backend.Meta.SetXattr(ctx, n.ino, attr, data); err != nil {
-		return mapMetaErr(err)
+	if err := n.backend.Meta.SetXattr(metaCtx(ctx), n.ino, attr, data); err != nil {
+		return logMetaErr("Setxattr", n.ino, err)
 	}
 	return 0
 }
@@ -558,10 +566,11 @@ func (n *Node) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	if !isUserXattr(attr) {
 		return syscall.EOPNOTSUPP
 	}
-	if err := n.backend.Meta.RemoveXattr(ctx, n.ino, attr); err != nil {
+	if err := n.backend.Meta.RemoveXattr(metaCtx(ctx), n.ino, attr); err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			return syscall.ENODATA
 		}
+		log.Printf("fs.Removexattr(ino=%d, attr=%q): %v", n.ino, attr, err)
 		return syscall.EIO
 	}
 	return 0
@@ -625,6 +634,22 @@ func (b *Backend) chunkSize() int64 {
 		return b.ChunkSize
 	}
 	return chunk.ChunkSize
+}
+
+// metaCtx returns a context that inherits values from ctx but never
+// gets canceled. Use for meta-DB operations inside FUSE write
+// handlers (Create, Mkdir, Setattr, ...) where the kernel-issued
+// FUSE ctx has a short deadline and canceling a half-committed tx
+// would leave inconsistent state on disk (or surface EIO to
+// userspace right after CreateChild already wrote the row to
+// SQLite). The meta operations are local, fast (milliseconds), and
+// idempotent — letting them complete past a kernel timeout is
+// strictly safer than aborting them.
+//
+// Don't use for genuinely-cancellable ops like Read (TG fetch) where
+// cancellation saves real work.
+func metaCtx(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
 }
 
 // mapMetaErr translates meta.* sentinels into POSIX-shaped errnos.
