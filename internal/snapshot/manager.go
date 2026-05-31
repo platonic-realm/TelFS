@@ -18,6 +18,15 @@ import (
 // jump straight to the latest without scanning the channel.
 const KVCurrentMsgID = "snap_msg_id"
 
+// KVCurrentJournalSeq records the journal seq that was current at the
+// moment of the most recently posted snapshot. The cadence loop skips
+// a snapshot when LastJournalSeq() hasn't advanced past this value
+// (no mutations since last snap), saving an upload + a delete RPC +
+// snapshot-sized TG bandwidth per idle 5-minute tick. The key is also
+// the recovery anchor: replay any journal entries with seq > this
+// value.
+const KVCurrentJournalSeq = "snap_journal_seq"
+
 // DefaultInterval is how often the cadence goroutine snapshots.
 const DefaultInterval = 5 * time.Minute
 
@@ -89,7 +98,28 @@ func (m *Manager) Run(ctx context.Context) error {
 // under the FS key, upload, record new msg_id, and prune snapshots
 // older than the retention window so the channel doesn't accumulate
 // indefinitely.
+//
+// Skips the cycle entirely when the journal seq hasn't advanced
+// since the last snapshot — there's no new state to capture, so the
+// upload would be a verbatim copy of what's already on the channel.
+// First-ever snapshot (no KVCurrentJournalSeq yet) is never skipped.
 func (m *Manager) Once(ctx context.Context) error {
+	currentSeq, err := m.Meta.LastJournalSeq(ctx)
+	if err != nil {
+		return fmt.Errorf("read last journal seq: %w", err)
+	}
+	prevSeq, hadPrev, err := loadCurrentJournalSeq(ctx, m.Meta)
+	if err != nil {
+		return fmt.Errorf("read prev snap journal seq: %w", err)
+	}
+	if hadPrev && currentSeq == prevSeq {
+		logger := m.Logger
+		if logger == nil {
+			logger = log.Default()
+		}
+		logger.Printf("[snapshot] skipped: no new journal entries since seq %d", currentSeq)
+		return nil
+	}
 	snap, err := Take(ctx, m.Meta)
 	if err != nil {
 		return fmt.Errorf("take: %w", err)
@@ -118,6 +148,9 @@ func (m *Manager) Once(ctx context.Context) error {
 	}
 	if err := storeCurrentMsgID(ctx, m.Meta, newID); err != nil {
 		return fmt.Errorf("persist new snap msg_id: %w", err)
+	}
+	if err := storeCurrentJournalSeq(ctx, m.Meta, snap.JournalSeq); err != nil {
+		return fmt.Errorf("persist new snap journal seq: %w", err)
 	}
 	// Retention pruning: list every snapshot for this fs_uuid, keep the
 	// `retention` newest, delete the rest. Best-effort — if delete
@@ -181,6 +214,29 @@ func loadCurrentMsgID(ctx context.Context, m *meta.Store) (int, error) {
 
 func storeCurrentMsgID(ctx context.Context, m *meta.Store, id int) error {
 	return m.PutKV(ctx, KVCurrentMsgID, []byte(strconv.Itoa(id)))
+}
+
+// loadCurrentJournalSeq reads the journal seq captured by the most
+// recent snapshot. The second return value is false when no snapshot
+// has ever been taken on this FS (key missing), which the caller uses
+// to suppress the no-op skip on the first cycle.
+func loadCurrentJournalSeq(ctx context.Context, m *meta.Store) (int64, bool, error) {
+	v, err := m.GetKV(ctx, KVCurrentJournalSeq)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	seq, err := strconv.ParseInt(string(v), 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("malformed %s kv (%q): %w", KVCurrentJournalSeq, string(v), err)
+	}
+	return seq, true, nil
+}
+
+func storeCurrentJournalSeq(ctx context.Context, m *meta.Store, seq int64) error {
+	return m.PutKV(ctx, KVCurrentJournalSeq, []byte(strconv.FormatInt(seq, 10)))
 }
 
 // shouldEncrypt reports whether Once should encrypt the snapshot
