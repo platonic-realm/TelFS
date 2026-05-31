@@ -12,7 +12,7 @@
   </dl>
 </section>
 
-{{if and (not .Supervised) (not .External)}}
+{{if and (not .Mounts) (not .External)}}
 <section class="card">
   <h3>Active mounts</h3>
   <p><em>No fuse.telfs mounts on this host. <a href="/mount/new">Start one</a> to access files.</em></p>
@@ -22,16 +22,17 @@
   <h3>Active mounts</h3>
   <p><small>Stop a mount before running repair so the daemon doesn't race writes with us. Start it back up from the <a href="/mount/new">Mounts page</a> when repair is done.</small></p>
   <table>
-    <thead><tr><th>Mountpoint</th><th>Origin</th><th>Status</th><th class="actions">Actions</th></tr></thead>
+    <thead><tr><th>Mountpoint</th><th>Profile</th><th>Origin</th><th>Status</th><th class="actions">Actions</th></tr></thead>
     <tbody>
-      {{range .Supervised}}
+      {{range .Mounts}}
       <tr>
         <td><code>{{.Mountpoint}}</code></td>
-        <td><a href="/mount/{{.Profile}}">supervised: {{.Profile}}</a></td>
+        <td><a href="/mount/{{.Profile}}">{{.Profile}}</a></td>
+        <td><small>{{.Origin}}</small></td>
         <td><span class="pill ok">{{.Status}}</span></td>
         <td class="actions">
           <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline"
-                onsubmit="return confirm('Stop the supervised mount for {{.Profile}}?');">
+                onsubmit="return confirm('Stop the mount at {{.Mountpoint}}? Any process with open files there will see I/O errors.');">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
             <button type="submit" class="danger">Stop</button>
           </form>
@@ -41,7 +42,8 @@
       {{range .External}}
       <tr>
         <td><code>{{.}}</code></td>
-        <td><span class="pill muted">external</span></td>
+        <td><small>—</small></td>
+        <td><span class="pill muted">unidentified</span></td>
         <td><span class="pill muted">running</span></td>
         <td class="actions">
           <form method="post" action="/mount/unmount-external" style="display:inline"

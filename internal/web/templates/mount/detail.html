@@ -1,7 +1,7 @@
 {{define "content"}}
 <h2>Mount: {{.Profile}}</h2>
 {{if not .Found}}
-<p><em>No supervised mount for this profile.</em></p>
+<p><em>No mount tracked for this profile.</em></p>
 <div class="row">
   <a href="/mount" class="btn secondary">Back</a>
   <a href="/mount/new" class="btn">Start one</a>
@@ -10,11 +10,14 @@
 <section class="card">
   <dl>
     <dt>Mountpoint</dt><dd><code>{{.Mountpoint}}</code></dd>
-    <dt>Started</dt><dd><small>{{.Started}}</small></dd>
+    <dt>Origin</dt><dd><small>{{.Origin}}</small></dd>
+    {{if .Pid}}<dt>PID</dt><dd><code>{{.Pid}}</code></dd>{{end}}
+    <dt>Started</dt><dd><small>{{if .Started}}{{.Started}}{{else}}—{{end}}</small></dd>
     <dt>Status</dt><dd><code>{{.Status}}</code></dd>
   </dl>
   <div class="row">
-    <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline">
+    <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline"
+          onsubmit="return confirm('Stop this mount? Any process with open files there will see I/O errors.');">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <button type="submit" class="danger">Stop</button>
     </form>
@@ -25,9 +28,13 @@
 
 <section class="card">
   <h3>Live log <small>polled every 2 s — last 16 KB</small></h3>
-  <div id="log" hx-get="/mount/{{.Profile}}/log" hx-trigger="load, every 2s" hx-swap="innerHTML">
-    <em>loading…</em>
-  </div>
+  {{if .HasLog}}
+    <div id="log" hx-get="/mount/{{.Profile}}/log" hx-trigger="load, every 2s" hx-swap="innerHTML">
+      <em>loading…</em>
+    </div>
+  {{else}}
+    <p><em>No log available — the daemon's stdout doesn't point at a regular file. Web-supervised mounts have logs; CLI mounts only when started with stdout redirected to a file (<code>telfs mount … &gt; log.txt</code>).</em></p>
+  {{end}}
 </section>
 {{end}}
 {{end}}

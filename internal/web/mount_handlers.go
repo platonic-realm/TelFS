@@ -14,9 +14,9 @@ import (
 
 type mountListData struct {
 	pageBase
-	Supervised []mountRow
-	External   []string
-	Profiles   []string
+	Mounts   []mountRow
+	External []string // fuse.telfs entries with no findable daemon process
+	Profiles []string
 }
 
 type mountRow struct {
@@ -26,19 +26,37 @@ type mountRow struct {
 	StatusKind string // ok | err | muted — drives the .pill class
 	Started    string
 	AgeSeconds int64
+	Origin     string // "supervised" | "adopted (started outside this web)"
+	Pid        int
+	HasLog     bool // true when LogPath is non-empty — controls whether the detail page link is useful
 }
 
 func (s *Server) mountList(w http.ResponseWriter, r *http.Request) {
 	d := mountListData{pageBase: s.basePage(w, r)}
 	for _, mp := range s.sup.List() {
 		st := mp.Status()
-		d.Supervised = append(d.Supervised, mountRow{
+		origin := "supervised"
+		if mp.Adopted {
+			origin = "adopted (started outside this web)"
+		}
+		var started string
+		if !mp.Started.IsZero() {
+			started = mp.Started.Format(time.RFC3339)
+		}
+		var age int64
+		if !mp.Started.IsZero() {
+			age = int64(time.Since(mp.Started).Seconds())
+		}
+		d.Mounts = append(d.Mounts, mountRow{
 			Profile:    mp.Profile,
 			Mountpoint: mp.Mountpoint,
 			Status:     st,
 			StatusKind: statusPillKind(st),
-			Started:    mp.Started.Format(time.RFC3339),
-			AgeSeconds: int64(time.Since(mp.Started).Seconds()),
+			Started:    started,
+			AgeSeconds: age,
+			Origin:     origin,
+			Pid:        mp.Pid,
+			HasLog:     mp.LogPath != "",
 		})
 	}
 	d.External = s.sup.ExternalMounts()
@@ -162,6 +180,9 @@ type mountDetailData struct {
 	Mountpoint string
 	Status     string
 	Started    string
+	Origin     string
+	Pid        int
+	HasLog     bool
 	Found      bool
 }
 
@@ -172,7 +193,15 @@ func (s *Server) mountDetail(w http.ResponseWriter, r *http.Request) {
 		d.Found = true
 		d.Mountpoint = mp.Mountpoint
 		d.Status = mp.Status()
-		d.Started = mp.Started.Format(time.RFC3339)
+		if !mp.Started.IsZero() {
+			d.Started = mp.Started.Format(time.RFC3339)
+		}
+		d.Pid = mp.Pid
+		d.HasLog = mp.LogPath != ""
+		d.Origin = "supervised"
+		if mp.Adopted {
+			d.Origin = "adopted (started outside this web)"
+		}
 	}
 	s.renderTemplate(w, "mount/detail.html", d)
 }

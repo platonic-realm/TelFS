@@ -39,7 +39,7 @@ type stateShowData struct {
 	// happening can collide). Best-effort: /proc/mounts can't attribute
 	// mounts to specific profiles.
 	MountActive bool
-	Supervised  []stateMountRow
+	Mounts      []stateMountRow
 	External    []string
 
 	// Repair is the snapshot of the current/last RepairPartialFiles
@@ -48,12 +48,15 @@ type stateShowData struct {
 	Repair *repairRunSnapshot
 }
 
-// stateMountRow is a thin view of a supervised mount for the unmount
-// shortcut on /state — just enough to render a button.
+// stateMountRow is a thin view of one mount for the Stop shortcut
+// on /state — covers both web-supervised and CLI-adopted procs so
+// the user sees one unified list regardless of how the daemon was
+// started.
 type stateMountRow struct {
 	Profile    string
 	Mountpoint string
 	Status     string
+	Origin     string
 }
 
 func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
@@ -88,10 +91,15 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 	d.MountActive = len(activeMounts()) > 0
 	d.Repair = s.repair.Snapshot()
 	for _, mp := range s.sup.List() {
-		d.Supervised = append(d.Supervised, stateMountRow{
+		origin := "supervised"
+		if mp.Adopted {
+			origin = "adopted"
+		}
+		d.Mounts = append(d.Mounts, stateMountRow{
 			Profile:    mp.Profile,
 			Mountpoint: mp.Mountpoint,
 			Status:     mp.Status(),
+			Origin:     origin,
 		})
 	}
 	d.External = s.sup.ExternalMounts()

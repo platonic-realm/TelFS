@@ -16,22 +16,43 @@ import (
 	"telfs/internal/config"
 )
 
-// MountProcess describes one supervised `telfs mount` child.
+// MountProcess describes one telfs mount daemon. Two flavors:
+//
+//   - Supervised: started by this web server via Supervisor.Start.
+//     cmd != nil, exit is observed via cmd.Wait, log path is known
+//     up front (we created it). Adopted == false.
+//   - Adopted: discovered after the fact in /proc by AdoptExternal.
+//     cmd == nil, exit is observed by polling /proc/<pid>/status,
+//     log path is read from /proc/<pid>/fd/1 when it's a regular
+//     file. Adopted == true. The pid is set so Stop can signal it.
+//
+// Both shapes share the same Stop / TailLog / Status semantics so
+// the UI never needs to branch on origin — the user gets the same
+// controls whether they started the daemon from `telfs mount` or
+// from /mount/new in the browser.
 type MountProcess struct {
 	Profile    string
 	Mountpoint string
 	LogPath    string
 	Started    time.Time
+	Adopted    bool
+	Pid        int
 
 	cmd *exec.Cmd
-	// done closes when Wait() returns. While the process is alive,
-	// reading from done blocks. Used by Stop's timeout path.
+	// done closes when the process has been observed to exit. For
+	// supervised procs this happens in the goroutine that ran
+	// cmd.Wait. For adopted procs Status() lazily closes it the
+	// first time it sees the pid has died.
 	done chan struct{}
 	// exitErr captures the result of cmd.Wait(); read only after <-done.
+	// Always nil for adopted procs (we never reaped them).
 	exitErr error
 }
 
-// Status is the short label shown in the UI.
+// Status is the short label shown in the UI. For adopted procs
+// (cmd==nil) it lazily detects exit by signal-0 probing the pid,
+// closing m.done the first time we see the process is gone so
+// future calls are O(1).
 func (m *MountProcess) Status() string {
 	if m == nil {
 		return "stopped"
@@ -43,8 +64,16 @@ func (m *MountProcess) Status() string {
 		}
 		return "exited"
 	default:
-		return "running"
 	}
+	// Adopted procs: poll the pid. syscall.Kill(pid, 0) returns nil
+	// if the process is alive; errors otherwise. Cheap (one syscall).
+	if m.Adopted && m.Pid > 0 {
+		if err := syscall.Kill(m.Pid, 0); err != nil {
+			close(m.done)
+			return "exited"
+		}
+	}
+	return "running"
 }
 
 // Supervisor owns supervised mount children. One per profile — TelFS
@@ -78,15 +107,18 @@ func NewSupervisor(selfPath string) (*Supervisor, error) {
 	}, nil
 }
 
-// List returns a snapshot of supervised processes, sorted by profile.
+// List returns a snapshot of every mount the supervisor knows about
+// — supervised (started here) and adopted (discovered in /proc).
+// Reconciles first so CLI-started daemons that appeared since the
+// last call show up. Sorted by profile for stable template output.
 func (s *Supervisor) List() []*MountProcess {
+	s.Reconcile()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*MountProcess, 0, len(s.procs))
 	for _, p := range s.procs {
 		out = append(out, p)
 	}
-	// Stable order for templates.
 	for i := 0; i < len(out); i++ {
 		for j := i + 1; j < len(out); j++ {
 			if out[j].Profile < out[i].Profile {
@@ -97,8 +129,11 @@ func (s *Supervisor) List() []*MountProcess {
 	return out
 }
 
-// Get returns the supervised process for a profile, or nil.
+// Get returns the mount process for a profile, or nil. Reconciles
+// first so a CLI-started daemon whose TELFS_PROFILE matches is
+// findable by name.
 func (s *Supervisor) Get(profile string) *MountProcess {
+	s.Reconcile()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.procs[profile]
@@ -138,6 +173,11 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 		return nil, errors.New("mountpoint is required")
 	}
 
+	// Reconcile first so a CLI-started daemon under the same profile
+	// shows up as "already running" instead of getting clobbered by a
+	// duplicate spawn that would fight for the same FUSE channel.
+	s.Reconcile()
+
 	s.mu.Lock()
 	if existing := s.procs[opts.Profile]; existing != nil {
 		select {
@@ -146,7 +186,11 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 			delete(s.procs, opts.Profile)
 		default:
 			s.mu.Unlock()
-			return nil, fmt.Errorf("profile %q already has a supervised mount at %s", opts.Profile, existing.Mountpoint)
+			origin := "supervised"
+			if existing.Adopted {
+				origin = "adopted (started outside this web)"
+			}
+			return nil, fmt.Errorf("profile %q already has a %s mount at %s — stop it first", opts.Profile, origin, existing.Mountpoint)
 		}
 	}
 	s.mu.Unlock()
@@ -208,6 +252,7 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 		Mountpoint: opts.Mountpoint,
 		LogPath:    logPath,
 		Started:    time.Now(),
+		Pid:        cmd.Process.Pid,
 		cmd:        cmd,
 		done:       make(chan struct{}),
 	}
@@ -223,37 +268,87 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 	return mp, nil
 }
 
-// Stop signals the supervised process and waits up to 25 seconds —
-// matching the in-mount watchdog. After that, it SIGKILLs the process
-// and runs `fusermount -u -z` as a last-ditch unmount.
+// Stop signals the mount daemon for the given profile and waits up
+// to 25 seconds — matching the in-mount watchdog. After that, it
+// SIGKILLs the process and runs `fusermount -u -z` as a last-ditch
+// unmount.
+//
+// Works for both supervised (started by us) and adopted (discovered
+// in /proc, started outside this web) procs. The branching is
+// minimal: signal delivery uses cmd.Process for supervised (where
+// we know the *os.Process) or syscall.Kill for adopted (where we
+// only know the pid). Exit detection is the channel close from the
+// supervised cmd.Wait goroutine, or a kill-0 poll loop for adopted.
 func (s *Supervisor) Stop(profile string) error {
 	s.mu.Lock()
 	mp := s.procs[profile]
 	s.mu.Unlock()
 	if mp == nil {
-		return fmt.Errorf("no supervised mount for profile %q", profile)
+		return fmt.Errorf("no mount tracked for profile %q", profile)
 	}
 	select {
 	case <-mp.done:
 		return nil
 	default:
 	}
-	if mp.cmd != nil && mp.cmd.Process != nil {
-		_ = mp.cmd.Process.Signal(syscall.SIGTERM)
-	}
-	select {
-	case <-mp.done:
+	_ = signalProc(mp, syscall.SIGTERM)
+	if waitForExit(mp, 25*time.Second) {
 		return nil
-	case <-time.After(25 * time.Second):
 	}
-	// Last-ditch: kill + lazy unmount.
-	if mp.cmd != nil && mp.cmd.Process != nil {
-		_ = mp.cmd.Process.Kill()
-	}
+	// Last-ditch: SIGKILL + lazy unmount.
+	_ = signalProc(mp, syscall.SIGKILL)
 	if err := exec.Command("fusermount", "-u", "-z", mp.Mountpoint).Run(); err != nil {
 		return fmt.Errorf("kill + lazy unmount failed: %w", err)
 	}
+	// Close the done channel for adopted procs so Status flips.
+	select {
+	case <-mp.done:
+	default:
+		close(mp.done)
+	}
 	return nil
+}
+
+// signalProc sends sig to mp's process. Uses cmd.Process for
+// supervised procs (where we hold the *os.Process), syscall.Kill
+// for adopted procs (where we only have the pid). Returns the
+// error from the kernel; caller usually ignores since the next
+// step is to confirm exit via waitForExit anyway.
+func signalProc(mp *MountProcess, sig syscall.Signal) error {
+	if mp.cmd != nil && mp.cmd.Process != nil {
+		return mp.cmd.Process.Signal(sig)
+	}
+	if mp.Pid > 0 {
+		return syscall.Kill(mp.Pid, sig)
+	}
+	return errors.New("no process handle or pid")
+}
+
+// waitForExit blocks until mp.done closes or the timeout elapses,
+// returning whether the proc actually exited. For adopted procs
+// (which have no cmd.Wait goroutine to close done) it polls
+// kill(pid, 0) on a short tick and closes done on detection so the
+// next Status call sees "exited" immediately.
+func waitForExit(mp *MountProcess, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-mp.done:
+			return true
+		case <-tick.C:
+			if mp.Adopted && mp.Pid > 0 {
+				if err := syscall.Kill(mp.Pid, 0); err != nil {
+					close(mp.done)
+					return true
+				}
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+		}
+	}
 }
 
 // TailLog returns the last `maxBytes` of the log file. Cheap polling
@@ -329,23 +424,257 @@ func (s *Supervisor) UnmountExternal(mountpoint string) error {
 }
 
 // ExternalMounts returns fuse.telfs mountpoints in /proc/mounts that
-// are NOT supervised here. Used to flag "ran outside the web UI" mounts
-// on the dashboard without offering to stop them.
+// the supervisor isn't tracking AT ALL — typically because the daemon
+// died unrecognizably (no pid in /proc, no matching cmdline). Real
+// CLI-started mounts get adopted into procs via Reconcile and show up
+// in List(); this is the residual list of "we see a mount but can't
+// find the daemon", surfaced as a warning in the UI.
 func (s *Supervisor) ExternalMounts() []string {
 	all := scanProcMounts()
 	s.mu.Lock()
-	supervised := make(map[string]struct{}, len(s.procs))
+	tracked := make(map[string]struct{}, len(s.procs))
 	for _, p := range s.procs {
-		supervised[p.Mountpoint] = struct{}{}
+		tracked[p.Mountpoint] = struct{}{}
 	}
 	s.mu.Unlock()
 	out := make([]string, 0, len(all))
 	for _, m := range all {
-		if _, ok := supervised[m]; !ok {
+		if _, ok := tracked[m]; !ok {
 			out = append(out, m)
 		}
 	}
 	return out
+}
+
+// Reconcile scans /proc for fuse.telfs mounts not yet in s.procs and
+// adopts them. Idempotent — already-tracked mountpoints (whether
+// supervised or previously-adopted) are skipped. Stale procs
+// (tracked but the pid is gone) get pruned so a future Start under
+// the same profile name can succeed.
+//
+// Cheap enough to call on every UI request: O(/proc/mounts entries)
+// plus one /proc walk per unmapped fuse.telfs entry to identify the
+// pid. The number of fuse.telfs mounts on a host is small.
+func (s *Supervisor) Reconcile() {
+	mounts := scanProcMounts()
+	s.mu.Lock()
+	// Prune dead procs first so a freshly-killed mount frees its
+	// profile slot for a re-mount under the same name.
+	for prof, mp := range s.procs {
+		select {
+		case <-mp.done:
+			delete(s.procs, prof)
+			continue
+		default:
+		}
+		if mp.Adopted && mp.Pid > 0 && syscall.Kill(mp.Pid, 0) != nil {
+			close(mp.done)
+			delete(s.procs, prof)
+		}
+	}
+	tracked := make(map[string]struct{}, len(s.procs))
+	for _, p := range s.procs {
+		tracked[p.Mountpoint] = struct{}{}
+	}
+	s.mu.Unlock()
+	for _, mp := range mounts {
+		if _, ok := tracked[mp]; ok {
+			continue
+		}
+		adopted := adoptFromProc(mp)
+		if adopted == nil {
+			continue
+		}
+		profileKey := adopted.Profile
+		if profileKey == "" {
+			// Avoid colliding with a "" key (used by Get with no
+			// profile name); attribute under a synthetic key derived
+			// from the mountpoint instead.
+			profileKey = "adopted:" + adopted.Mountpoint
+			adopted.Profile = profileKey
+		}
+		s.mu.Lock()
+		// Last-writer-wins. A concurrent Start since we dropped the
+		// lock would have inserted under the same key; respect it.
+		if _, exists := s.procs[profileKey]; !exists {
+			s.procs[profileKey] = adopted
+		}
+		s.mu.Unlock()
+	}
+}
+
+// adoptFromProc finds the telfs mount daemon serving `mountpoint`
+// by walking /proc/*/cmdline. Returns nil when nothing matches —
+// the mountpoint is a fuse.telfs entry but no live telfs process
+// holds it (zombie or detached). Reads profile from TELFS_PROFILE
+// in /proc/<pid>/environ; falls back to "(unknown)" when absent.
+// LogPath is /proc/<pid>/fd/1 IF it resolves to a regular file —
+// daemons started with stdout redirected to a file (the supervisor
+// pattern, or `telfs mount ... > log.txt`).
+func adoptFromProc(mountpoint string) *MountProcess {
+	pid, found := findTelfsMountPid(mountpoint)
+	if !found {
+		return nil
+	}
+	mp := &MountProcess{
+		Mountpoint: mountpoint,
+		Pid:        pid,
+		Adopted:    true,
+		done:       make(chan struct{}),
+		Profile:    readEnvVar(pid, config.EnvProfile),
+		Started:    procStartTime(pid),
+		LogPath:    resolveStdoutLog(pid),
+	}
+	return mp
+}
+
+// findTelfsMountPid scans /proc/*/cmdline for the daemon that mounted
+// `mountpoint`. The daemon's argv ends with `<mountpoint>` (see
+// cmd/telfs/main.go's mount subcommand and the supervisor's Start
+// args construction). Returns (pid, true) on match, (0, false) on
+// no match.
+func findTelfsMountPid(mountpoint string) (int, bool) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == "" || name[0] < '0' || name[0] > '9' {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + name + "/cmdline")
+		if err != nil {
+			continue
+		}
+		argv := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+		if len(argv) < 2 {
+			continue
+		}
+		// First arg should look like a telfs binary; later args
+		// should contain "mount" and end with the mountpoint.
+		exe := filepath.Base(argv[0])
+		if exe != "telfs" {
+			continue
+		}
+		// Quick scan: need both "mount" subcommand and matching final mountpoint.
+		hasMount := false
+		for _, a := range argv[1:] {
+			if a == "mount" {
+				hasMount = true
+				break
+			}
+		}
+		if !hasMount {
+			continue
+		}
+		if argv[len(argv)-1] != mountpoint {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(name, "%d", &pid); err == nil {
+			return pid, true
+		}
+	}
+	return 0, false
+}
+
+// readEnvVar pulls a single environment variable's value from
+// /proc/<pid>/environ. Returns empty string if missing or unreadable
+// — typical when the daemon was started without setting the var.
+func readEnvVar(pid int, key string) string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		return ""
+	}
+	prefix := key + "="
+	for _, kv := range strings.Split(string(b), "\x00") {
+		if strings.HasPrefix(kv, prefix) {
+			return kv[len(prefix):]
+		}
+	}
+	return ""
+}
+
+// procStartTime reads /proc/<pid>/stat's start-time field (jiffies
+// since boot) and converts to a wall-clock time using boot time +
+// the system clock tick. Returns zero time on any parse failure;
+// the UI just shows "—" in that case.
+func procStartTime(pid int) time.Time {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return time.Time{}
+	}
+	// /proc/<pid>/stat fields are space-separated; field 22 (1-based)
+	// is starttime in clock ticks since boot. The comm field (#2) is
+	// wrapped in parens and may contain spaces, so split AFTER the
+	// closing paren.
+	s := string(b)
+	cp := strings.LastIndexByte(s, ')')
+	if cp < 0 {
+		return time.Time{}
+	}
+	fields := strings.Fields(s[cp+1:])
+	// After the close-paren, field offsets shift: starttime is now
+	// at index 19 (was 22, minus pid + comm).
+	if len(fields) < 20 {
+		return time.Time{}
+	}
+	var startTicks int64
+	if _, err := fmt.Sscanf(fields[19], "%d", &startTicks); err != nil {
+		return time.Time{}
+	}
+	boot := bootTime()
+	if boot.IsZero() {
+		return time.Time{}
+	}
+	// USER_HZ is conventionally 100 on Linux; correct in practice
+	// for every kernel TelFS targets.
+	const userHz = 100
+	return boot.Add(time.Duration(startTicks) * time.Second / userHz)
+}
+
+// bootTime returns the system boot wall-clock by parsing /proc/stat's
+// "btime" line.
+func bootTime() time.Time {
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return time.Time{}
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "btime ") {
+			continue
+		}
+		var btime int64
+		if _, err := fmt.Sscanf(line, "btime %d", &btime); err == nil {
+			return time.Unix(btime, 0)
+		}
+	}
+	return time.Time{}
+}
+
+// resolveStdoutLog returns the file path that /proc/<pid>/fd/1
+// (stdout) points to, when it's a regular file. Daemons that ran
+// with stdout redirected to a log file (the supervisor pattern, or
+// `telfs mount ... > log` from a shell) get their log surfaced;
+// daemons attached to a tty or piping into another process get
+// empty (no useful log path).
+func resolveStdoutLog(pid int) string {
+	target, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/1", pid))
+	if err != nil {
+		return ""
+	}
+	if target == "" || target[0] != '/' {
+		return ""
+	}
+	// Skip if it's a tty or pipe (/dev/pts/*, pipe:[...]).
+	if strings.HasPrefix(target, "/dev/") || strings.HasPrefix(target, "pipe:") {
+		return ""
+	}
+	if st, err := os.Stat(target); err != nil || !st.Mode().IsRegular() {
+		return ""
+	}
+	return target
 }
 
 // scanProcMounts mirrors activeMounts() in handlers.go but lives here

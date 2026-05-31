@@ -2,19 +2,26 @@
 <h2>Mounts</h2>
 
 <section class="card">
-  <h3>Supervised by this web server</h3>
-  {{if .Supervised}}
+  <h3>All mounts</h3>
+  <p><small>Both web-supervised mounts AND daemons started from the CLI (<code>telfs mount …</code>) appear here. The web reconciles against <code>/proc/mounts</code> on every load so anything you run from a shell shows up immediately — same Stop, log tail, and detail-page features.</small></p>
+  {{if .Mounts}}
   <table>
-    <thead><tr><th>Profile</th><th>Mountpoint</th><th>Status</th><th>Started</th><th></th></tr></thead>
+    <thead><tr><th>Profile</th><th>Mountpoint</th><th>Origin</th><th>PID</th><th>Status</th><th>Started</th><th></th></tr></thead>
     <tbody>
-      {{range .Supervised}}
+      {{range .Mounts}}
       <tr>
-        <td><a href="/mount/{{.Profile}}"><strong>{{.Profile}}</strong></a></td>
+        <td>
+          {{if .HasLog}}<a href="/mount/{{.Profile}}"><strong>{{.Profile}}</strong></a>
+          {{else}}<strong>{{.Profile}}</strong>{{end}}
+        </td>
         <td><code>{{.Mountpoint}}</code></td>
+        <td><small>{{.Origin}}</small></td>
+        <td><small>{{if .Pid}}{{.Pid}}{{else}}—{{end}}</small></td>
         <td><span class="pill {{.StatusKind}}">{{.Status}}</span></td>
-        <td><small>{{.Started}}</small></td>
+        <td><small>{{if .Started}}{{.Started}}{{else}}—{{end}}</small></td>
         <td class="actions">
-          <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline">
+          <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline"
+                onsubmit="return confirm('Stop the mount at {{.Mountpoint}}? Any process with open files there will see I/O errors.');">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
             <button type="submit" class="danger">Stop</button>
           </form>
@@ -24,14 +31,14 @@
     </tbody>
   </table>
   {{else}}
-  <p><em>No supervised mounts. <a href="/mount/new">Start one</a>.</em></p>
+  <p><em>No mounts. <a href="/mount/new">Start one</a>.</em></p>
   {{end}}
 </section>
 
 {{if .External}}
 <section class="card">
-  <h3>External <span class="pill muted">not started by web</span></h3>
-  <p><small>Mounted from a separate terminal. Unmount issues <code>fusermount -u</code> directly; if open files block it, falls back to a lazy detach (<code>fusermount -u -z</code>) so the mount disappears from the namespace immediately.</small></p>
+  <h3>Unidentified <span class="pill muted">fuse.telfs entry, no daemon found</span></h3>
+  <p><small>A <code>fuse.telfs</code> mountpoint is live but the corresponding <code>telfs mount</code> process couldn't be located in <code>/proc</code> — usually a zombie or a daemon detached after the kernel registered the mount. Unmount lazily detaches.</small></p>
   <table>
     <thead><tr><th>Mountpoint</th><th class="actions">Actions</th></tr></thead>
     <tbody>
