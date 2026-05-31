@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -29,6 +30,12 @@ type stateShowData struct {
 	PendingCount int
 	PendingBytes int64
 
+	// CacheLive holds the daemon's live cache numbers (size, cap,
+	// hit ratio). Nil when the daemon's --metrics-addr endpoint is
+	// unreachable, in which case the template falls back to showing
+	// just the on-disk size from CacheSize / CacheN above.
+	CacheLive *cacheLiveStats
+
 	Stats meta.Stats
 	KV    []meta.MetaKVEntry
 
@@ -48,6 +55,51 @@ type stateShowData struct {
 	Repair *repairRunSnapshot
 }
 
+// cacheLiveStats is the parsed shape of the daemon's /cache JSON.
+// Template-friendly: percentages are pre-multiplied by 100 so the
+// HTML can render "{{printf "%.1f"}}%" without further math.
+type cacheLiveStats struct {
+	SizeBytes int64
+	CapBytes  int64
+	UsedPct   float64 // 0..100
+	Hits      int64
+	Misses    int64
+	HitPct    float64 // 0..100; meaningless when Hits+Misses == 0
+}
+
+// fetchCacheLive pulls /cache from the running daemon and parses it.
+// Returns nil on any failure (network, JSON, non-200) — the caller
+// treats nil as "fall back to on-disk stats from dirStats".
+func fetchCacheLive() *cacheLiveStats {
+	resp, err := httpClient.Get("http://127.0.0.1:9090/cache")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	var raw struct {
+		SizeBytes int64   `json:"size_bytes"`
+		CapBytes  int64   `json:"cap_bytes"`
+		UsedRatio float64 `json:"used_ratio"`
+		Hits      int64   `json:"hits"`
+		Misses    int64   `json:"misses"`
+		HitRatio  float64 `json:"hit_ratio"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil
+	}
+	return &cacheLiveStats{
+		SizeBytes: raw.SizeBytes,
+		CapBytes:  raw.CapBytes,
+		UsedPct:   raw.UsedRatio * 100,
+		Hits:      raw.Hits,
+		Misses:    raw.Misses,
+		HitPct:    raw.HitRatio * 100,
+	}
+}
+
 // stateMountRow is a thin view of one mount for the Stop shortcut
 // on /state — covers both web-supervised and CLI-adopted procs so
 // the user sees one unified list regardless of how the daemon was
@@ -64,7 +116,7 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 	cfg, err := config.Load()
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
-		s.renderTemplate(w, "state/show.html", d)
+		s.renderTemplateWith(w, "state/show.html", d, "templates/partials/cache.html")
 		return
 	}
 	d.Profile = config.ActiveProfile()
@@ -88,6 +140,7 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	d.CacheLive = fetchCacheLive()
 	d.MountActive = len(activeMounts()) > 0
 	d.Repair = s.repair.Snapshot()
 	for _, mp := range s.sup.List() {
@@ -105,13 +158,13 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 	d.External = s.sup.ExternalMounts()
 
 	if _, err := os.Stat(cfg.DBPath()); err != nil {
-		s.renderTemplate(w, "state/show.html", d)
+		s.renderTemplateWith(w, "state/show.html", d, "templates/partials/cache.html")
 		return
 	}
 	mstore, err := meta.Open(cfg.DBPath())
 	if err != nil {
 		SetFlash(w, "error", "meta.Open: "+err.Error())
-		s.renderTemplate(w, "state/show.html", d)
+		s.renderTemplateWith(w, "state/show.html", d, "templates/partials/cache.html")
 		return
 	}
 	defer mstore.Close()
@@ -130,7 +183,7 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 		d.Partials = parts
 	}
 
-	s.renderTemplateWith(w, "state/show.html", d, "templates/state/repair_progress.html")
+	s.renderTemplateWith(w, "state/show.html", d, "templates/state/repair_progress.html", "templates/partials/cache.html")
 }
 
 // stateRepair kicks off a RepairPartialFiles run in the background

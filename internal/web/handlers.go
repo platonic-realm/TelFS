@@ -502,15 +502,29 @@ func dirStats(dir string) (int64, int, error) {
 	return total, n, err
 }
 
-// humanBytesTpl is the template helper; mirrors cmd/telfs/humanBytes.
+// humanBytesTpl is the template helper. Renders with one decimal so
+// "1.99 GiB" doesn't round-truncate to "1 GiB" (a previous version
+// used integer right-shift which dropped up to a whole unit of
+// precision). Strips a trailing ".0" so whole numbers stay clean.
 func humanBytesTpl(n int64) string {
+	render := func(unit string, div float64) string {
+		v := float64(n) / div
+		s := fmt.Sprintf("%.1f %s", v, unit)
+		// Strip ".0" for tidy whole-number cases.
+		if idx := len(s) - len(unit) - 1; idx > 2 && s[idx-2] == '.' && s[idx-1] == '0' {
+			s = s[:idx-2] + s[idx:]
+		}
+		return s
+	}
 	switch {
+	case n >= 1<<40:
+		return render("TiB", float64(int64(1)<<40))
 	case n >= 1<<30:
-		return fmt.Sprintf("%d GiB", n>>30)
+		return render("GiB", float64(int64(1)<<30))
 	case n >= 1<<20:
-		return fmt.Sprintf("%d MiB", n>>20)
+		return render("MiB", float64(int64(1)<<20))
 	case n >= 1<<10:
-		return fmt.Sprintf("%d KiB", n>>10)
+		return render("KiB", float64(int64(1)<<10))
 	}
 	return fmt.Sprintf("%d B", n)
 }

@@ -305,7 +305,14 @@ func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, 
 	if err != nil {
 		return 0, err
 	}
-	u := uploader.NewUploader(api)
+	// 512 KiB part size satisfies gotd's constraints (partSize % 1024
+	// == 0 and 524288 % partSize == 0) and shrinks a 32 MiB packed
+	// blob from 256 SaveBigFilePart RPCs to 64. Under a tight upload
+	// rate limit that 4× reduction directly translates into 4× more
+	// rate-limit budget available for downloads sharing the same
+	// middleware chain — the bottleneck visible in /telegram during
+	// kernel-untar workloads.
+	u := uploader.NewUploader(api).WithPartSize(512 * 1024)
 	uf, err := u.FromReader(ctx, filename, r)
 	if err != nil {
 		return 0, fmt.Errorf("upload bytes: %w", err)
@@ -457,6 +464,19 @@ func (s *Session) streamDocumentRange(ctx context.Context, doc *tg.Document, w i
 		limit := int64(rangePartSize)
 		if cur+limit > alignedEnd {
 			limit = alignedEnd - cur
+		}
+		// Telegram rejects a single upload.getFile that crosses a
+		// 1 MiB boundary with rpc error 400 LIMIT_INVALID — even when
+		// the request is otherwise 4 KiB-aligned and under 1 MiB long.
+		// Pack-route extents start at arbitrary offsets inside the
+		// packed blob, so a 1 MiB request from a mid-blob offset almost
+		// always straddles one of these boundaries. Clamp every
+		// request to the next 1 MiB boundary so the loop just makes
+		// one extra round when an extent spans the line, instead of
+		// blowing up the entire read.
+		mibBoundary := ((cur / (1 << 20)) + 1) * (1 << 20)
+		if cur+limit > mibBoundary {
+			limit = mibBoundary - cur
 		}
 		req := &tg.UploadGetFileRequest{
 			Precise:  true,

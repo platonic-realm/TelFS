@@ -16,12 +16,19 @@ import (
 // keeps the most recent N of these in a ring buffer so the web UI
 // can show what the daemon is doing without enabling gotd's full
 // debug logging.
+//
+// Bytes is the per-row wire-bytes column shown in /telegram: for
+// upload-shaped RPCs (UploadSaveFilePartRequest, ...) it's the
+// encoded request size, which contains the payload; for download-
+// shaped RPCs (UploadGetFileRequest) it's the response payload size
+// the server returned. Either way it represents "bytes that crossed
+// the wire for this RPC," matching what an operator expects to see.
 type Request struct {
 	ID        int64         // monotonically increasing within a Tracker
 	Method    string        // gotd type name without package prefix (e.g. "UploadGetFileRequest")
 	Started   time.Time     // when Invoke returned to the middleware
 	Duration  time.Duration // populated on completion
-	Bytes     int           // wire bytes of the request encoder (best-effort)
+	Bytes     int           // tx for uploads, rx for downloads (whichever is the payload-bearing direction)
 	Err       string        // empty on success
 	InFlight  bool          // true between Started and completion
 	FloodWait time.Duration // non-zero if Telegram returned FLOOD_WAIT
@@ -36,7 +43,7 @@ type MethodCount struct {
 	OK        int64 // successful invocations
 	Err       int64 // failed invocations (any non-nil error)
 	FloodWait int64 // FLOOD_WAIT responses (subset of Err — gets retried)
-	Bytes     int64 // sum of encoded request bytes (best-effort, request side only)
+	Bytes     int64 // payload-direction bytes per Request.Bytes semantics (tx for upload methods, rx for download methods)
 }
 
 // Tracker is a thread-safe ring buffer of recent RPCs plus aggregate
@@ -44,18 +51,20 @@ type MethodCount struct {
 // in-flight count, per-method totals). One Tracker is shared by the
 // gotd middleware chain and the web /telegram handler.
 type Tracker struct {
-	mu        sync.Mutex
-	ring      []Request
-	head      int       // next write position
-	cap       int       // ring capacity
-	seq       int64     // last issued ID
-	totalOK   int64     // count of successful Invokes since start
-	totalErr  int64     // count of errored Invokes since start
-	totalBytes int64    // sum of request bytes since start
-	byMethod  map[string]*MethodCount
-	inFlight  int       // currently outstanding RPCs
-	lastOK    time.Time // wall time of last successful Invoke
-	lastErr   time.Time // wall time of last errored Invoke
+	mu         sync.Mutex
+	ring       []Request
+	head       int       // next write position
+	cap        int       // ring capacity
+	seq        int64     // last issued ID
+	totalOK    int64     // count of successful Invokes since start
+	totalErr   int64     // count of errored Invokes since start
+	totalBytes int64     // sum of request+response payload bytes since start (tx+rx)
+	totalTx    int64     // upload-direction payload (encoded request bytes for upload methods)
+	totalRx    int64     // download-direction payload (response .Bytes for download methods)
+	byMethod   map[string]*MethodCount
+	inFlight   int       // currently outstanding RPCs
+	lastOK     time.Time // wall time of last successful Invoke
+	lastErr    time.Time // wall time of last errored Invoke
 	lastErrText string
 }
 
@@ -73,8 +82,10 @@ func NewTracker(capacity int) *Tracker {
 }
 
 // Begin records the start of an Invoke and returns the assigned ID.
-// Pair with End once the RPC finishes (success or failure).
-func (t *Tracker) Begin(method string, bytes int) int64 {
+// Pair with End once the RPC finishes (success or failure). txBytes is
+// the encoded request size — populated for ALL methods; the End call
+// may later override Request.Bytes with rx for download-shaped methods.
+func (t *Tracker) Begin(method string, txBytes int) int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.seq++
@@ -83,7 +94,7 @@ func (t *Tracker) Begin(method string, bytes int) int64 {
 		ID:       t.seq,
 		Method:   method,
 		Started:  time.Now(),
-		Bytes:    bytes,
+		Bytes:    txBytes,
 		InFlight: true,
 	}
 	t.ring[t.head] = r
@@ -91,9 +102,12 @@ func (t *Tracker) Begin(method string, bytes int) int64 {
 	return r.ID
 }
 
-// End updates the previously-Begun request with completion info. The
-// linear scan is fine because the ring is small (default 64).
-func (t *Tracker) End(id int64, err error, floodWait time.Duration) {
+// End updates the previously-Begun request with completion info.
+// rxBytes is the response payload size for download-shaped methods
+// (zero for upload methods where the request encoder already carries
+// the payload). The linear scan is fine because the ring is small
+// (default 64).
+func (t *Tracker) End(id int64, err error, floodWait time.Duration, rxBytes int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.inFlight--
@@ -101,23 +115,35 @@ func (t *Tracker) End(id int64, err error, floodWait time.Duration) {
 		t.inFlight = 0
 	}
 	now := time.Now()
-	// Update ring + aggregate totals. We need the method name and
-	// bytes from the ring entry to feed byMethod, so do both in
-	// one pass.
 	for i := range t.ring {
 		if t.ring[i].ID == id {
 			t.ring[i].Duration = now.Sub(t.ring[i].Started)
 			t.ring[i].InFlight = false
 			t.ring[i].FloodWait = floodWait
 			method := t.ring[i].Method
-			bytes := int64(t.ring[i].Bytes)
+			tx := int64(t.ring[i].Bytes) // recorded as tx at Begin time
+			rx := int64(rxBytes)
+			// Per-row display: for downloads the response payload is
+			// the meaningful number, not the tiny request encoder.
+			// Pick whichever side actually moved bytes.
+			if rx > 0 && rx > tx {
+				t.ring[i].Bytes = int(rx)
+			}
 			mc := t.byMethod[method]
 			if mc == nil {
 				mc = &MethodCount{Method: method}
 				t.byMethod[method] = mc
 			}
-			mc.Bytes += bytes
-			t.totalBytes += bytes
+			// Per-method aggregate matches the display semantics:
+			// downloads contribute rx, uploads contribute tx.
+			payload := tx
+			if rx > 0 && rx > tx {
+				payload = rx
+			}
+			mc.Bytes += payload
+			t.totalBytes += payload
+			t.totalTx += tx
+			t.totalRx += rx
 			if err != nil {
 				t.ring[i].Err = err.Error()
 				t.lastErr = now
@@ -147,10 +173,12 @@ type Snapshot struct {
 	LastError    time.Time
 	LastErrorMsg string
 	// Aggregate totals since daemon start.
-	TotalOK    int64
-	TotalErr   int64
-	TotalBytes int64
-	PerMethod  []MethodCount // sorted by total count desc
+	TotalOK      int64
+	TotalErr     int64
+	TotalBytes   int64 // payload-direction sum across all RPCs (tx for uploads + rx for downloads)
+	TotalBytesTx int64 // upload-direction wire bytes
+	TotalBytesRx int64 // download-direction wire bytes
+	PerMethod    []MethodCount // sorted by total count desc
 }
 
 func (t *Tracker) Snapshot() Snapshot {
@@ -188,6 +216,8 @@ func (t *Tracker) Snapshot() Snapshot {
 		TotalOK:      t.totalOK,
 		TotalErr:     t.totalErr,
 		TotalBytes:   t.totalBytes,
+		TotalBytesTx: t.totalTx,
+		TotalBytesRx: t.totalRx,
 		PerMethod:    perMethod,
 	}
 }
@@ -204,16 +234,44 @@ type TrackingMiddleware struct {
 func (m *TrackingMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 		method := requestName(input)
-		bytes := encodedSize(input)
-		id := m.Tracker.Begin(method, bytes)
+		txBytes := encodedSize(input)
+		id := m.Tracker.Begin(method, txBytes)
 		err := next.Invoke(ctx, input, output)
 		var fw time.Duration
 		if d, ok := asFloodWait(err); ok {
 			fw = d
 		}
-		m.Tracker.End(id, err, fw)
+		// Sniff the response payload for download-shaped RPCs. The
+		// gotd output decoder for upload.getFile is *tg.UploadFile,
+		// which carries .Bytes — the actual chunk data. Without this,
+		// download traffic is invisible because the encoded REQUEST is
+		// tiny (file location + offset + limit, ~64 B). Same for the
+		// CDN-routed variant. Other download shapes (web.getFile,
+		// upload.getCDNFile, etc.) can be added here if we ever use
+		// them.
+		var rxBytes int
+		if err == nil {
+			rxBytes = responsePayloadSize(output)
+		}
+		m.Tracker.End(id, err, fw, rxBytes)
 		return err
 	}
+}
+
+// responsePayloadSize extracts the byte-length of the payload portion
+// of a known download response. Returns 0 for unknown / non-download
+// shapes — those are inherently "no rx accounting needed" cases (the
+// request encoder already contains the payload, or there's no
+// content). Worth keeping the type-assert list small: each entry has
+// to be a download shape we actually issue.
+func responsePayloadSize(output bin.Decoder) int {
+	if output == nil {
+		return 0
+	}
+	if uf, ok := output.(*tg.UploadFile); ok {
+		return len(uf.Bytes)
+	}
+	return 0
 }
 
 // requestName returns a short type name like "UploadGetFileRequest"

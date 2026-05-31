@@ -10,11 +10,49 @@
   {{if not .IsRoot}}<span class="sep">·</span><a href="{{.UpURL}}">↑ parent</a>{{end}}
 </nav>
 
+<div class="browse-toolbar">
+  <details class="toolbar-action">
+    <summary class="btn primary">⬆ Upload</summary>
+    <form method="post" action="/browse/upload" enctype="multipart/form-data" class="inline-form toolbar-form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="at" value="{{.At}}">
+      <input type="hidden" name="p" value="{{.P}}">
+      <input type="file" name="file" required>
+      <button type="submit">Upload</button>
+      <small>Up to 2 GiB per file. Writes go through FUSE → chunk pipeline → channel.</small>
+    </form>
+  </details>
+  <details class="toolbar-action">
+    <summary class="btn">📄 New file</summary>
+    <form method="post" action="/browse/newfile" class="inline-form toolbar-form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="at" value="{{.At}}">
+      <input type="hidden" name="p" value="{{.P}}">
+      <input type="text" name="name" placeholder="new-file.txt" required>
+      <button type="submit">Create</button>
+    </form>
+  </details>
+  <details class="toolbar-action">
+    <summary class="btn">📁 New folder</summary>
+    <form method="post" action="/browse/mkdir" class="inline-form toolbar-form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="at" value="{{.At}}">
+      <input type="hidden" name="p" value="{{.P}}">
+      <input type="text" name="name" placeholder="new-directory" required>
+      <button type="submit">Create</button>
+    </form>
+  </details>
+  <label class="browse-filter">
+    <input type="search" id="browse-filter-input" placeholder="Filter (this dir)…" autocomplete="off"
+           oninput="(function(q){q=q.toLowerCase();document.querySelectorAll('table.browse tbody tr[data-row-name]').forEach(function(r){r.style.display=r.dataset.rowName.toLowerCase().includes(q)?'':'none';});})(this.value)">
+  </label>
+</div>
+
 <table class="browse">
   <thead><tr><th>Name</th><th class="num">Size</th><th>Modified</th><th>Actions</th></tr></thead>
   <tbody>
     {{range .Entries}}
-    <tr class="{{if .IsDir}}dir{{else if .IsLink}}link{{else}}file{{end}}">
+    <tr class="{{if .IsDir}}dir{{else if .IsLink}}link{{else}}file{{end}}" data-row-name="{{.Name}}">
       <td>
         {{if .IsDir}}📁 <a href="{{.HrefDir}}">{{.Name}}/</a>
         {{else if .IsLink}}🔗 <span>{{.Name}}</span>{{if .LinkTarget}} <small>→ <code>{{.LinkTarget}}</code></small>{{end}}
@@ -36,14 +74,21 @@
             <button type="submit" class="small">Save</button>
           </form>
         </details>
-        <form method="post" action="/browse/delete" class="inline-form"
-              onsubmit="return confirm('{{if .IsDir}}Delete directory {{.Name}}/ and everything inside? This cannot be undone.{{else}}Delete {{.Name}}?{{end}}');">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <input type="hidden" name="at" value="{{$.At}}">
-          <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
-          {{if .IsDir}}<input type="hidden" name="recursive" value="1">{{end}}
-          <button type="submit" class="small danger">Delete</button>
-        </form>
+        <details class="row-confirm">
+          <summary class="btn small danger">Delete</summary>
+          <form method="post" action="/browse/delete" class="inline-form confirm-form">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="at" value="{{$.At}}">
+            <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
+            {{if .IsDir}}<input type="hidden" name="recursive" value="1">{{end}}
+            <p>
+              <strong>Delete {{.Name}}{{if .IsDir}}/{{end}}?</strong>
+              {{if .IsDir}}This will recursively remove every file inside the directory.{{end}}
+              This cannot be undone.
+            </p>
+            <button type="submit" class="small danger">Confirm delete</button>
+          </form>
+        </details>
       </td>
     </tr>
     {{else}}
@@ -52,43 +97,8 @@
   </tbody>
 </table>
 
-<section class="card">
-  <h3>Upload file</h3>
-  <form method="post" action="/browse/upload" enctype="multipart/form-data">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <input type="hidden" name="at" value="{{.At}}">
-    <input type="hidden" name="p" value="{{.P}}">
-    <div class="row">
-      <input type="file" name="file" required>
-      <button type="submit">Upload</button>
-    </div>
-  </form>
-  <p><small>Up to 2 GiB per file. Writes go through FUSE → chunk pipeline → channel.</small></p>
-</section>
-
-<section class="card">
-  <h3>Create empty file</h3>
-  <form method="post" action="/browse/newfile">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <input type="hidden" name="at" value="{{.At}}">
-    <input type="hidden" name="p" value="{{.P}}">
-    <div class="row">
-      <input type="text" name="name" placeholder="new-file.txt" required>
-      <button type="submit">Create</button>
-    </div>
-  </form>
-</section>
-
-<section class="card">
-  <h3>Make directory</h3>
-  <form method="post" action="/browse/mkdir">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <input type="hidden" name="at" value="{{.At}}">
-    <input type="hidden" name="p" value="{{.P}}">
-    <div class="row">
-      <input type="text" name="name" placeholder="new-directory" required>
-      <button type="submit">Create</button>
-    </div>
-  </form>
-</section>
+<!-- Upload / new-file / new-folder are now in the .browse-toolbar
+     above the file list. The legacy three-card layout has been
+     collapsed; deep links to existing forms still POST to the same
+     endpoints. -->
 {{end}}

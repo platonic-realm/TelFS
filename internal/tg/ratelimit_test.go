@@ -28,7 +28,7 @@ var _ tg.Invoker = (*countingInvoker)(nil)
 // every call straight through with no wait — same shape as the
 // pre-limiter code path.
 func TestRateLimiterUnlimited(t *testing.T) {
-	rl := NewRateLimiter(0)
+	rl := NewRateLimiter(0, 0)
 	if rl.PerMinute() != 0 {
 		t.Fatalf("PerMinute=%d, want 0 (unlimited)", rl.PerMinute())
 	}
@@ -53,7 +53,7 @@ func TestRateLimiterUnlimited(t *testing.T) {
 // down the call rate. With burst=cap/4 + cap=60/min the limiter
 // admits the burst immediately then trickles 1/sec.
 func TestRateLimiterCaps(t *testing.T) {
-	rl := NewRateLimiter(60) // 1/s sustained, burst=15
+	rl := NewRateLimiter(60, 0) // upload 1/s sustained, burst=15; downloads unlimited
 	if rl.PerMinute() != 60 {
 		t.Fatalf("PerMinute=%d, want 60", rl.PerMinute())
 	}
@@ -85,7 +85,7 @@ func TestRateLimiterCaps(t *testing.T) {
 // invocations and the new rate takes effect for subsequent calls.
 // This is the contract the daemon's hot-reload poller relies on.
 func TestRateLimiterSetLive(t *testing.T) {
-	rl := NewRateLimiter(0)
+	rl := NewRateLimiter(0, 0)
 	rl.SetPerMinute(120)
 	if rl.PerMinute() != 120 {
 		t.Fatalf("after Set(120): PerMinute=%d", rl.PerMinute())

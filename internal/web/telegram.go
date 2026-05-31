@@ -25,6 +25,8 @@ type tgState struct {
 	TotalOK               int64       `json:"total_ok"`
 	TotalErr              int64       `json:"total_err"`
 	TotalBytes            int64       `json:"total_bytes"`
+	TotalBytesTx          int64       `json:"total_bytes_tx"`
+	TotalBytesRx          int64       `json:"total_bytes_rx"`
 	LastSuccessUnix       int64       `json:"last_success_unix"`
 	LastSuccessAgeSeconds int64       `json:"last_success_age_seconds"`
 	LastErrorUnix         int64       `json:"last_error_unix"`
@@ -89,11 +91,15 @@ type tgPageData struct {
 	StallSeconds int64 // derived: how long since last success
 	NowUnix      int64
 
-	// RateLimitPerMin is the per-FS requests/min cap, read fresh
-	// from meta_kv on every request so CLI edits show up
+	// RateLimitPerMin is the per-FS UPLOAD requests/min cap, read
+	// fresh from meta_kv on every request so CLI edits show up
 	// immediately. Zero means unlimited. -1 signals "couldn't
 	// read meta_kv" so the template can flag that.
-	RateLimitPerMin int
+	RateLimitPerMin         int
+	// DownloadRateLimitPerMin mirrors the upload cap above but for
+	// upload.getFile RPCs only. -1 on read failure, 0 = unlimited,
+	// >0 = explicit cap.
+	DownloadRateLimitPerMin int
 }
 
 // telegramPage renders the connection-state + request-log view. Data
@@ -147,10 +153,11 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 		url = v
 	}
 	data := tgPageData{
-		pageBase:        s.basePage(w, r),
-		Source:          url,
-		NowUnix:         time.Now().Unix(),
-		RateLimitPerMin: readRateLimitFromMeta(r.Context()),
+		pageBase:                s.basePage(w, r),
+		Source:                  url,
+		NowUnix:                 time.Now().Unix(),
+		RateLimitPerMin:         readRateLimitFromMeta(r.Context()),
+		DownloadRateLimitPerMin: readDownloadRateLimitFromMeta(r.Context()),
 	}
 	populateTGState(&data, url)
 	return data
@@ -203,9 +210,9 @@ func populateTGState(data *tgPageData, url string) {
 var httpClient = &http.Client{Timeout: 2 * time.Second}
 
 // readRateLimitFromMeta opens the active profile's meta DB and
-// returns the current TG rate-limit value. Returns -1 if the meta
-// DB can't be read (no active profile, DB missing, schema not yet
-// initialized) so the template can flag the "unknown" case
+// returns the current TG UPLOAD rate-limit value. Returns -1 if the
+// meta DB can't be read (no active profile, DB missing, schema not
+// yet initialized) so the template can flag the "unknown" case
 // distinctly from "explicitly unlimited" (0).
 func readRateLimitFromMeta(ctx context.Context) int {
 	cfg, err := config.Load()
@@ -224,22 +231,63 @@ func readRateLimitFromMeta(ctx context.Context) int {
 	return n
 }
 
-// telegramSetRateLimit accepts the per-minute cap from the form on
-// /telegram and writes it to meta_kv. The daemon's poller picks it
-// up within ~5 s — no remount needed. Empty / 0 / "clear" all
-// disable the limit.
+// readDownloadRateLimitFromMeta mirrors readRateLimitFromMeta but
+// for the download-direction lane.
+func readDownloadRateLimitFromMeta(ctx context.Context) int {
+	cfg, err := config.Load()
+	if err != nil {
+		return -1
+	}
+	mstore, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return -1
+	}
+	defer mstore.Close()
+	n, err := mstore.TGDownloadRateLimitPerMin(ctx)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// telegramSetRateLimit accepts the upload + download per-minute
+// caps from the form on /telegram and writes them to meta_kv. The
+// daemon's poller picks them up within ~5 s — no remount needed.
+// Empty / 0 / "clear" disable each lane independently.
+//
+// Back-compat: the form previously named the field "per_minute"
+// (single cap). We accept both "upload_per_minute" (new) and
+// "per_minute" (legacy) for the upload lane so external callers
+// hitting the endpoint with the old field name continue to work.
 func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 	if err := s.state.CheckCSRF(r); err != nil {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
-	raw := strings.TrimSpace(r.FormValue("per_minute"))
-	if raw == "" || raw == "clear" {
-		raw = "0"
+	parseN := func(field string) (int, bool, error) {
+		raw := strings.TrimSpace(r.FormValue(field))
+		if raw == "" {
+			return 0, false, nil
+		}
+		if raw == "clear" {
+			return 0, true, nil
+		}
+		n, err := strconv.Atoi(raw)
+		return n, true, err
 	}
-	n, perr := strconv.Atoi(raw)
-	if perr != nil {
-		SetFlash(w, "error", "rate limit: "+perr.Error())
+	upN, upSet, upErr := parseN("upload_per_minute")
+	if !upSet && upErr == nil {
+		// Legacy field name.
+		upN, upSet, upErr = parseN("per_minute")
+	}
+	downN, downSet, downErr := parseN("download_per_minute")
+	if upErr != nil {
+		SetFlash(w, "error", "upload rate limit: "+upErr.Error())
+		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+		return
+	}
+	if downErr != nil {
+		SetFlash(w, "error", "download rate limit: "+downErr.Error())
 		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
 		return
 	}
@@ -256,15 +304,35 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer mstore.Close()
-	if err := mstore.SetTGRateLimitPerMin(r.Context(), n); err != nil {
-		SetFlash(w, "error", "set rate limit: "+err.Error())
-		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
-		return
+	var bits []string
+	if upSet {
+		if err := mstore.SetTGRateLimitPerMin(r.Context(), upN); err != nil {
+			SetFlash(w, "error", "set upload rate limit: "+err.Error())
+			http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+			return
+		}
+		if upN == 0 {
+			bits = append(bits, "upload cleared")
+		} else {
+			bits = append(bits, fmt.Sprintf("upload %d req/min", upN))
+		}
 	}
-	if n == 0 {
-		SetFlash(w, "ok", "rate limit cleared (unlimited) — daemon picks it up within 5 s")
+	if downSet {
+		if err := mstore.SetTGDownloadRateLimitPerMin(r.Context(), downN); err != nil {
+			SetFlash(w, "error", "set download rate limit: "+err.Error())
+			http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+			return
+		}
+		if downN == 0 {
+			bits = append(bits, "download cleared")
+		} else {
+			bits = append(bits, fmt.Sprintf("download %d req/min", downN))
+		}
+	}
+	if len(bits) == 0 {
+		SetFlash(w, "ok", "no changes — both fields were empty")
 	} else {
-		SetFlash(w, "ok", fmt.Sprintf("rate limit set to %d requests/min — daemon picks it up within 5 s", n))
+		SetFlash(w, "ok", "applied: "+strings.Join(bits, ", ")+" — daemon picks it up within 5 s")
 	}
 	http.Redirect(w, r, "/telegram", http.StatusSeeOther)
 }

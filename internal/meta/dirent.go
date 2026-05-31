@@ -200,15 +200,24 @@ func (s *Store) Link(ctx context.Context, parent int64, name string, target int6
 // For directories, ErrNotEmpty is returned if the directory has children.
 // Symlinks behave like regular files.
 func (s *Store) Unlink(ctx context.Context, parent int64, name string) error {
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
-		if _, _, err := unlinkInTx(ctx, tx, parent, name); err != nil {
+	var deletedIno int64
+	err := s.WithTx(ctx, func(tx *sql.Tx) error {
+		ino, deleted, err := unlinkInTx(ctx, tx, parent, name)
+		if err != nil {
 			return err
 		}
-		_, err := appendJournalTx(ctx, tx, JournalOp{
+		if deleted {
+			deletedIno = ino
+		}
+		_, err = appendJournalTx(ctx, tx, JournalOp{
 			Op: OpUnlink, Parent: parent, Name: name,
 		})
 		return err
 	})
+	if err == nil && deletedIno != 0 {
+		s.notifyInodeDeleted(deletedIno)
+	}
+	return err
 }
 
 // unlinkInTx is the reusable transactional core. Returns the child inode
@@ -273,7 +282,8 @@ func (s *Store) Rename(ctx context.Context, oldParent int64, oldName string, new
 	if oldParent == newParent && oldName == newName {
 		return nil
 	}
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
+	var deletedIno int64
+	err := s.WithTx(ctx, func(tx *sql.Tx) error {
 		src, err := lookup(ctx, tx, oldParent, oldName)
 		if err != nil {
 			return err
@@ -318,8 +328,12 @@ func (s *Store) Rename(ctx context.Context, oldParent int64, oldName string, new
 			} else if src.Kind == KindDir {
 				return ErrNotDir
 			}
-			if _, _, err := unlinkInTx(ctx, tx, newParent, newName); err != nil {
-				return err
+			ino, deleted, uerr := unlinkInTx(ctx, tx, newParent, newName)
+			if uerr != nil {
+				return uerr
+			}
+			if deleted {
+				deletedIno = ino
 			}
 		} else if !errors.Is(err, ErrNotFound) {
 			return err
@@ -338,6 +352,10 @@ func (s *Store) Rename(ctx context.Context, oldParent int64, oldName string, new
 		}
 		return nil
 	})
+	if err == nil && deletedIno != 0 {
+		s.notifyInodeDeleted(deletedIno)
+	}
+	return err
 }
 
 // isAncestor reports whether `maybeAncestor` is an ancestor of `start`

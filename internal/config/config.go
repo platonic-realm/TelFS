@@ -65,6 +65,15 @@ type Config struct {
 
 	Channel ChannelConfig `toml:"channel"`
 
+	// CacheCap is the LRU disk-cache size cap for this mount. Empty
+	// (or unparseable) falls through to chunk.DefaultCacheCapBytes
+	// (1 GiB). Recognized suffixes: B / KiB / MiB / GiB / KB / MB /
+	// GB. The CLI flag --cache-cap on `telfs mount` overrides this.
+	//
+	// Set once at mount; not hot-reloadable. The Reader / Writer
+	// hold the cache pointer for the life of the daemon.
+	CacheCap string `toml:"cache_cap,omitempty"`
+
 	// DataDir is the resolved location of the .telfs/ directory. Not serialized.
 	DataDir string `toml:"-"`
 }
@@ -76,6 +85,65 @@ func (c *Config) EffectiveAuthMode() AuthMode {
 		return AuthModeBot
 	}
 	return AuthModeUser
+}
+
+// CacheCapBytes parses Config.CacheCap. Returns 0 (caller falls back
+// to its default) on empty / parse error.
+func (c *Config) CacheCapBytes() int64 {
+	if n, err := ParseHumanBytes(c.CacheCap); err == nil {
+		return n
+	}
+	return 0
+}
+
+// ParseHumanBytes accepts strings like "8GiB", "512 MB", "1024" (bare
+// bytes), or "" (zero). Recognises binary (KiB / MiB / GiB / TiB) and
+// decimal (KB / MB / GB / TB) suffixes case-insensitively. Returns
+// (0, error) on parse failure so callers can distinguish "explicit
+// zero" (which is the same as no cap, i.e. "use default") from
+// "operator typo".
+func ParseHumanBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	i := 0
+	for i < len(s) && (s[i] == '.' || (s[i] >= '0' && s[i] <= '9')) {
+		i++
+	}
+	numStr := strings.TrimSpace(s[:i])
+	suffix := strings.ToLower(strings.TrimSpace(s[i:]))
+	if numStr == "" {
+		return 0, fmt.Errorf("cache_cap %q: missing number", s)
+	}
+	num, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("cache_cap %q: %w", s, err)
+	}
+	mult := int64(1)
+	switch suffix {
+	case "", "b":
+		mult = 1
+	case "k", "kb":
+		mult = 1000
+	case "kib":
+		mult = 1 << 10
+	case "m", "mb":
+		mult = 1000 * 1000
+	case "mib":
+		mult = 1 << 20
+	case "g", "gb":
+		mult = 1000 * 1000 * 1000
+	case "gib":
+		mult = 1 << 30
+	case "t", "tb":
+		mult = 1000 * 1000 * 1000 * 1000
+	case "tib":
+		mult = 1 << 40
+	default:
+		return 0, fmt.Errorf("cache_cap %q: unknown suffix %q", s, suffix)
+	}
+	return int64(num * float64(mult)), nil
 }
 
 // ChannelConfig stores the resolved peer reference for the backing channel.

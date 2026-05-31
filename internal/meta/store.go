@@ -23,10 +23,55 @@ const RootIno int64 = 1
 // ErrNotFound is returned by Get-style methods when no row matches.
 var ErrNotFound = errors.New("meta: not found")
 
+// IsFKViolation reports whether err is a SQLite FOREIGN KEY constraint
+// failure. The packer uses this on PutChunk failure to distinguish the
+// "inode was unlinked while my upload was in flight" race (a
+// permanent-and-expected condition that warrants dropping the chunk
+// silently, since the chunk_map row is no longer wanted) from genuine
+// transient errors (busy, lock, write-disk-full) that the caller
+// should treat as retriable. We match the error string emitted by
+// modernc.org/sqlite because importing the typed errors here would
+// pull a sqlite-specific dependency into every consumer of meta.
+func IsFKViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
+}
+
 // Store owns the local SQLite metadata database. It is safe for use by
 // multiple goroutines; SQLite handles serialization internally.
 type Store struct {
 	db *sql.DB
+
+	// onInodeDeleted, if non-nil, is invoked after a committed
+	// transaction has removed an inodes row (whether via Unlink that
+	// dropped nlink to 0, or a Rename that overwrote an existing
+	// target). The packer registers a callback here so it can drop
+	// any pending wires for the freshly-gone inode — otherwise those
+	// wires upload to TG and only fail at PutChunk's FK check, wasting
+	// the upload. Called outside the tx with the deleted inode number;
+	// safe to call any meta API (it is on a fresh goroutine).
+	onInodeDeleted func(ino int64)
+}
+
+// SetInodeDeletedCallback registers fn as the listener for inode
+// deletions. Pass nil to clear. The callback runs AFTER the deletion
+// has committed, on a fresh goroutine, so its work does not extend
+// the unlink critical section. Idempotent on a single Store; the
+// daemon calls it once at startup, after the packer is constructed.
+func (s *Store) SetInodeDeletedCallback(fn func(ino int64)) {
+	s.onInodeDeleted = fn
+}
+
+// notifyInodeDeleted dispatches to onInodeDeleted asynchronously.
+// Helper for the unlink / rename paths.
+func (s *Store) notifyInodeDeleted(ino int64) {
+	cb := s.onInodeDeleted
+	if cb == nil {
+		return
+	}
+	go cb(ino)
 }
 
 // Open opens (or creates) the metadata DB at path. Parent directories must
@@ -85,6 +130,25 @@ func (s *Store) Close() error {
 		return nil
 	}
 	return s.db.Close()
+}
+
+// CheckpointWAL runs PRAGMA wal_checkpoint(PASSIVE) to flush the WAL
+// into the main DB file. The PASSIVE mode never blocks readers or
+// writers — it's a best-effort drain that gives up cleanly if any
+// connection is mid-transaction. Returns the number of frames in the
+// WAL after the checkpoint (0 means fully drained) and any error.
+//
+// Background goroutines call this periodically during long-running
+// daemons to keep WAL growth bounded. Without it the WAL accumulates
+// until SQLite's auto-checkpoint heuristic (default 1000 pages) ticks
+// over; under bursty load that easily reaches 100+ MiB on disk
+// (we observed db.sqlite-wal at 116 MiB during the kernel-untar
+// incident — fine for correctness but wasted disk and slower opens
+// on the next mount because the recovery scan reads the entire WAL).
+func (s *Store) CheckpointWAL(ctx context.Context) (busy, log, checkpointed int, err error) {
+	row := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(PASSIVE);`)
+	err = row.Scan(&busy, &log, &checkpointed)
+	return
 }
 
 // DB exposes the underlying *sql.DB for advanced callers (e.g. snapshot
@@ -209,6 +273,16 @@ const KVCompressionCodec = "compression_codec"
 // FLOOD_WAIT — useful when bursty workloads (tar extracts, mass
 // deletes) cause cascading retry storms.
 const KVTGRateLimitPerMin = "tg_rate_limit_per_min"
+
+// KVTGDownloadRateLimitPerMin caps download-direction (upload.getFile)
+// MTProto requests separately from the upload-direction cap. Zero /
+// missing means unlimited — the safe default. Downloads rarely
+// trigger FLOOD_WAIT in practice, so most operators leave this open
+// and only throttle uploads (the bigger volume + more aggressive
+// FLOOD_WAIT trigger). The split exists so a heavy packer flush
+// doesn't starve reads that share the same middleware chain — a
+// real-world failure mode visible during the kernel-untar incident.
+const KVTGDownloadRateLimitPerMin = "tg_download_rate_limit_per_min"
 
 // Trash safety-net KV keys. When KVTrashEnabled is set to "1", every
 // kernel-issued unlink/rmdir from FUSE is rerouted to a top-level
@@ -380,6 +454,38 @@ func (s *Store) SetTGRateLimitPerMin(ctx context.Context, n int) error {
 		return nil
 	}
 	return s.PutKV(ctx, KVTGRateLimitPerMin, []byte(strconv.Itoa(n)))
+}
+
+// TGDownloadRateLimitPerMin returns the download-side cap (0 ==
+// unlimited, the default). Mirrors the upload-side accessor.
+func (s *Store) TGDownloadRateLimitPerMin(ctx context.Context) (int, error) {
+	v, err := s.GetKV(ctx, KVTGDownloadRateLimitPerMin)
+	if errors.Is(err, ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(v)))
+	if err != nil {
+		return 0, fmt.Errorf("meta: %s kv malformed (%q): %w", KVTGDownloadRateLimitPerMin, string(v), err)
+	}
+	return n, nil
+}
+
+// SetTGDownloadRateLimitPerMin writes the download-side cap. 0
+// disables the limit (deletes the key). Negative values rejected.
+func (s *Store) SetTGDownloadRateLimitPerMin(ctx context.Context, n int) error {
+	if n < 0 {
+		return fmt.Errorf("meta: download rate limit %d must be >= 0", n)
+	}
+	if n == 0 {
+		if err := s.DeleteKV(ctx, KVTGDownloadRateLimitPerMin); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		return nil
+	}
+	return s.PutKV(ctx, KVTGDownloadRateLimitPerMin, []byte(strconv.Itoa(n)))
 }
 
 // TrashEnabled reports whether the trash safety-net is active for this

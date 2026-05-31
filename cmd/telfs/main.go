@@ -428,8 +428,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	debug := fs.Bool("debug", false, "log every FUSE op")
 	noRecover := fs.Bool("no-recover", false, "skip cold-mount recovery from channel snapshot (starts with an empty DB if local DB is missing)")
 	metricsAddr := fs.String("metrics-addr", "", "bind a Prometheus /metrics endpoint at this addr (default: off). Example: 127.0.0.1:9090")
+	cacheCap := fs.String("cache-cap", "", "override the LRU disk-cache size cap (e.g. 8GiB, 512MiB, 2GB). Flag wins over config; empty falls through to config.toml's cache_cap; that falls through to 1 GiB.")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] <mountpoint>")
+		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] [--cache-cap SIZE] <mountpoint>")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -440,6 +441,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return errors.New("mount: expected exactly one mountpoint argument")
 	}
 	mountpoint := fs.Arg(0)
+	checkFusermount()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -584,7 +586,26 @@ func cmdMount(signalCtx context.Context, args []string) error {
 
 	err = func() error {
 		fetcher := &chunk.TGFetcher{Session: sess}
-		cache, err := chunk.NewCache(cfg.CachePath(), chunk.DefaultCacheCapBytes, fetcher, cipher, codec)
+		// Cache cap resolution: --cache-cap flag wins, then config's
+		// cache_cap, then chunk.DefaultCacheCapBytes. A parse error on
+		// the flag aborts (operator typo, fail loudly); a parse error
+		// in config is silent (treat as "use default" — config-edit
+		// errors shouldn't fail mount when it would otherwise come
+		// up cleanly).
+		capBytes := chunk.DefaultCacheCapBytes
+		if *cacheCap != "" {
+			n, perr := config.ParseHumanBytes(*cacheCap)
+			if perr != nil {
+				return fmt.Errorf("--cache-cap: %w", perr)
+			}
+			if n > 0 {
+				capBytes = n
+			}
+		} else if n := cfg.CacheCapBytes(); n > 0 {
+			capBytes = n
+		}
+		fmt.Fprintf(os.Stderr, "cache cap: %s (%d bytes)\n", humanBytes(capBytes), capBytes)
+		cache, err := chunk.NewCache(cfg.CachePath(), capBytes, fetcher, cipher, codec)
 		if err != nil {
 			return err
 		}
@@ -618,6 +639,18 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// the per-message RTT. Nil-safe — Writer falls back to
 		// direct upload when no packer is wired.
 		packer := chunk.NewPacker(metaStore, sess, 0, 0, 0)
+		// Cancel pending wires on unlink. When a file is deleted while
+		// some of its chunks are still buffered in the packer (tar
+		// overwriting an extracted tree, rm -rf during an upload, etc.),
+		// uploading those chunks would just produce orphan TG messages
+		// that the packer's PutChunk then FK-rejects. DropInode pulls
+		// them from the queue before the upload happens — saving the
+		// bandwidth AND removing the log spam.
+		metaStore.SetInodeDeletedCallback(func(ino int64) {
+			if n := packer.DropInode(ino); n > 0 {
+				fmt.Fprintf(os.Stderr, "[packer] dropped %d pending wire(s) for unlinked ino=%d\n", n, ino)
+			}
+		})
 
 		backend := &telfsfs.Backend{
 			Meta:      metaStore,
@@ -653,6 +686,11 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// we stuck in FLOOD_WAIT? did we get FILE_PART_MISSING?
 			// JSON only for now; rendering is the web's problem.
 			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore))
+			// /cache reports the LRU disk cache's live size + cap +
+			// hit/miss counts so the /state web page can render the
+			// cache panel without having to know about the metrics
+			// scrape format. Cheap: in-memory atomic loads.
+			metricsSrv.RegisterHandler("/cache", cacheJSONHandler(cache))
 			if err := metricsSrv.Start(); err != nil {
 				return err
 			}
@@ -700,16 +738,25 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// value is in meta_kv now — if zero/missing, the limiter
 		// stays unlimited (historical default).
 		applyRateLimit := func() {
-			n, err := metaStore.TGRateLimitPerMin(signalCtx)
-			if err != nil {
-				return
+			rl := client.RateLimiter()
+			if n, err := metaStore.TGRateLimitPerMin(signalCtx); err == nil {
+				if n != rl.UploadPerMinute() {
+					rl.SetUploadPerMinute(n)
+					if n == 0 {
+						fmt.Fprintln(os.Stderr, "[ratelimit] upload cleared (unlimited)")
+					} else {
+						fmt.Fprintf(os.Stderr, "[ratelimit] upload set to %d requests/min\n", n)
+					}
+				}
 			}
-			if n != client.RateLimiter().PerMinute() {
-				client.RateLimiter().SetPerMinute(n)
-				if n == 0 {
-					fmt.Fprintln(os.Stderr, "[ratelimit] cleared (unlimited)")
-				} else {
-					fmt.Fprintf(os.Stderr, "[ratelimit] set to %d requests/min\n", n)
+			if n, err := metaStore.TGDownloadRateLimitPerMin(signalCtx); err == nil {
+				if n != rl.DownloadPerMinute() {
+					rl.SetDownloadPerMinute(n)
+					if n == 0 {
+						fmt.Fprintln(os.Stderr, "[ratelimit] download cleared (unlimited)")
+					} else {
+						fmt.Fprintf(os.Stderr, "[ratelimit] download set to %d requests/min\n", n)
+					}
 				}
 			}
 		}
@@ -726,6 +773,26 @@ func cmdMount(signalCtx context.Context, args []string) error {
 					return
 				case <-t.C:
 					applyRateLimit()
+				}
+			}
+		}()
+
+		// WAL checkpointer: SQLite's auto-checkpoint heuristic (default
+		// at every 1000 pages crossed) can lag badly under bursty
+		// write workloads — we observed db.sqlite-wal at 116 MiB
+		// during the kernel-untar incident, which is wasted disk and
+		// slow next-mount recovery. A 30 s PASSIVE checkpoint never
+		// blocks readers or writers; it just opportunistically drains
+		// frames that aren't actively in use.
+		go func() {
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-signalCtx.Done():
+					return
+				case <-t.C:
+					_, _, _, _ = metaStore.CheckpointWAL(signalCtx)
 				}
 			}
 		}()
@@ -909,6 +976,32 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionM
 	}
 }
 
+// cacheJSONHandler emits the LRU disk cache's live state — size,
+// cap, hit/miss counters — so the web UI can render its cache panel
+// against authoritative in-process numbers. Walking the cache dir
+// from the web process would double-count (the pending/ sub-dir is
+// NOT counted against the cap, but `du` doesn't know that).
+func cacheJSONHandler(cache *chunk.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		size := cache.SizeBytes()
+		cap_ := cache.CapBytes()
+		hits := metrics.CacheHits.Load()
+		misses := metrics.CacheMisses.Load()
+		used := float64(0)
+		if cap_ > 0 {
+			used = float64(size) / float64(cap_)
+		}
+		hitRatio := float64(0)
+		if hits+misses > 0 {
+			hitRatio = float64(hits) / float64(hits+misses)
+		}
+		fmt.Fprintf(w,
+			"{\"size_bytes\":%d,\"cap_bytes\":%d,\"used_ratio\":%.4f,\"hits\":%d,\"misses\":%d,\"hit_ratio\":%.4f}\n",
+			size, cap_, used, hits, misses, hitRatio)
+	}
+}
+
 // telegramJSONHandler returns an http.HandlerFunc that renders the
 // tracker's current state as JSON. Format is intentionally simple so
 // the web UI can fetch + render with a few lines of JS, and curl
@@ -936,6 +1029,8 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 		fmt.Fprintf(w, "  \"total_ok\": %d,\n", snap.TotalOK)
 		fmt.Fprintf(w, "  \"total_err\": %d,\n", snap.TotalErr)
 		fmt.Fprintf(w, "  \"total_bytes\": %d,\n", snap.TotalBytes)
+		fmt.Fprintf(w, "  \"total_bytes_tx\": %d,\n", snap.TotalBytesTx)
+		fmt.Fprintf(w, "  \"total_bytes_rx\": %d,\n", snap.TotalBytesRx)
 
 		// Queue depths. Order:
 		//   1. packer pending — chunks buffered in memory awaiting
@@ -1024,6 +1119,28 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 		fmt.Fprintln(w, "  ]")
 		fmt.Fprintln(w, "}")
 	}
+}
+
+// checkFusermount looks up fusermount3 (preferred — fuse3) and falls
+// back to fusermount (fuse2). At least one is needed for the lazy-
+// unmount fallback we rely on for graceful shutdown and for any
+// recovery from a wedged kernel mount. If neither is present we print
+// a clear remediation hint and continue — root-only setups can still
+// mount + unmount via direct syscalls, so this is a warning rather
+// than a hard failure.
+func checkFusermount() {
+	for _, name := range []string{"fusermount3", "fusermount"} {
+		if p, err := exec.LookPath(name); err == nil {
+			fmt.Fprintf(os.Stderr, "fuse helper: %s\n", p)
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, "warning: fusermount / fusermount3 not found in PATH.")
+	fmt.Fprintln(os.Stderr, "         Install your distro's FUSE userspace package:")
+	fmt.Fprintln(os.Stderr, "           Debian/Ubuntu: apt install fuse3   (or 'fuse' on older systems)")
+	fmt.Fprintln(os.Stderr, "           Arch:          pacman -S fuse3")
+	fmt.Fprintln(os.Stderr, "           Alpine:        apk add fuse3       (or 'fuse')")
+	fmt.Fprintln(os.Stderr, "         TelFS uses it for the lazy-unmount fallback when shutdown stalls.")
 }
 
 // recoverPending scans the pending-uploads directory and submits any

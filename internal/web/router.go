@@ -19,6 +19,7 @@ func (s *Server) registerRoutes() {
 	// Dashboard + status partial (auto-refresh).
 	s.mux.HandleFunc("GET /{$}", s.dashboardIndex)
 	s.mux.HandleFunc("GET /partials/status", s.statusPartial)
+	s.mux.HandleFunc("GET /partials/health", s.healthPartial)
 
 	// First-run setup wizard.
 	s.mux.HandleFunc("GET /setup", s.setupWizard)
@@ -159,6 +160,35 @@ func tmplFuncs() template.FuncMap {
 	return template.FuncMap{
 		"humanBytes": humanBytesTpl,
 		"add1":       func(i int) int { return i + 1 },
+		// pctOf / pctOf64: render a "filled %" for the queue visual
+		// bars. Clamped to [0, 100] so an over-target buffer (rare —
+		// the packer flushes on threshold) still produces a sane bar.
+		"pctOf": func(num, denom int) float64 {
+			if denom <= 0 {
+				return 0
+			}
+			p := float64(num) / float64(denom) * 100
+			if p < 0 {
+				return 0
+			}
+			if p > 100 {
+				return 100
+			}
+			return p
+		},
+		"pctOf64": func(num, denom int64) float64 {
+			if denom <= 0 {
+				return 0
+			}
+			p := float64(num) / float64(denom) * 100
+			if p < 0 {
+				return 0
+			}
+			if p > 100 {
+				return 100
+			}
+			return p
+		},
 		"ageSeconds": func(now, then int64) int64 {
 			if now < then {
 				return 0

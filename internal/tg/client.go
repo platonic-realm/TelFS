@@ -47,7 +47,7 @@ func New(cfg *config.Config) (*Client, error) {
 	return &Client{
 		cfg:       cfg,
 		tracker:   NewTracker(128),
-		rateLimit: NewRateLimiter(0),
+		rateLimit: NewRateLimiter(0, 0),
 	}, nil
 }
 

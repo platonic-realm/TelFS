@@ -161,6 +161,43 @@ func (p *Packer) QueueDepth() (chunks int, bytes int64) {
 // user can compare packer_pending_bytes against the trigger.
 func (p *Packer) Target() int64 { return p.target }
 
+// DropInode discards every pending wire for ino that hasn't reached
+// the flush batch yet. Called when ino is unlinked so we don't waste
+// upload bandwidth on a chunk whose inode no longer exists — the
+// packer's PutChunk would FK-fail anyway, dropping the row but only
+// AFTER the MTProto round trip. Dropping at Submit time saves both
+// the upload bytes and the FK-violation log spam downstream.
+//
+// Wires whose pendingPath is non-empty get deleted from disk too —
+// otherwise they'd reappear via recoverPending on next startup.
+// Result channels are closed with no error (mirroring the FK-handle
+// path) so writer-side recovery loops don't re-Submit.
+//
+// Returns the number of wires dropped. Safe to call from any
+// goroutine; takes p.mu briefly.
+func (p *Packer) DropInode(ino int64) int {
+	p.mu.Lock()
+	kept := p.pending[:0]
+	var dropped []packReq
+	for _, r := range p.pending {
+		if r.ino == ino {
+			dropped = append(dropped, r)
+			p.bufBytes -= int64(len(r.wire))
+			continue
+		}
+		kept = append(kept, r)
+	}
+	p.pending = kept
+	p.mu.Unlock()
+	for _, r := range dropped {
+		if r.pendingPath != "" {
+			_ = DeletePending(r.pendingPath)
+		}
+		close(r.result)
+	}
+	return len(dropped)
+}
+
 // Submit enqueues a wire for the next packed-blob upload and
 // returns a chan that will deliver the (msgID, packOffset) once
 // the upload lands. The caller MUST receive on the chan — otherwise
@@ -367,6 +404,27 @@ func (p *Packer) flush() {
 			PackSize:    int32(len(r.wire)),
 		}
 		if err := p.meta.PutChunk(context.Background(), c); err != nil {
+			// FK violation = the inode was unlinked between our
+			// caller submitting the wire and us reaching PutChunk
+			// (most commonly: tar overwriting a file whose chunks
+			// hadn't drained yet). The chunk is now an orphan on
+			// the channel; GC will reap it on its next pass. We
+			// MUST NOT report this as a transient error — the
+			// writer's recovery loop would re-submit forever — and
+			// we MUST delete the wire so it doesn't replay across
+			// daemon restarts. Closing the result with no error
+			// communicates "your work is done, but the row you
+			// asked for isn't wanted anymore" — which is fine
+			// because the caller (file handle for an inode that's
+			// now deleted) has nothing to do with the answer.
+			if meta.IsFKViolation(err) {
+				if r.pendingPath != "" {
+					_ = DeletePending(r.pendingPath)
+				}
+				fmt.Fprintf(os.Stderr, "[packer] dropped orphan chunk ino=%d/%d (inode gone, msg %d kept for GC)\n", r.ino, r.idx, msgID)
+				close(r.result)
+				continue
+			}
 			r.result <- packResult{err: fmt.Errorf("packer put_chunk: %w", err)}
 			close(r.result)
 			continue

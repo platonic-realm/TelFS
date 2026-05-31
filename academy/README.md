@@ -35,6 +35,7 @@ references inside them point at real code paths so you can keep
 | [11 — Operational features](11-operational-features.md) | Trash, rate limit, GC, fsck, doctor | The CLI surface you actually live in |
 | [12 — The web UI](12-web-ui.md) | Supervisor, mount adoption, partial polls, CSRF | Why the UI behaves the way it does |
 | [13 — Lessons learned](13-lessons-learned.md) | Real bugs and what they taught us | Pattern library for future work |
+| [14 — A perf + correctness pass](14-perf-correctness-pass.md) | Kernel-untar incident: LIMIT_INVALID, FK violations, rate-limit lane split, UX overhaul | Walks through one session that hardened several subsystems at once |
 
 ## Conventions
 

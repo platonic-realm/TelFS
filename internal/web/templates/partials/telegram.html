@@ -13,7 +13,8 @@
     {{if .State.ChannelTitle}}
     <tr><td>Channel</td><td><code>{{.State.ChannelTitle}}</code> (id {{.State.ChannelID}})</td></tr>
     {{end}}
-    <tr><td>RPCs sent (since daemon start)</td><td><strong>{{.State.TotalOK}}</strong> ok / <strong>{{.State.TotalErr}}</strong> err · {{humanBytes .State.TotalBytes}}</td></tr>
+    <tr><td>RPCs sent (since daemon start)</td><td><strong>{{.State.TotalOK}}</strong> ok / <strong>{{.State.TotalErr}}</strong> err</td></tr>
+    <tr><td>Wire bytes</td><td>tx <strong>{{humanBytes .State.TotalBytesTx}}</strong> · rx <strong>{{humanBytes .State.TotalBytesRx}}</strong> <small>(total payload = {{humanBytes .State.TotalBytes}})</small></td></tr>
     <tr><td>In-flight</td><td><strong>{{.State.InFlight}}</strong></td></tr>
     {{if .State.LastSuccessUnix}}
     <tr><td>Last successful RPC</td><td>{{.State.LastSuccessAgeSeconds}}s ago</td></tr>
@@ -32,43 +33,49 @@
 <div class="panel">
   <h3>Upload queue <small>(snapshot every 2 s)</small></h3>
   <table class="kv">
-    <tr>
+    <tr title="Concurrent MTProto round trips. Counts SaveBigFilePart + SendMedia + any other RPC currently in flight, gated by the upload semaphore.">
       <td>Pool</td>
       <td>
-        <strong>{{.State.Queue.PoolInFlight}}</strong> of {{.State.Queue.PoolCap}} concurrency slots in use
-        <small>(MTProto round trips active right now)</small>
+        <strong>{{.State.Queue.PoolInFlight}}</strong> of {{.State.Queue.PoolCap}}
+        <div class="qbar">
+          <div class="qbar-fill" style="width: {{pctOf .State.Queue.PoolInFlight .State.Queue.PoolCap}}%"></div>
+        </div>
+        <small>concurrency slots in use</small>
       </td>
     </tr>
-    <tr>
+    <tr title="Wires accumulated in memory waiting for the next packed-blob upload. The packer flushes when this hits the target or the 1-second window elapses, whichever first.">
       <td>Packer buffer</td>
       <td>
         <strong>{{.State.Queue.PackerChunks}}</strong> chunk(s),
         <strong>{{humanBytes .State.Queue.PackerBytes}}</strong>
         {{if gt .State.Queue.PackerTargetBytes 0}}
-          <small>(flush triggers at {{humanBytes .State.Queue.PackerTargetBytes}})</small>
+          <div class="qbar">
+            <div class="qbar-fill" style="width: {{pctOf64 .State.Queue.PackerBytes .State.Queue.PackerTargetBytes}}%"></div>
+          </div>
+          <small>flush at {{humanBytes .State.Queue.PackerTargetBytes}}</small>
         {{end}}
       </td>
     </tr>
-    <tr>
+    <tr title="Wires durably staged on disk under cache/pending/. Each one is a chunk dispatched to the packer whose chunk_map row hasn't landed yet. Survives daemon crash; the next startup re-submits them.">
       <td>Staged on disk</td>
       <td>
         <strong>{{.State.Queue.PendingWiresCount}}</strong> wire(s),
         <strong>{{humanBytes .State.Queue.PendingWiresBytes}}</strong>
         {{if gt .State.Queue.PendingWiresCount 0}}
-          <small>(dispatched, chunk_map row not yet landed — survives daemon crash)</small>
+          <small>dispatched, chunk_map row not yet landed</small>
         {{else}}
-          <small>(all dispatched chunks have committed)</small>
+          <small>all dispatched chunks have committed</small>
         {{end}}
       </td>
     </tr>
-    <tr>
+    <tr title="Local journal rows that haven't been posted to the channel yet. The poster batches up to 1000 ops per channel message.">
       <td>Journal unposted</td>
       <td>
         <strong>{{.State.Queue.JournalUnposted}}</strong> op(s)
         {{if gt .State.Queue.JournalUnposted 0}}
-          <small>(meta mutations waiting for the next poster tick to land on the channel)</small>
+          <small>meta mutations waiting for the next poster tick</small>
         {{else}}
-          <small>(every mutation is mirrored to the channel)</small>
+          <small>every mutation is mirrored to the channel</small>
         {{end}}
       </td>
     </tr>
@@ -130,7 +137,7 @@
         {{else}}<span class="ok">ok</span>{{end}}
       </td>
       <td>{{if .InFlight}}—{{else}}{{formatDuration .DurationMS}}{{end}}</td>
-      <td>{{.Bytes}}</td>
+      <td>{{humanBytes .Bytes}}</td>
       <td>{{if gt .FloodWaitSeconds 0}}{{.FloodWaitSeconds}}s{{else}}—{{end}}</td>
     </tr>
   {{else}}

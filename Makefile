@@ -38,7 +38,7 @@ help: ## Show this help
 
 build: ## Build the telfs binary into bin/
 	@mkdir -p bin
-	$(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/telfs
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/telfs
 
 run: build ## Build then run telfs with no args (prints usage)
 	$(BIN)

@@ -65,6 +65,64 @@
   }
 }
 
+/* Explicit overrides via the header theme toggle. Mirror the dark
+   media block above; the [data-theme="..."] selector wins over the
+   media query so toggle decisions survive a system-pref change. */
+html[data-theme="dark"] {
+  --bg:          #0d1117;
+  --bg-page:     #010409;
+  --bg-subtle:   #161b22;
+  --bg-elev:     #161b22;
+  --bg-code:     #1c2129;
+  --fg:          #e6edf3;
+  --fg-muted:    #9198a1;
+  --fg-subtle:   #6e7681;
+  --fg-on-acc:   #ffffff;
+  --border:      #30363d;
+  --border-soft: #21262d;
+  --acc:         #4493f8;
+  --acc-hover:   #79b8ff;
+  --acc-soft:    #0c2d6b;
+  --ok-fg:       #3fb950;
+  --ok-bg:       #0d2818;
+  --ok-border:   #1f6e34;
+  --warn-fg:     #d29922;
+  --warn-bg:     #2d2410;
+  --warn-border: #6d4d05;
+  --err-fg:      #f85149;
+  --err-bg:      #28100f;
+  --err-border:  #7d0e10;
+  --shadow-sm:   0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md:   0 3px 6px rgba(0, 0, 0, 0.55);
+}
+html[data-theme="light"] {
+  --bg:          #f6f8fa;
+  --bg-page:     #ffffff;
+  --bg-subtle:   #f0f2f5;
+  --bg-elev:     #ffffff;
+  --bg-code:     #eef1f4;
+  --fg:          #1f2328;
+  --fg-muted:    #57606a;
+  --fg-subtle:   #8b949e;
+  --fg-on-acc:   #ffffff;
+  --border:      #d0d7de;
+  --border-soft: #e6e8eb;
+  --acc:         #0969da;
+  --acc-hover:   #0858b8;
+  --acc-soft:    #ddf4ff;
+  --ok-fg:       #1a7f37;
+  --ok-bg:       #dafbe1;
+  --ok-border:   #aceebb;
+  --warn-fg:     #9a6700;
+  --warn-bg:     #fff8c5;
+  --warn-border: #eac54f;
+  --err-fg:      #cf222e;
+  --err-bg:      #ffebe9;
+  --err-border:  #ffaba8;
+  --shadow-sm:   0 1px 2px rgba(31, 35, 40, 0.04);
+  --shadow-md:   0 3px 6px rgba(31, 35, 40, 0.08);
+}
+
 /* ─── reset / base ──────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
@@ -165,6 +223,73 @@ header nav a.active {
   background: var(--accent, #2563eb);
   color: #ffffff;
 }
+/* Setup dropdown — CSS-only via <details>. Open while the summary is
+   focused (so it stays open after a click) OR while the menu is being
+   hovered over. */
+header nav details.nav-group {
+  position: relative;
+}
+header nav details.nav-group > summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: .92rem;
+  font-weight: 500;
+  padding: .35rem .7rem;
+  border-radius: var(--radius-sm);
+  user-select: none;
+}
+header nav details.nav-group > summary::-webkit-details-marker { display: none; }
+header nav details.nav-group > summary:hover {
+  background: var(--bg-subtle);
+  color: var(--fg);
+}
+header nav details.nav-group .nav-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: .25rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  min-width: 12rem;
+  padding: .25rem;
+  display: flex;
+  flex-direction: column;
+  z-index: 20;
+}
+header nav details.nav-group .nav-menu a {
+  padding: .4rem .7rem;
+  border-radius: var(--radius-sm);
+}
+header nav details.nav-group[open] > summary {
+  background: var(--bg-subtle);
+  color: var(--fg);
+}
+
+/* Header extras: health pill + theme toggle on the right. */
+.header-extras {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+.theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: .25rem .45rem;
+  font-size: 1rem;
+  cursor: pointer;
+  color: var(--fg-muted);
+  line-height: 1;
+}
+.theme-toggle:hover {
+  background: var(--bg-subtle);
+  color: var(--fg);
+}
+
 header nav a.active:hover {
   background: var(--accent, #2563eb);
   color: #ffffff;
@@ -173,10 +298,11 @@ header nav a.active:hover {
 
 /* ─── main / footer ─────────────────────────────────────────────── */
 main {
-  max-width: 1080px;
+  max-width: 960px;
   margin: 0 auto;
-  padding: 1.75rem 1.5rem 3rem;
+  padding: 1.4rem 1.4rem 3rem;
 }
+body.browse-page main { max-width: 1200px; }
 footer {
   text-align: center;
   color: var(--fg-subtle);
@@ -189,8 +315,8 @@ footer {
   background: var(--bg-elev);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
-  padding: 1.1rem 1.25rem;
-  margin-bottom: 1.1rem;
+  padding: .9rem 1.1rem;
+  margin-bottom: .9rem;
   box-shadow: var(--shadow-sm);
 }
 .card h2, .card h3 { margin-top: 0; }
@@ -276,6 +402,69 @@ tr.file td:first-child a:hover { color: var(--acc); }
 td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg-muted); }
 td.actions { text-align: right; white-space: nowrap; }
 
+/* browse toolbar — one row of action chips above the file table.
+   Each chip is a <details> that reveals an inline form. Mirrors the
+   row-confirm panel pattern but anchored to the toolbar, not table
+   row. */
+.browse-toolbar {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin: .25rem 0 .8rem;
+}
+.browse-toolbar details.toolbar-action {
+  position: relative;
+}
+.browse-toolbar details.toolbar-action > summary {
+  list-style: none;
+  cursor: pointer;
+}
+.browse-toolbar details.toolbar-action > summary::-webkit-details-marker { display: none; }
+.browse-toolbar form.toolbar-form {
+  position: absolute;
+  left: 0;
+  top: calc(100% + .25rem);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  padding: .65rem .8rem;
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  min-width: 22rem;
+  z-index: 25;
+}
+.browse-toolbar form.toolbar-form small { color: var(--fg-muted); }
+.browse-filter { margin-left: auto; }
+.browse-filter input[type="search"] {
+  padding: .35rem .6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  color: var(--fg);
+  min-width: 14rem;
+}
+
+/* queue depth visual bars — used by the upload-queue panel rows on
+   /telegram. Stays inline beside the text so the eye gets both the
+   number and a sense of "how full" without a separate chart. */
+.qbar {
+  width: 100%;
+  max-width: 14rem;
+  height: .35rem;
+  background: var(--bg-subtle);
+  border-radius: 999px;
+  overflow: hidden;
+  margin: .2rem 0 .15rem;
+}
+.qbar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--acc), #6e40c9);
+  transition: width .25s ease-out;
+}
+
 /* repair progress bar */
 .progress-bar {
   width: 100%;
@@ -291,6 +480,32 @@ td.actions { text-align: right; white-space: nowrap; }
   background: var(--acc);
   transition: width .25s ease-out;
 }
+/* Inline confirm — used by destructive actions in tables (delete,
+   stop, unmount). Replaces the legacy browser confirm() popup with a
+   styled inline panel: click the summary to reveal a confirm form,
+   click outside (or away) to dismiss. Lives next to the rename
+   <details> pattern that already worked. */
+details.row-confirm { display: inline-block; position: relative; }
+details.row-confirm > summary { list-style: none; cursor: pointer; }
+details.row-confirm > summary::-webkit-details-marker { display: none; }
+details.row-confirm form.confirm-form {
+  position: absolute;
+  right: 0;
+  top: calc(100% + .25rem);
+  background: var(--bg-elev);
+  border: 1px solid var(--err-border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  padding: .65rem .8rem;
+  min-width: 18rem;
+  max-width: 24rem;
+  text-align: left;
+  z-index: 30;
+  white-space: normal;
+}
+details.row-confirm form.confirm-form p { font-size: .85rem; margin: 0 0 .5rem; }
+details.row-confirm form.confirm-form strong { font-size: .92rem; }
+
 td.actions form { display: inline-flex; }
 td.actions .btn.small, td.actions button.small {
   padding: .15rem .5rem;

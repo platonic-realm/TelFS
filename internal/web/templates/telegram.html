@@ -4,34 +4,51 @@
 {{template "telegram_panel" .}}
 
 <section class="card">
-  <h3>Request rate limit</h3>
+  <h3>Request rate limits</h3>
   <p><small>
-    Caps outgoing MTProto requests at a per-minute budget. Helps avoid
-    cascading <code>FLOOD_WAIT</code> errors during bursty workloads
-    (tar extracts, mass deletes) at the cost of throughput. The running
-    daemon polls this setting every 5 s — changes take effect without
-    a remount, whether you set it here or via <code>telfs ratelimit set N</code>.
+    Two independent lanes. <strong>Upload</strong> covers everything that
+    isn't a download (SaveFilePart, SaveBigFilePart, SendMedia, journal
+    posts, snapshot uploads, channel scans). <strong>Download</strong>
+    covers <code>upload.getFile</code> only (cache misses + range reads).
+    The split keeps a heavy upload session from starving reads. The
+    running daemon polls these settings every 5 s — changes take effect
+    without a remount, whether you set them here or via
+    <code>telfs ratelimit set</code>.
   </small></p>
   <dl>
-    <dt>Current setting</dt>
+    <dt>Upload</dt>
     <dd>
       {{if lt .RateLimitPerMin 0}}
-        <span class="pill muted">unknown</span> <small>— couldn't read meta DB (no active profile or DB not initialized)</small>
+        <span class="pill muted">unknown</span> <small>— couldn't read meta DB</small>
       {{else if eq .RateLimitPerMin 0}}
-        <span class="pill muted">unlimited</span> <small>— historical default; no cap on outgoing requests</small>
+        <span class="pill muted">unlimited</span> <small>— no cap on outgoing upload requests</small>
       {{else}}
         <strong>{{.RateLimitPerMin}}</strong> requests/min
+      {{end}}
+    </dd>
+    <dt>Download</dt>
+    <dd>
+      {{if lt .DownloadRateLimitPerMin 0}}
+        <span class="pill muted">unknown</span>
+      {{else if eq .DownloadRateLimitPerMin 0}}
+        <span class="pill muted">unlimited</span> <small>— recommended default; TG rarely FLOOD_WAITs downloads</small>
+      {{else}}
+        <strong>{{.DownloadRateLimitPerMin}}</strong> requests/min
       {{end}}
     </dd>
   </dl>
   <form method="post" action="/telegram/ratelimit">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <label>
-      Cap (requests/min) — 0 or empty disables the limit
-      <input type="number" name="per_minute" min="0" placeholder="0" value="{{if gt .RateLimitPerMin 0}}{{.RateLimitPerMin}}{{end}}">
+      Upload cap (req/min) — 0 disables
+      <input type="number" name="upload_per_minute" min="0" placeholder="0" value="{{if gt .RateLimitPerMin 0}}{{.RateLimitPerMin}}{{end}}">
+    </label>
+    <label>
+      Download cap (req/min) — 0 disables
+      <input type="number" name="download_per_minute" min="0" placeholder="0" value="{{if gt .DownloadRateLimitPerMin 0}}{{.DownloadRateLimitPerMin}}{{end}}">
     </label>
     <button type="submit">Apply</button>
-    <small>Suggested starting point: 60–120 req/min. Lower = safer, higher = faster.</small>
+    <small>Suggested starting point: upload 60–120 req/min, download unlimited.</small>
   </form>
 </section>
 

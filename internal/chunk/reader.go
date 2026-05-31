@@ -110,22 +110,25 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 	if len(dest) == 0 {
 		return 0, nil
 	}
-	// Async-close barrier: if a writer recently called Flush on this
-	// ino and the upload goroutines haven't landed yet, wait for them
-	// so chunk_map sees the new rows before we look. Fast path is a
-	// single mutex roundtrip + nil-channel return when nothing is in
-	// flight, so reads of cold files pay no measurable cost.
-	if r.pending != nil {
-		if err := r.pending.Wait(ctx, ino); err != nil {
-			return 0, err
-		}
-	}
 	// Per-inode chunk size: each file picks its tier at first
 	// dispatch; the value is stored on the inode row. Look it up
 	// once per ReadAt and use that for idx math (instead of the
 	// reader's FS-default chunkSize). One extra GetInode per
 	// ReadAt — comparable to the per-chunk GetChunk cost already
 	// in the loop below.
+	//
+	// Note: there is NO unconditional pending.Wait up here, even
+	// when a writer recently dispatched chunks for this ino. The
+	// barrier still exists, but we only fall back to it when both
+	// chunk_map AND the on-disk staging dir come up empty. That way
+	// reads of freshly-written files (whose plaintext wires are
+	// already on disk under cache/pending/) skip the network round-
+	// trip entirely — they're served from the staging dir at memory
+	// speed. The barrier matters for the corner case where the
+	// packer's flush has DELETED the staged wire but PutChunk
+	// hasn't committed the row yet (a very brief window inside
+	// flush()); ReadFromStaging-or-wait sequencing handles that
+	// without paying the barrier cost on the common path.
 	in, err := r.meta.GetInode(ctx, ino)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
@@ -150,44 +153,14 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 		// with this chunk's fetch.
 		r.scheduleAhead(ino, idx+1, PrefetchWindow)
 
-		c, err := r.meta.GetChunk(ctx, ino, idx)
-		var data []byte
-		if errors.Is(err, meta.ErrNotFound) {
-			// chunk_map has no row for this idx. Two cases:
-			//
-			//  - Genuine EOF — idx is past the file's last chunk.
-			//    inode.size tells us how far the file goes; if we're
-			//    past it, the read terminates here.
-			//  - Pre-commit window — the chunk has been dispatched
-			//    (wire staged in pendingDir) but PutChunk hasn't run
-			//    yet. The wire on disk holds the bytes; decode and
-			//    serve. This is the scenario that turns "tar wrote
-			//    it, then read it back as zeros while the packer is
-			//    still flushing" into a non-issue.
-			chunkStart := int64(idx) * chunkSize
-			if chunkStart >= in.Size {
-				// Real EOF.
-				return written, nil
-			}
-			pdata, found, perr := r.tryPendingFallback(ino, idx)
-			if perr != nil {
-				return written, perr
-			}
-			if !found {
-				// inode says there should be bytes here but neither
-				// chunk_map nor the staging dir has them. Surface
-				// EIO so the caller knows the data is genuinely
-				// gone, instead of returning silent zero-fill.
-				return written, fmt.Errorf("chunk %d/%d: missing from chunk_map AND staging (data lost)", ino, idx)
-			}
-			data = pdata
-		} else if err != nil {
-			return written, fmt.Errorf("chunk lookup %d/%d: %w", ino, idx, err)
-		} else {
-			data, err = r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
-			if err != nil {
-				return written, err
-			}
+		data, err := r.fetchOne(ctx, ino, idx, chunkSize, in.Size)
+		if err != nil {
+			return written, err
+		}
+		if data == nil {
+			// fetchOne returns nil + nil error when the loop has
+			// walked past EOF (idx >= ceil(in.Size / chunkSize)).
+			return written, nil
 		}
 		chunkStart := int64(idx) * chunkSize
 		relStart := cur - chunkStart
@@ -211,6 +184,82 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 		}
 	}
 	return written, nil
+}
+
+// fetchOne returns the plaintext bytes for chunk idx of ino, walking
+// the three-tier read path:
+//
+//  1. chunk_map row + cache.Get (hot path — file is fully uploaded).
+//  2. Staging-dir fallback (the wire is on local disk but the
+//     packer hasn't committed the chunk_map row yet — typical for
+//     freshly-written files mid-flush). Decode the wire inline.
+//  3. R-A-W barrier wait + re-check both above (covers the brief
+//     packer.flush() window where the wire was deleted before the
+//     row landed, or where the inode genuinely had work in flight
+//     that wasn't on disk yet).
+//
+// Returns (data, nil) on success; (nil, nil) when idx is past EOF
+// (a normal short-read termination signal — caller's loop bails);
+// (nil, err) for genuine failures (data lost, decrypt mismatch,
+// network error on cache.Get, etc).
+//
+// Splitting this out keeps ReadAt's loop body readable: at the call
+// site you have "fetch this chunk or terminate" semantics, and the
+// three-tier dance lives in one named function with a single happy
+// path.
+func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, inSize int64) ([]byte, error) {
+	chunkStart := int64(idx) * chunkSize
+
+	c, err := r.meta.GetChunk(ctx, ino, idx)
+	if err == nil {
+		return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
+	}
+	if !errors.Is(err, meta.ErrNotFound) {
+		return nil, fmt.Errorf("chunk lookup %d/%d: %w", ino, idx, err)
+	}
+	// Row not committed. Could be EOF, could be pending.
+	if chunkStart >= inSize {
+		return nil, nil
+	}
+	// Tier 2: staging dir. Avoids the R-A-W barrier on the common
+	// case where the writer just dispatched but the packer hasn't
+	// flushed yet.
+	pdata, found, perr := r.tryPendingFallback(ino, idx)
+	if perr != nil {
+		return nil, perr
+	}
+	if found {
+		return pdata, nil
+	}
+	// Tier 3: barrier. If pending is non-nil AND it has work for
+	// this ino, wait for the current upload batch to drain, then
+	// retry chunk_map (the row should land) and the staging dir
+	// (the wire may have just been deleted by a successful flush).
+	if r.pending != nil {
+		if err := r.pending.Wait(ctx, ino); err != nil {
+			return nil, err
+		}
+		c, err := r.meta.GetChunk(ctx, ino, idx)
+		if err == nil {
+			return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
+		}
+		if !errors.Is(err, meta.ErrNotFound) {
+			return nil, fmt.Errorf("chunk lookup %d/%d: %w", ino, idx, err)
+		}
+		pdata, found, perr := r.tryPendingFallback(ino, idx)
+		if perr != nil {
+			return nil, perr
+		}
+		if found {
+			return pdata, nil
+		}
+	}
+	// chunk_map empty, staging empty, no pending upload to wait
+	// for. inode.size says there should be bytes here, but every
+	// source has come up empty — surface EIO so the caller knows
+	// the data is genuinely gone instead of returning silent zero-
+	// fill that the kernel would happily pad with NULs.
+	return nil, fmt.Errorf("chunk %d/%d: missing from chunk_map AND staging (data lost)", ino, idx)
 }
 
 // tryPendingFallback looks under the staging dir for a wire

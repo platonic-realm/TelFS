@@ -10,21 +10,29 @@ import (
 	"telfs/internal/meta"
 )
 
-const ratelimitUsage = `telfs ratelimit — view or change the TG requests/minute cap
+const ratelimitUsage = `telfs ratelimit — view or change the TG requests/minute caps
 
-The cap is enforced inside the daemon's gotd middleware. While the daemon is
-running it polls meta_kv every 5 s, so set/clear take effect WITHOUT a
-remount. Zero means unlimited (the historical default).
+The caps are enforced inside the daemon's gotd middleware. While the daemon
+is running it polls meta_kv every 5 s, so set/clear take effect WITHOUT a
+remount. Zero means unlimited (the safe default for downloads; the
+historical default for uploads too).
+
+Two independent lanes:
+  upload    — every RPC that isn't a download (SaveFilePart, SaveBigFilePart,
+              SendMedia, channel scans, journal posts, snapshot uploads).
+  download  — upload.getFile only (cache misses, range reads, etc.).
 
 usage:
-  telfs ratelimit show          print the current cap (0 = unlimited)
-  telfs ratelimit set <N>       set cap to N requests/min (>0)
-  telfs ratelimit clear         disable the cap (same as 'set 0')
+  telfs ratelimit show                          print both caps
+  telfs ratelimit set <N>                       set UPLOAD cap to N req/min
+  telfs ratelimit set --download <N>            set DOWNLOAD cap to N req/min
+  telfs ratelimit set --upload <U> --download <D>   set both at once
+  telfs ratelimit clear                         disable BOTH caps
+  telfs ratelimit clear --upload | --download   disable one lane
 
 Use this when bursty workloads (tar extracts, mass deletes) trigger
-cascading FLOOD_WAITs. A conservative starting point is 60–120 req/min,
-which leaves headroom under Telegram's per-user budget while still
-making forward progress.
+cascading FLOOD_WAITs on the upload side. Throttle uploads first; leave
+downloads unlimited unless you specifically need to slow reads.
 `
 
 func cmdRateLimit(ctx context.Context, args []string) error {
@@ -44,39 +52,21 @@ func cmdRateLimit(ctx context.Context, args []string) error {
 
 	switch args[0] {
 	case "show":
-		n, err := mstore.TGRateLimitPerMin(ctx)
+		up, err := mstore.TGRateLimitPerMin(ctx)
 		if err != nil {
 			return err
 		}
-		if n == 0 {
-			fmt.Println("rate limit: unlimited (historical default)")
-		} else {
-			fmt.Printf("rate limit: %d requests/min\n", n)
+		down, err := mstore.TGDownloadRateLimitPerMin(ctx)
+		if err != nil {
+			return err
 		}
+		fmt.Printf("upload   rate limit: %s\n", fmtRL(up))
+		fmt.Printf("download rate limit: %s\n", fmtRL(down))
 		return nil
 	case "set":
-		if len(args) != 2 {
-			return fmt.Errorf("ratelimit set: expected <N>")
-		}
-		n, err := strconv.Atoi(args[1])
-		if err != nil {
-			return fmt.Errorf("ratelimit set: %w", err)
-		}
-		if err := mstore.SetTGRateLimitPerMin(ctx, n); err != nil {
-			return err
-		}
-		if n == 0 {
-			fmt.Println("rate limit cleared (unlimited)")
-		} else {
-			fmt.Printf("rate limit set to %d requests/min — takes effect on the running daemon within 5 s\n", n)
-		}
-		return nil
+		return setRateLimits(ctx, mstore, args[1:])
 	case "clear":
-		if err := mstore.SetTGRateLimitPerMin(ctx, 0); err != nil {
-			return err
-		}
-		fmt.Println("rate limit cleared (unlimited)")
-		return nil
+		return clearRateLimits(ctx, mstore, args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(ratelimitUsage)
 		return nil
@@ -85,4 +75,115 @@ func cmdRateLimit(ctx context.Context, args []string) error {
 		os.Exit(2)
 		return nil
 	}
+}
+
+// fmtRL renders a per-minute value for the `show` output. Zero is
+// rendered as "unlimited" rather than "0 requests/min" so operators
+// don't have to remember the convention.
+func fmtRL(n int) string {
+	if n == 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d requests/min", n)
+}
+
+// setRateLimits accepts forms:
+//
+//	set N                          — upload cap only
+//	set --upload N                  — upload cap only
+//	set --download N                — download cap only
+//	set --upload N --download M     — both
+func setRateLimits(ctx context.Context, mstore *meta.Store, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("ratelimit set: expected <N> or --upload N / --download N")
+	}
+	// Bare-number form (back-compat).
+	if len(args) == 1 {
+		n, err := strconv.Atoi(args[0])
+		if err == nil {
+			if err := mstore.SetTGRateLimitPerMin(ctx, n); err != nil {
+				return err
+			}
+			fmt.Printf("upload rate limit: %s — takes effect within 5 s\n", fmtRL(n))
+			return nil
+		}
+	}
+	var (
+		upSet, downSet bool
+		up, down       int
+	)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--upload", "-u":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--upload: missing value")
+			}
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil {
+				return fmt.Errorf("--upload %q: %w", args[i], err)
+			}
+			up, upSet = n, true
+		case "--download", "-d":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--download: missing value")
+			}
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil {
+				return fmt.Errorf("--download %q: %w", args[i], err)
+			}
+			down, downSet = n, true
+		default:
+			return fmt.Errorf("unknown set flag %q", args[i])
+		}
+	}
+	if !upSet && !downSet {
+		return fmt.Errorf("ratelimit set: no lane specified")
+	}
+	if upSet {
+		if err := mstore.SetTGRateLimitPerMin(ctx, up); err != nil {
+			return err
+		}
+		fmt.Printf("upload rate limit: %s — takes effect within 5 s\n", fmtRL(up))
+	}
+	if downSet {
+		if err := mstore.SetTGDownloadRateLimitPerMin(ctx, down); err != nil {
+			return err
+		}
+		fmt.Printf("download rate limit: %s — takes effect within 5 s\n", fmtRL(down))
+	}
+	return nil
+}
+
+// clearRateLimits clears one or both lanes. Bare `clear` zeroes both
+// (matching the legacy behavior, which only had one lane to clear).
+func clearRateLimits(ctx context.Context, mstore *meta.Store, args []string) error {
+	clearUp, clearDown := true, true
+	if len(args) > 0 {
+		clearUp, clearDown = false, false
+		for _, a := range args {
+			switch a {
+			case "--upload", "-u":
+				clearUp = true
+			case "--download", "-d":
+				clearDown = true
+			default:
+				return fmt.Errorf("unknown clear flag %q", a)
+			}
+		}
+	}
+	if clearUp {
+		if err := mstore.SetTGRateLimitPerMin(ctx, 0); err != nil {
+			return err
+		}
+		fmt.Println("upload rate limit cleared (unlimited)")
+	}
+	if clearDown {
+		if err := mstore.SetTGDownloadRateLimitPerMin(ctx, 0); err != nil {
+			return err
+		}
+		fmt.Println("download rate limit cleared (unlimited)")
+	}
+	return nil
 }
