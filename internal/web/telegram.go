@@ -85,15 +85,35 @@ func (s *Server) telegramPage(w http.ResponseWriter, r *http.Request) {
 }
 
 // telegramPartial is the HTMX-polled inner fragment. Same data
-// fetch as telegramPage; renders only the telegram_panel block so
-// hx-swap can replace the section without a full page navigation.
+// fetch as telegramPage but uses fetchTelegramStatePartial which
+// SKIPS basePage — so the 2s poll doesn't rotate the CSRF cookie
+// (which would break the still-rendered Apply form) and doesn't
+// CONSUME the flash message (which would be silently eaten before
+// the user sees it).
 func (s *Server) telegramPartial(w http.ResponseWriter, r *http.Request) {
-	data := s.fetchTelegramState(w, r)
+	data := s.fetchTelegramStatePartial(r)
 	s.renderPartialBlock(w, "partials/telegram.html", "telegram_panel", data)
 }
 
+// fetchTelegramStatePartial is the htmx-poll variant: same network
+// fetch + parse as fetchTelegramState, but skips basePage so the
+// poll doesn't consume the flash or rotate CSRF. The partial
+// template doesn't reference any pageBase fields anyway.
+func (s *Server) fetchTelegramStatePartial(r *http.Request) tgPageData {
+	url := "http://127.0.0.1:9090/telegram"
+	if v := r.URL.Query().Get("source"); v != "" {
+		url = v
+	}
+	data := tgPageData{
+		Source:  url,
+		NowUnix: time.Now().Unix(),
+	}
+	populateTGState(&data, url)
+	return data
+}
+
 // fetchTelegramState pulls + parses the daemon's /telegram JSON for
-// rendering by either the page or the partial.
+// the full-page render (CSRF + flash needed for the form).
 func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPageData {
 	url := "http://127.0.0.1:9090/telegram"
 	if v := r.URL.Query().Get("source"); v != "" {
@@ -105,28 +125,37 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 		NowUnix:         time.Now().Unix(),
 		RateLimitPerMin: readRateLimitFromMeta(r.Context()),
 	}
+	populateTGState(&data, url)
+	return data
+}
+
+// populateTGState does the actual HTTP fetch + JSON parse + reverse-
+// order. Pure function so both fetchTelegramState (full page) and
+// fetchTelegramStatePartial (htmx fragment) can share the network
+// step without dragging in basePage's CSRF/flash side effects.
+func populateTGState(data *tgPageData, url string) {
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		data.Online = false
 		data.FetchError = err.Error()
-		return data
+		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		data.Online = false
 		data.FetchError = fmt.Sprintf("HTTP %d from daemon", resp.StatusCode)
-		return data
+		return
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		data.Online = false
 		data.FetchError = "read body: " + err.Error()
-		return data
+		return
 	}
 	if err := json.Unmarshal(body, &data.State); err != nil {
 		data.Online = false
 		data.FetchError = "parse json: " + err.Error()
-		return data
+		return
 	}
 	data.Online = true
 	if data.State.LastSuccessAgeSeconds > 0 && data.State.InFlight > 0 {
@@ -139,7 +168,6 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 	for i, j := 0, len(reqs)-1; i < j; i, j = i+1, j-1 {
 		reqs[i], reqs[j] = reqs[j], reqs[i]
 	}
-	return data
 }
 
 // httpClient has a short timeout — the daemon's /telegram endpoint

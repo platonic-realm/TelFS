@@ -38,15 +38,21 @@ func NewState() *State {
 // EnsureCSRF returns the request's existing CSRF token from cookie, or
 // mints a new one and writes a Set-Cookie header. Should be called by
 // every GET handler that renders a form.
+//
+// If the browser sends a cookie that looks like one of ours (32 hex
+// chars) but isn't in the in-memory map, we ADOPT it rather than
+// rotating to a new token. Otherwise a web server restart would
+// silently expire every form currently rendered in a user's browser
+// — they'd type, hit Apply, and get 403 because the in-memory map
+// no longer has their token. The cookie itself is the source of
+// truth for CSRF protection (same-origin guarantee); the in-memory
+// map is only for janitorial expiry, not security.
 func (s *State) EnsureCSRF(w http.ResponseWriter, r *http.Request) string {
-	if c, err := r.Cookie(csrfCookie); err == nil && c.Value != "" {
+	if c, err := r.Cookie(csrfCookie); err == nil && looksLikeCSRFToken(c.Value) {
 		s.mu.Lock()
-		if _, ok := s.csrfs[c.Value]; ok {
-			s.csrfs[c.Value] = time.Now()
-			s.mu.Unlock()
-			return c.Value
-		}
+		s.csrfs[c.Value] = time.Now()
 		s.mu.Unlock()
+		return c.Value
 	}
 	t := randomHex(16)
 	s.mu.Lock()
@@ -63,8 +69,33 @@ func (s *State) EnsureCSRF(w http.ResponseWriter, r *http.Request) string {
 	return t
 }
 
+// looksLikeCSRFToken filters out empty/short/wrong-format cookie
+// values so a tampered client can't push an arbitrary string into
+// the in-memory map. The tokens we mint are 32 lowercase hex chars
+// (16 random bytes hex-encoded); reject anything that doesn't look
+// like one.
+func looksLikeCSRFToken(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // CheckCSRF verifies the form's `csrf` field matches the cookie's
 // token (both must be present and equal). Returns nil on success.
+//
+// Same adoption story as EnsureCSRF: if the cookie ↔ form pair
+// matches and the value looks like a token we'd have minted, accept
+// it even if it's not in the in-memory map. The cookie ↔ form
+// equality is what defeats CSRF; the map only ages tokens out.
+// Without this, a web restart between form-render and form-submit
+// silently 403s the submit.
 func (s *State) CheckCSRF(r *http.Request) error {
 	c, err := r.Cookie(csrfCookie)
 	if err != nil || c.Value == "" {
@@ -77,11 +108,11 @@ func (s *State) CheckCSRF(r *http.Request) error {
 	if subtle.ConstantTimeCompare([]byte(c.Value), []byte(form)) != 1 {
 		return fmt.Errorf("csrf mismatch")
 	}
+	if !looksLikeCSRFToken(c.Value) {
+		return fmt.Errorf("csrf token malformed")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.csrfs[c.Value]; !ok {
-		return fmt.Errorf("csrf token expired")
-	}
 	s.csrfs[c.Value] = time.Now()
 	return nil
 }

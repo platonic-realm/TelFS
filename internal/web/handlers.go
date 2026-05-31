@@ -95,7 +95,15 @@ func (s *Server) dashboardIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) statusPartial(w http.ResponseWriter, r *http.Request) {
-	d := s.loadDashboard(r.Context(), w, r)
+	// Partial polls every 10s; MUST NOT go through loadDashboard
+	// because that calls basePage → ConsumeFlash + EnsureCSRF. The
+	// flash would be silently eaten before the user saw it, and a
+	// server restart between page render and form submit would
+	// rotate the CSRF cookie under the form. Build a minimal data
+	// shape with only what the partial template references.
+	d := struct {
+		Mounts []string
+	}{Mounts: activeMounts()}
 	s.renderPartial(w, "partials/status.html", d)
 }
 
