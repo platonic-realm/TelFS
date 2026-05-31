@@ -283,15 +283,37 @@ func (p *Packer) flush() {
 	}
 
 	name := fmt.Sprintf("pack-%d", time.Now().UnixNano())
-	// Uploads use a long-deadline context (not Background) so a
-	// stuck MTProto connection — where TCP send buffer is queued
-	// but Telegram isn't acking, gotd has no app-level timeout —
-	// doesn't wedge the packer indefinitely. After this fires, the
-	// batch fails, wires stay in the pending dir (PendingPath !=
-	// "" branch below skips DeletePending on err), and the next
-	// daemon startup or retry picks them up. 5 min is generous
-	// enough to ride through normal network glitches.
-	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Uploads use a long-deadline context so a stuck MTProto
+	// connection — where TCP send buffer is queued but Telegram
+	// isn't acking, gotd has no app-level timeout — doesn't wedge
+	// the packer indefinitely.
+	//
+	// Pick the deadline carefully. A 32 MiB packed blob is ~30
+	// UploadSaveBigFilePart RPCs plus a MessagesSendMedia finalize.
+	// Each RPC is gated by the rate limiter; with a conservative cap
+	// of 30/min one batch takes a full minute at the absolute floor.
+	// Add FLOOD_WAIT internal retries (gotd's middleware can sleep up
+	// to 60 min PER attempt), uploadWithRetry's own backoff, and one
+	// reconnect cycle (the stall watchdog at the session layer kicks
+	// at 90 s), and a single batch's wall-clock floor under hostile
+	// network + rate-limit conditions is in the 15-20 min range.
+	//
+	// The PREVIOUS value (5 min) was too aggressive. Under throttled
+	// upload, packed batches timed out mid-flight; their constituent
+	// writers had already been Closed by FUSE Release (since Flush
+	// returns async), so the result error fell through to recordLost
+	// — chunk_map rows were never written, while inode.size had
+	// already been persisted. Tens of thousands of files ended up
+	// with size > 0 and zero chunks, reading back as sparse zeros.
+	// Wires stayed in pending/ for recovery, but until the next
+	// daemon restart drained them the user saw corrupt files.
+	//
+	// 60 min lets every realistic combination of rate limit + flood
+	// wait + retry land before we give up. The stall watchdog is the
+	// right level for "the connection is wedged" detection; this
+	// timeout is just the upper bound that prevents one truly stuck
+	// upload from blocking the packer's flusher forever.
+	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancelUpload()
 	//
 	// Snapshot the assembled body via bytes.NewReader so the size
