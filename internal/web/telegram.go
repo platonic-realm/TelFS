@@ -119,6 +119,13 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 	if data.State.LastSuccessAgeSeconds > 0 && data.State.InFlight > 0 {
 		data.StallSeconds = data.State.LastSuccessAgeSeconds
 	}
+	// Reverse the requests slice so the most recent appears first.
+	// The daemon serves them oldest-first (ring-buffer insertion
+	// order); flipping in the web layer keeps the daemon API stable.
+	reqs := data.State.Requests
+	for i, j := 0, len(reqs)-1; i < j; i, j = i+1, j-1 {
+		reqs[i], reqs[j] = reqs[j], reqs[i]
+	}
 	return data
 }
 
