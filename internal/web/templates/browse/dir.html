@@ -2,30 +2,68 @@
 <nav class="crumbs" aria-label="path">
   <a href="/browse">all mounts</a>
   <span class="sep">/</span>
-  <span><code>{{.At}}</code></span>
-  {{if .P}}<span class="sep">/</span><span><code>{{.P}}</code></span>{{end}}
+  <a href="{{$.AtURL}}"><code>{{.At}}</code></a>
+  {{range .Crumbs}}
+    <span class="sep">/</span>
+    {{if .Href}}<a href="{{.Href}}"><code>{{.Name}}</code></a>{{else}}<span><code>{{.Name}}</code></span>{{end}}
+  {{end}}
   {{if not .IsRoot}}<span class="sep">·</span><a href="{{.UpURL}}">↑ parent</a>{{end}}
 </nav>
 
-<table>
-  <thead><tr><th>Name</th><th class="num">Size</th><th>Modified</th><th></th></tr></thead>
+<table class="browse">
+  <thead><tr><th>Name</th><th class="num">Size</th><th>Modified</th><th>Actions</th></tr></thead>
   <tbody>
     {{range .Entries}}
     <tr class="{{if .IsDir}}dir{{else if .IsLink}}link{{else}}file{{end}}">
       <td>
         {{if .IsDir}}📁 <a href="{{.HrefDir}}">{{.Name}}/</a>
-        {{else if .IsLink}}🔗 <span>{{.Name}}</span>
+        {{else if .IsLink}}🔗 <span>{{.Name}}</span>{{if .LinkTarget}} <small>→ <code>{{.LinkTarget}}</code></small>{{end}}
         {{else}}📄 <a href="{{.HrefFile}}">{{.Name}}</a>{{end}}
       </td>
       <td class="num">{{if not .IsDir}}{{humanBytes .Size}}{{end}}</td>
       <td><small>{{.Mtime}}</small></td>
       <td class="actions">
-        <form method="post" action="/browse/delete" style="display:inline" onsubmit="return confirm('Delete {{.Name}}?')">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <input type="hidden" name="at" value="{{$.At}}">
-          <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
-          <button type="submit" class="danger">Delete</button>
-        </form>
+        {{if not .IsDir}}
+          <a href="{{.HrefFile}}" class="btn small">Download</a>
+        {{end}}
+        <details class="row-action">
+          <summary class="btn small">Rename</summary>
+          <form method="post" action="/browse/rename" class="inline-form">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="at" value="{{$.At}}">
+            <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
+            <input type="text" name="new_name" value="{{.Name}}" required>
+            <button type="submit" class="small">Save</button>
+          </form>
+        </details>
+        {{if .IsDir}}
+          <form method="post" action="/browse/delete" class="inline-form"
+                onsubmit="return confirm('Delete directory {{.Name}}/ — empty only. Cancel and use the “recursive” form below to wipe contents.');">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="at" value="{{$.At}}">
+            <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
+            <button type="submit" class="small danger">Delete (empty)</button>
+          </form>
+          <details class="row-action">
+            <summary class="btn small danger">Delete (recursive)</summary>
+            <form method="post" action="/browse/delete" class="inline-form"
+                  onsubmit="return confirm('Recursively delete {{.Name}}/ AND every file inside? This cannot be undone.');">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="at" value="{{$.At}}">
+              <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
+              <input type="hidden" name="recursive" value="1">
+              <button type="submit" class="small danger">Wipe {{.Name}}/</button>
+            </form>
+          </details>
+        {{else}}
+          <form method="post" action="/browse/delete" class="inline-form"
+                onsubmit="return confirm('Delete {{.Name}}?');">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="at" value="{{$.At}}">
+            <input type="hidden" name="p" value="{{if $.P}}{{$.P}}/{{end}}{{.Name}}">
+            <button type="submit" class="small danger">Delete</button>
+          </form>
+        {{end}}
       </td>
     </tr>
     {{else}}
@@ -35,7 +73,7 @@
 </table>
 
 <section class="card">
-  <h3>Upload</h3>
+  <h3>Upload file</h3>
   <form method="post" action="/browse/upload" enctype="multipart/form-data">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <input type="hidden" name="at" value="{{.At}}">
@@ -46,6 +84,19 @@
     </div>
   </form>
   <p><small>Up to 2 GiB per file. Writes go through FUSE → chunk pipeline → channel.</small></p>
+</section>
+
+<section class="card">
+  <h3>Create empty file</h3>
+  <form method="post" action="/browse/newfile">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="at" value="{{.At}}">
+    <input type="hidden" name="p" value="{{.P}}">
+    <div class="row">
+      <input type="text" name="name" placeholder="new-file.txt" required>
+      <button type="submit">Create</button>
+    </div>
+  </form>
 </section>
 
 <section class="card">

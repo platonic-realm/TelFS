@@ -83,8 +83,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /browse/dir", s.browseDir)
 	s.mux.HandleFunc("GET /browse/file", s.browseFile)
 	s.mux.HandleFunc("POST /browse/mkdir", s.browseMkdir)
+	s.mux.HandleFunc("POST /browse/newfile", s.browseNewFile)
 	s.mux.HandleFunc("POST /browse/upload", s.browseUpload)
 	s.mux.HandleFunc("POST /browse/delete", s.browseDelete)
+	s.mux.HandleFunc("POST /browse/rename", s.browseRename)
 }
 
 // renderTemplate parses + executes a template set (always including

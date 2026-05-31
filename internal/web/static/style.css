@@ -275,6 +275,36 @@ tr.file td:first-child a { color: var(--fg); }
 tr.file td:first-child a:hover { color: var(--acc); }
 td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg-muted); }
 td.actions { text-align: right; white-space: nowrap; }
+td.actions form { display: inline-flex; }
+td.actions .btn.small, td.actions button.small {
+  padding: .15rem .5rem;
+  font-size: .78rem;
+  margin-left: .25rem;
+}
+.inline-form {
+  display: inline-flex;
+  gap: .25rem;
+  align-items: center;
+  margin-top: .25rem;
+}
+.inline-form input[type="text"] {
+  width: 12rem;
+  padding: .2rem .4rem;
+  font-size: .82rem;
+}
+details.row-action {
+  display: inline;
+  margin-left: .25rem;
+}
+details.row-action summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-block;
+}
+details.row-action summary::-webkit-details-marker { display: none; }
+details.row-action[open] > .inline-form {
+  margin-left: .5rem;
+}
 
 /* ─── forms ────────────────────────────────────────────────────── */
 form { margin: 0; }

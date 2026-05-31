@@ -56,17 +56,28 @@ type browseDirData struct {
 	Parent   string // p value of the parent dir; empty if at root
 	IsRoot   bool
 	UpURL    string // /browse/dir?at=...&p=parent
-	UploadOK bool   // false if the dir is read-only at the FS level (best-effort hint)
+	AtURL    string // /browse/dir?at=<at> — the mountpoint root
+	Crumbs   []browseCrumb
+	UploadOK bool // false if the dir is read-only at the FS level (best-effort hint)
+}
+
+// browseCrumb is one path segment in the breadcrumb. Href is empty
+// for the last (current) segment so the template renders it as plain
+// text instead of a link.
+type browseCrumb struct {
+	Name string
+	Href string
 }
 
 type browseEntry struct {
-	Name     string
-	IsDir    bool
-	IsLink   bool
-	Size     int64
-	Mtime    string
-	HrefDir  string // /browse/dir?at=...&p=...
-	HrefFile string // /browse/file?at=...&p=...
+	Name       string
+	IsDir      bool
+	IsLink     bool
+	Size       int64
+	Mtime      string
+	HrefDir    string // /browse/dir?at=...&p=...
+	HrefFile   string // /browse/file?at=...&p=...
+	LinkTarget string // populated when IsLink — best-effort os.Readlink
 }
 
 func (s *Server) browseDir(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +109,7 @@ func (s *Server) browseDir(w http.ResponseWriter, r *http.Request) {
 		At:       at,
 		P:        p,
 		IsRoot:   p == "" || p == ".",
+		AtURL:    browseDirHref(at, ""),
 		UploadOK: true,
 	}
 	if !d.IsRoot {
@@ -107,6 +119,25 @@ func (s *Server) browseDir(w http.ResponseWriter, r *http.Request) {
 		}
 		d.Parent = parent
 		d.UpURL = browseDirHref(at, parent)
+		// Build segment crumbs: each segment links to /browse/dir at
+		// that prefix; the trailing segment renders without a link.
+		segs := strings.Split(p, "/")
+		acc := ""
+		for i, seg := range segs {
+			if seg == "" {
+				continue
+			}
+			if acc == "" {
+				acc = seg
+			} else {
+				acc = acc + "/" + seg
+			}
+			c := browseCrumb{Name: seg}
+			if i < len(segs)-1 {
+				c.Href = browseDirHref(at, acc)
+			}
+			d.Crumbs = append(d.Crumbs, c)
+		}
 	}
 	for _, e := range entries {
 		fi, ferr := e.Info()
@@ -120,6 +151,11 @@ func (s *Server) browseDir(w http.ResponseWriter, r *http.Request) {
 			IsLink: fi.Mode()&os.ModeSymlink != 0,
 			Size:   fi.Size(),
 			Mtime:  fi.ModTime().Format(time.RFC3339),
+		}
+		if ent.IsLink {
+			if tgt, err := os.Readlink(filepath.Join(abs, e.Name())); err == nil {
+				ent.LinkTarget = tgt
+			}
 		}
 		if ent.IsDir {
 			ent.HrefDir = browseDirHref(at, childRel)
@@ -262,16 +298,131 @@ func (s *Server) browseDelete(w http.ResponseWriter, r *http.Request) {
 	if parent == "." {
 		parent = ""
 	}
-	// os.Remove (NOT RemoveAll) — refuses non-empty directories. This is
-	// a safety property we explicitly want: no accidental recursive
-	// deletes from a single click in the web UI.
+	// Default to os.Remove — refuses non-empty directories. Recursive
+	// delete requires the explicit `recursive=1` form value, which the
+	// template asks for in a second confirm dialog. This keeps a single
+	// click from wiping a populated tree.
+	recursive := r.FormValue("recursive") == "1"
+	info, statErr := os.Stat(abs)
+	if statErr != nil {
+		SetFlash(w, "error", "stat: "+statErr.Error())
+		http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+		return
+	}
+	if recursive {
+		if !info.IsDir() {
+			SetFlash(w, "error", "recursive delete only applies to directories")
+			http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+			return
+		}
+		if err := os.RemoveAll(abs); err != nil {
+			SetFlash(w, "error", "delete (recursive): "+err.Error())
+			http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+			return
+		}
+		SetFlash(w, "ok", "deleted directory "+path.Base(p)+" (recursive)")
+		http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+		return
+	}
 	if err := os.Remove(abs); err != nil {
-		SetFlash(w, "error", "delete: "+err.Error())
+		// Hint at the recursive form when the dir is non-empty.
+		if info.IsDir() {
+			SetFlash(w, "error", "directory not empty — re-submit with the recursive option")
+		} else {
+			SetFlash(w, "error", "delete: "+err.Error())
+		}
 		http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
 		return
 	}
 	SetFlash(w, "ok", "deleted "+path.Base(p))
 	http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+}
+
+// ── POST /browse/rename ───────────────────────────────────────────
+
+func (s *Server) browseRename(w http.ResponseWriter, r *http.Request) {
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	at, p, abs, err := s.resolveBrowsePath(r.FormValue("at"), r.FormValue("p"))
+	if err != nil {
+		SetFlash(w, "error", err.Error())
+		http.Redirect(w, r, "/browse", http.StatusSeeOther)
+		return
+	}
+	parent := path.Dir(p)
+	if parent == "." {
+		parent = ""
+	}
+	if p == "" || p == "." {
+		SetFlash(w, "error", "refusing to rename the mountpoint root")
+		http.Redirect(w, r, browseDirHref(at, p), http.StatusSeeOther)
+		return
+	}
+	newName := strings.TrimSpace(r.FormValue("new_name"))
+	if newName == "" || strings.ContainsAny(newName, "/\x00") {
+		SetFlash(w, "error", "invalid new name")
+		http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+		return
+	}
+	dst := filepath.Join(filepath.Dir(abs), newName)
+	// Belt-and-suspenders: dst must stay under the same mountpoint root.
+	if relCheck, err := filepath.Rel(at, dst); err != nil || strings.HasPrefix(relCheck, "..") {
+		SetFlash(w, "error", "invalid target path")
+		http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+		return
+	}
+	if _, err := os.Lstat(dst); err == nil {
+		SetFlash(w, "error", "target already exists: "+newName)
+		http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+		return
+	}
+	if err := os.Rename(abs, dst); err != nil {
+		SetFlash(w, "error", "rename: "+err.Error())
+		http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+		return
+	}
+	SetFlash(w, "ok", "renamed "+path.Base(p)+" → "+newName)
+	http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+}
+
+// ── POST /browse/newfile ──────────────────────────────────────────
+
+func (s *Server) browseNewFile(w http.ResponseWriter, r *http.Request) {
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	at, p, abs, err := s.resolveBrowsePath(r.FormValue("at"), r.FormValue("p"))
+	if err != nil {
+		SetFlash(w, "error", err.Error())
+		http.Redirect(w, r, "/browse", http.StatusSeeOther)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" || strings.ContainsAny(name, "/\x00") {
+		SetFlash(w, "error", "invalid file name")
+		http.Redirect(w, r, browseDirHref(at, p), http.StatusSeeOther)
+		return
+	}
+	dst := filepath.Join(abs, name)
+	if _, err := os.Lstat(dst); err == nil {
+		SetFlash(w, "error", "already exists: "+name)
+		http.Redirect(w, r, browseDirHref(at, p), http.StatusSeeOther)
+		return
+	}
+	// O_EXCL refuses to clobber an existing entry — second-line guard
+	// alongside the Lstat above (covers a race between check and create).
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		SetFlash(w, "error", "create: "+err.Error())
+		http.Redirect(w, r, browseDirHref(at, p), http.StatusSeeOther)
+		return
+	}
+	f.Close()
+	SetFlash(w, "ok", "created "+name)
+	http.Redirect(w, r, browseDirHref(at, p), http.StatusSeeOther)
 }
 
 // resolveBrowsePath validates that `at` is a known TelFS mountpoint
