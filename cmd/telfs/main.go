@@ -608,6 +608,11 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		chunk.CleanupPendingTmp(pendingDir)
 		pool.PendingDir = pendingDir
 		reader := chunk.NewReader(metaStore, cache, pool.Pending, chunkSize)
+		// Wire the staging-dir fallback so reads of freshly-written
+		// chunks succeed even when chunk_map hasn't seen its row yet
+		// (the wire is on disk, encoded the same way the Writer's
+		// dispatch encoded it — same cipher, same codec).
+		reader.SetPendingFallback(pendingDir, cipher, codec)
 		// Small-file packer: aggregates chunks smaller than
 		// chunk.DefaultPackThreshold into shared TG blobs to amortize
 		// the per-message RTT. Nil-safe — Writer falls back to

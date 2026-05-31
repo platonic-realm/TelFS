@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 
+	"telfs/internal/compress"
+	"telfs/internal/crypto"
 	"telfs/internal/meta"
 )
 
@@ -45,6 +49,16 @@ type Reader struct {
 	pending   *PendingInodes
 	chunkSize int64
 
+	// pendingDir + cipher + codec power the read-from-staging
+	// fallback (see ReadAt). When a chunk_map row is missing but
+	// the inode's size says the file has data, we look for the
+	// pre-dispatch wire under <pendingDir>/<ino>-<idx>-*.bin and
+	// decode it inline. Zero values disable the fallback (no
+	// pending dir, no cipher, no codec).
+	pendingDir string
+	cipher     crypto.Cipher
+	codec      compress.Codec
+
 	// Prefetch state. prefetchSem caps in-flight fetches; inflight is
 	// a per-Key dedup so two consecutive ReadAt calls don't both kick
 	// off the same fetch. Both protect against pathological wasted
@@ -67,6 +81,22 @@ func NewReader(m *meta.Store, c *Cache, pending *PendingInodes, chunkSize int64)
 		chunkSize:   chunkSize,
 		prefetchSem: make(chan struct{}, PrefetchConcurrency),
 	}
+}
+
+// SetPendingFallback wires up the staging-area read fallback. After
+// this call, ReadAt will try <pendingDir>/<ino>-<idx>-*.bin on
+// chunk_map miss, decode the wire through cipher + codec, and serve
+// it directly — so freshly written files are readable even before
+// their chunk_map row lands. Empty pendingDir disables.
+//
+// Cipher and codec MUST match what the Writer used to encode the
+// wires (the FS-wide settings stored in meta_kv). The daemon's main
+// loop is the right place to call this, after it has resolved
+// crypto + compression and ensured the pending dir exists.
+func (r *Reader) SetPendingFallback(pendingDir string, cipher crypto.Cipher, codec compress.Codec) {
+	r.pendingDir = pendingDir
+	r.cipher = cipher
+	r.codec = codec
 }
 
 // ReadAt fills dest with bytes from ino starting at off. Returns the
@@ -121,16 +151,43 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 		r.scheduleAhead(ino, idx+1, PrefetchWindow)
 
 		c, err := r.meta.GetChunk(ctx, ino, idx)
+		var data []byte
 		if errors.Is(err, meta.ErrNotFound) {
-			// Past EOF — return what we have so far.
-			return written, nil
-		}
-		if err != nil {
+			// chunk_map has no row for this idx. Two cases:
+			//
+			//  - Genuine EOF — idx is past the file's last chunk.
+			//    inode.size tells us how far the file goes; if we're
+			//    past it, the read terminates here.
+			//  - Pre-commit window — the chunk has been dispatched
+			//    (wire staged in pendingDir) but PutChunk hasn't run
+			//    yet. The wire on disk holds the bytes; decode and
+			//    serve. This is the scenario that turns "tar wrote
+			//    it, then read it back as zeros while the packer is
+			//    still flushing" into a non-issue.
+			chunkStart := int64(idx) * chunkSize
+			if chunkStart >= in.Size {
+				// Real EOF.
+				return written, nil
+			}
+			pdata, found, perr := r.tryPendingFallback(ino, idx)
+			if perr != nil {
+				return written, perr
+			}
+			if !found {
+				// inode says there should be bytes here but neither
+				// chunk_map nor the staging dir has them. Surface
+				// EIO so the caller knows the data is genuinely
+				// gone, instead of returning silent zero-fill.
+				return written, fmt.Errorf("chunk %d/%d: missing from chunk_map AND staging (data lost)", ino, idx)
+			}
+			data = pdata
+		} else if err != nil {
 			return written, fmt.Errorf("chunk lookup %d/%d: %w", ino, idx, err)
-		}
-		data, err := r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
-		if err != nil {
-			return written, err
+		} else {
+			data, err = r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
+			if err != nil {
+				return written, err
+			}
 		}
 		chunkStart := int64(idx) * chunkSize
 		relStart := cur - chunkStart
@@ -154,6 +211,60 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 		}
 	}
 	return written, nil
+}
+
+// tryPendingFallback looks under the staging dir for a wire
+// matching (ino, idx) and, if found, decrypts + decompresses it.
+// Returns (plaintext, true, nil) on success, (nil, false, nil) when
+// no matching wire exists, or (nil, false, err) on read/decode
+// failure.
+//
+// The filename pattern is <ino>-<idx>-<plaintextSize>.bin (set by
+// PersistPending). We glob by (ino, idx) because the plaintext size
+// suffix is informational only — the wire file's bytes hold the
+// encoded chunk, not the inode size. Multiple matching files would
+// only happen on a race we don't have today; we use the first.
+func (r *Reader) tryPendingFallback(ino int64, idx int32) ([]byte, bool, error) {
+	if r.pendingDir == "" {
+		return nil, false, nil
+	}
+	pattern := filepath.Join(r.pendingDir, fmt.Sprintf("%d-%d-*.bin", ino, idx))
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, false, fmt.Errorf("pending glob %s: %w", pattern, err)
+	}
+	if len(matches) == 0 {
+		return nil, false, nil
+	}
+	wire, err := os.ReadFile(matches[0])
+	if err != nil {
+		// File could have been deleted by the packer between Glob
+		// and ReadFile (race with a completing flush). Treat as
+		// "not found" so the caller can fall through and retry the
+		// chunk_map lookup — the next round will see the now-
+		// committed row.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read pending %s: %w", matches[0], err)
+	}
+	// Reverse the writer pipeline: decrypt → decompress.
+	plaintext := wire
+	if r.cipher != nil {
+		dec, derr := r.cipher.Open(ino, idx, plaintext)
+		if derr != nil {
+			return nil, false, fmt.Errorf("decrypt pending %d/%d: %w", ino, idx, derr)
+		}
+		plaintext = dec
+	}
+	if r.codec != nil {
+		dec, derr := r.codec.Decompress(plaintext)
+		if derr != nil {
+			return nil, false, fmt.Errorf("decompress pending %d/%d: %w", ino, idx, derr)
+		}
+		plaintext = dec
+	}
+	return plaintext, true, nil
 }
 
 // scheduleAhead fires off background prefetches for chunks
