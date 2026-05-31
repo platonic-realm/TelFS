@@ -202,9 +202,14 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 	if w.closed {
 		return 0, fmt.Errorf("writer: handle closed")
 	}
-	if err := w.uploadErr; err != nil {
-		return 0, err
-	}
+	// NOTE: we DO NOT surface w.uploadErr here. Background upload
+	// failures that have been restored-to-dirty will retry on the
+	// next dispatch (eager below, or explicit Flush). Returning the
+	// error here would make tar see EIO mid-extract even though the
+	// chunk is queued for an imminent retry. Truly-lost chunks
+	// (writer detached, can't restore) still set uploadErr via
+	// recordLost, so Flush/Sync surface them at the durability
+	// checkpoint where it actually matters.
 
 	// Materialize any sparse region between size and off as zeros. This
 	// is wasteful for true sparse files but correct (POSIX reads of holes
@@ -267,12 +272,11 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 		if err := w.dispatchFlushLocked(ctx, victim); err != nil {
 			return written, err
 		}
-		// dispatchFlushLocked releases + reacquires w.mu; re-check
-		// the dirtyErr each iteration so a fast-failed background
-		// upload surfaces here.
-		if err := w.uploadErr; err != nil {
-			return written, err
-		}
+		// Don't surface w.uploadErr here either — the dispatch path
+		// removes the chunk from dirty up-front, so this loop's
+		// termination is bounded by the dirty queue draining, not
+		// by an error escape. Background failures (which restore
+		// the chunk later) are handled by the next dispatch cycle.
 	}
 
 	return written, nil
@@ -574,6 +578,15 @@ func (w *Writer) Flush(ctx context.Context) error {
 // Sync is the fsync(2) path: dispatch + WAIT this handle's uploads +
 // SetSize. Use when the caller needs close-implies-durable semantics
 // that Flush no longer provides.
+//
+// Since the recordTransient/recordLost split, uploadErr is no longer
+// the durability signal — transient failures only log and restore-
+// to-dirty, they don't poison uploadErr. So Sync's durability check
+// is: after waiting for all in-flight uploads to complete, is the
+// dirty map empty? If non-empty, at least one upload failed and was
+// restored — return an error so the caller (fsync) knows the data
+// isn't yet on the channel. Caller can retry Sync after the
+// transient condition clears.
 func (w *Writer) Sync(ctx context.Context) error {
 	w.mu.Lock()
 	if w.closed {
@@ -600,10 +613,18 @@ func (w *Writer) Sync(ctx context.Context) error {
 	w.uploadWg.Wait()
 	w.mu.Lock()
 	stickyErr := w.uploadErr
+	restoredCount := len(w.dirty)
 	finalSize := w.size
 	w.mu.Unlock()
 	if stickyErr != nil {
 		return stickyErr
+	}
+	if restoredCount > 0 {
+		// At least one upload failed and was restored to dirty for a
+		// future retry. fsync semantics require us to surface that;
+		// the caller can retry Sync once the transient condition
+		// clears.
+		return fmt.Errorf("sync: %d chunk(s) failed to upload and were restored for retry", restoredCount)
 	}
 	return w.meta.SetSize(ctx, w.ino, finalSize)
 }
@@ -693,7 +714,10 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "[writer] uploadOne PANIC ino=%d idx=%d: %v\n", w.ino, idx, r)
-			w.recordError(fmt.Errorf("uploadOne panic ino=%d idx=%d: %v", w.ino, idx, r))
+			// A panic from within the upload pipeline is not safely
+			// retryable — the chunk is in unknown state. Promote
+			// straight to LOST so any concurrent Flush sees it.
+			w.recordLost(fmt.Errorf("uploadOne panic ino=%d idx=%d: %v", w.ino, idx, r))
 		}
 	}()
 	defer close(doneCh)
@@ -703,6 +727,7 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		w.mu.Unlock()
 	}()
 	var restore bool
+	var lastErr error // captured by the error sites; used by the defer to call recordLost on drop-on-floor
 	defer func() {
 		if !restore {
 			return
@@ -710,9 +735,14 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		w.mu.Lock()
 		if w.closed {
 			// Writer already detached. There's no dirty map to put dc
-			// back into and no Flush will retry. The error has been
-			// logged via recordError; drop dc on the floor.
+			// back into and no Flush will retry. Promote the transient
+			// error to a LOST chunk: uploadErr gets the sticky failure
+			// so any concurrent Flush surfaces it (rare race) and the
+			// daemon log records the data-loss event explicitly.
 			w.mu.Unlock()
+			if lastErr != nil {
+				w.recordLost(lastErr)
+			}
 			return
 		}
 		if _, hasNew := w.dirty[idx]; !hasNew {
@@ -742,7 +772,8 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		reused, blobMsgID, _, derr := w.meta.ReuseChunkByHash(context.Background(), w.ino, idx, sum[:])
 		if derr != nil {
 			restore = true
-			w.recordError(fmt.Errorf("dedup lookup %d: %w", idx, derr))
+			lastErr = fmt.Errorf("dedup lookup %d: %w", idx, derr)
+			w.recordTransient(lastErr)
 			return
 		}
 		if reused {
@@ -762,13 +793,15 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	compressed, err := w.codec.Compress(dc.data)
 	if err != nil {
 		restore = true
-		w.recordError(fmt.Errorf("compress chunk %d: %w", idx, err))
+		lastErr = fmt.Errorf("compress chunk %d: %w", idx, err)
+		w.recordTransient(lastErr)
 		return
 	}
 	wire, err := w.cipher.Seal(w.ino, idx, compressed)
 	if err != nil {
 		restore = true
-		w.recordError(fmt.Errorf("encrypt chunk %d: %w", idx, err))
+		lastErr = fmt.Errorf("encrypt chunk %d: %w", idx, err)
+		w.recordTransient(lastErr)
 		return
 	}
 	// Route: pack small chunks, direct-upload everything else. Packing
@@ -788,7 +821,8 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 			p, perr := PersistPending(dir, w.ino, idx, int32(len(dc.data)), wire)
 			if perr != nil {
 				restore = true
-				w.recordError(fmt.Errorf("persist pending chunk %d: %w", idx, perr))
+				lastErr = fmt.Errorf("persist pending chunk %d: %w", idx, perr)
+				w.recordTransient(lastErr)
 				return
 			}
 			pendingPath = p
@@ -807,7 +841,8 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		case packRes := <-resultCh:
 			if packRes.err != nil {
 				restore = true
-				w.recordError(fmt.Errorf("pack chunk %d: %w", idx, packRes.err))
+				lastErr = fmt.Errorf("pack chunk %d: %w", idx, packRes.err)
+				w.recordTransient(lastErr)
 				return
 			}
 			// Packer already wrote the chunk_map row with pack_offset
@@ -817,7 +852,8 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 			return
 		case <-ctx.Done():
 			restore = true
-			w.recordError(fmt.Errorf("pack chunk %d: %w", idx, ctx.Err()))
+			lastErr = fmt.Errorf("pack chunk %d: %w", idx, ctx.Err())
+			w.recordTransient(lastErr)
 			return
 		}
 	}
@@ -827,7 +863,8 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	if err != nil {
 		restore = true
 		metrics.UploadErrors.Inc()
-		w.recordError(fmt.Errorf("upload chunk %d: %w", idx, err))
+		lastErr = fmt.Errorf("upload chunk %d: %w", idx, err)
+		w.recordTransient(lastErr)
 		return
 	}
 	metrics.ChunksUploaded.Inc()
@@ -850,7 +887,8 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		// to dirty for retry — the next Flush will re-upload and the
 		// orphan TG message becomes garbage for `telfs gc`.
 		restore = true
-		w.recordError(fmt.Errorf("chunk_map %d: %w", idx, err))
+		lastErr = fmt.Errorf("chunk_map %d: %w", idx, err)
+		w.recordTransient(lastErr)
 		return
 	}
 	if w.dedupEnabled() {
@@ -889,17 +927,32 @@ func (w *Writer) dedupEnabled() bool {
 	return ok && d.Deterministic()
 }
 
-// recordError sets the sticky uploadErr (first-wins). It does NOT
-// cancel the worker context — sibling uploads that are already
-// past their network round-trip should still get their chunk_map
-// rows in; the sticky error stops the NEXT dispatch but doesn't
-// abort what's already committed. Close() is the only place that
-// cancels uploadCtx.
+// recordTransient logs a transient upload failure but does NOT set
+// uploadErr. The chunk is restored to dirty by the calling site's
+// restore-on-failure defer, so the next dispatch (eager from
+// WriteAt or explicit from Flush) will retry it — there's no point
+// surfacing the failure to userspace as long as the data is still
+// queued for retry.
 //
-// The error is also printed to stderr at first occurrence so live
-// mount logs surface the underlying cause (FLOOD_WAIT, RPC timeout,
-// network glitch) rather than just "I/O error" via the kernel.
-func (w *Writer) recordError(err error) {
+// Old shape (recordError, first-wins) used to ALSO set uploadErr,
+// which made the next WriteAt return EIO to tar even though the
+// chunk was about to retry successfully. Tar then aborted mid-
+// extract on transient TG hiccups despite eventual consistency.
+//
+// Stderr line stays so live mount logs still surface the underlying
+// cause (FLOOD_WAIT past middleware cap, RPC timeout, network
+// glitch).
+func (w *Writer) recordTransient(err error) {
+	fmt.Fprintf(os.Stderr, "[writer] transient upload error (ino=%d, restored for retry): %v\n", w.ino, err)
+}
+
+// recordLost is called when a chunk truly cannot be retried — the
+// writer has been Detached, so there's no dirty map to restore into
+// and no future Flush will fire. The chunk's bytes are now orphans
+// on Telegram (if the upload had succeeded but PutChunk hadn't yet
+// run) or simply lost. Sets uploadErr so any concurrent Flush/Sync
+// (rare) sees it.
+func (w *Writer) recordLost(err error) {
 	w.mu.Lock()
 	first := w.uploadErr == nil
 	if first {
@@ -907,7 +960,7 @@ func (w *Writer) recordError(err error) {
 	}
 	w.mu.Unlock()
 	if first {
-		fmt.Fprintf(os.Stderr, "[writer] upload error (ino=%d): %v\n", w.ino, err)
+		fmt.Fprintf(os.Stderr, "[writer] LOST chunk (ino=%d, writer detached, no retry): %v\n", w.ino, err)
 	}
 }
 
