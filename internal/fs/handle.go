@@ -110,12 +110,17 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 	)
 	switch {
 	case seek && h.chunkSize > 0 && !h.dirty:
-		n, err = h.node.backend.Reader.ReadAtKnownNoPrefetch(ctx, h.node.ino, dest, off, h.chunkSize, h.size)
+		// Seek path: cancel the stale prefetches from the old
+		// position and fire a LARGER prefetch burst at the new
+		// position. Critical for video players — mpv after a seek
+		// reads 5-15 chunks looking for the next keyframe + filling
+		// its buffer; without a wide prefetch each one pays the
+		// full per-RPC latency serially.
+		n, err = h.node.backend.Reader.ReadAtKnownSeek(ctx, h.node.ino, dest, off, h.chunkSize, h.size)
 	case seek:
-		// Dirty / cold handle on a seek: still cancel the prefetches
-		// (the Reader exposes that via a sibling method that falls
-		// back to GetInode), but no chunkSize hint to pass.
-		n, err = h.node.backend.Reader.ReadAtKnownNoPrefetch(ctx, h.node.ino, dest, off, 0, 0)
+		// Dirty / cold handle on a seek: same idea but no chunkSize
+		// hint to pass — Reader does its own GetInode.
+		n, err = h.node.backend.Reader.ReadAtKnownSeek(ctx, h.node.ino, dest, off, 0, 0)
 	case h.chunkSize > 0 && !h.dirty:
 		n, err = h.node.backend.Reader.ReadAtKnown(ctx, h.node.ino, dest, off, h.chunkSize, h.size)
 	default:

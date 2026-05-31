@@ -20,23 +20,28 @@ import (
 // DownloadDocumentRange), so window × concurrency is the upper
 // bound on in-flight prefetch RPCs.
 //
-// Picked conservatively: too-deep prefetch starves the FOREGROUND
-// download for bandwidth, which is felt most painfully on movie
-// seeks — the kernel issues a 4 MiB read at the new position, and
-// the player can't decode until our cache.Get for that chunk
-// returns. Adding 4 prefetches × 4 gotd threads = 16 background
-// RPCs to compete with would slow the foreground to 1/5 of
-// bandwidth. 4 is the sweet spot: enough lookahead to mask round-
-// trip latency on sequential streams, not enough to starve seeks.
-const DefaultPrefetchWindow = 4
+// 8 picks a sweet spot for Telegram's per-RPC-throttled download
+// model: each upload.getFile call takes ~3-5s on a typical
+// connection regardless of how many you have in flight (TG throttles
+// per-stream, not per-user, up to its concurrency limit). So more
+// parallelism = more aggregate throughput, up to the point where
+// TG starts rejecting. 8 chunks scheduled × 4 prefetchers = 32 RPC
+// slots; combined with foreground that's well inside what TG
+// tolerates.
+const DefaultPrefetchWindow = 8
+
+// SeekPrefetchWindow is the larger window used for the FIRST read
+// after a detected seek. mpv-style players need 5-15 chunks
+// downloaded post-seek (keyframe search + buffer fill), and serving
+// them sequentially at per-RPC latency adds up to minutes.
+// Scheduling them as one prefetch burst lets the parallel
+// fetcher work them down to ~one chunk's wall-clock.
+const SeekPrefetchWindow = 16
 
 // DefaultPrefetchConcurrency caps simultaneous prefetchOne
 // goroutines, not RPCs — each one can fire 4 concurrent
-// UploadGetFile requests through the parallel ranged fetcher. 2
-// prefetchers × 4 RPCs = 8 in-flight prefetch reads, which leaves
-// most of the network for the foreground chunk a player is
-// actually waiting on.
-const DefaultPrefetchConcurrency = 2
+// UploadGetFile requests through the parallel ranged fetcher.
+const DefaultPrefetchConcurrency = 4
 
 // PrefetchWindow / PrefetchConcurrency are kept as legacy aliases
 // for tests and existing callers that referenced the constants.
@@ -214,17 +219,44 @@ func (r *Reader) ReadAtKnown(ctx context.Context, ino int64, dest []byte, off in
 	return r.readAt(ctx, ino, dest, off, chunkSize, size, r.prefetchWindow)
 }
 
-// ReadAtKnownNoPrefetch is ReadAtKnown but skips background
-// prefetch scheduling AND cancels any in-flight prefetches that
-// were targeting this inode from a previous read. Used by the
-// file-handle's seek detection: after a non-sequential jump, the
-// previously-queued prefetches are downloading data the player
-// no longer needs, and competing with the new foreground chunk
-// for bandwidth. The next sequential read picks prefetch back up.
+// ReadAtKnownSeek is the seek path: a non-sequential jump just
+// happened, the prior prefetches were targeting the OLD position
+// (now wasted bandwidth), and the player is about to demand a
+// burst of forward reads from the NEW position (keyframe search +
+// buffer fill — typically 5-15 chunks for a video player).
+//
+// We cancel the stale prefetches as a group AND schedule a LARGER
+// window (SeekPrefetchWindow) for the new burst so the forward
+// reads land in the cache instead of forcing serial fetches that
+// add up to minutes of latency on per-RPC-throttled networks.
+func (r *Reader) ReadAtKnownSeek(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64) (int, error) {
+	r.cancelPrefetchesForIno(ino)
+	if chunkSize <= 0 {
+		in, err := r.meta.GetInode(ctx, ino)
+		if err != nil {
+			if errors.Is(err, meta.ErrNotFound) {
+				return 0, nil
+			}
+			return 0, fmt.Errorf("read get inode %d: %w", ino, err)
+		}
+		cs := in.ChunkSize
+		if cs <= 0 {
+			cs = r.chunkSize
+		}
+		return r.readAt(ctx, ino, dest, off, cs, in.Size, SeekPrefetchWindow)
+	}
+	return r.readAt(ctx, ino, dest, off, chunkSize, size, SeekPrefetchWindow)
+}
+
+// ReadAtKnownNoPrefetch is the same as ReadAtKnown but with the
+// prefetcher disabled for THIS read. Kept for callers that have
+// explicit reasons to suppress prefetch (read-only mounts probing
+// metadata, debug tools); the file-handle's seek path uses
+// ReadAtKnownSeek instead, which DOES prefetch but at a larger
+// window.
 func (r *Reader) ReadAtKnownNoPrefetch(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64) (int, error) {
 	r.cancelPrefetchesForIno(ino)
 	if chunkSize <= 0 {
-		// Fall back to the GetInode path but still pass window=0.
 		in, err := r.meta.GetInode(ctx, ino)
 		if err != nil {
 			if errors.Is(err, meta.ErrNotFound) {
