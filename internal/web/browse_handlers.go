@@ -315,8 +315,30 @@ func (s *Server) browseDelete(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
 			return
 		}
-		if err := os.RemoveAll(abs); err != nil {
-			SetFlash(w, "error", "delete (recursive): "+err.Error())
+		// Retry RemoveAll on failure. A FUSE Readdir EIO mid-walk
+		// (SQLite busy timeout, context wobble, etc.) is usually
+		// transient — os.RemoveAll on the same already-partly-deleted
+		// tree just resumes where it left off, so retrying is safe.
+		// 3 attempts × short backoff keeps the worst case bounded
+		// at ~1.5s of extra waiting while letting us survive a
+		// hiccup or two on a 10k-file wipe.
+		const maxAttempts = 3
+		var lastErr error
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			if err := os.RemoveAll(abs); err == nil {
+				lastErr = nil
+				break
+			} else {
+				lastErr = err
+				s.opts.Logger.Printf("browse: recursive delete attempt %d/%d on %s failed: %v",
+					attempt, maxAttempts, abs, err)
+				if attempt < maxAttempts {
+					time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+				}
+			}
+		}
+		if lastErr != nil {
+			SetFlash(w, "error", fmt.Sprintf("delete (recursive) failed after %d attempts: %s — check the daemon log for what FUSE returned", maxAttempts, lastErr.Error()))
 			http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
 			return
 		}

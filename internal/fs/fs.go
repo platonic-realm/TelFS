@@ -3,6 +3,7 @@ package fs
 import (
 	"context"
 	"errors"
+	"log"
 	"strings"
 	"syscall"
 
@@ -239,6 +240,12 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*go
 func (n *Node) Readdir(ctx context.Context) (gofuse.DirStream, syscall.Errno) {
 	infos, err := n.backend.Meta.ReaddirInfo(ctx, n.ino)
 	if err != nil {
+		// Log the underlying error so transient EIOs (SQLite busy
+		// timeout, ctx cancellation, ...) are diagnosable from the
+		// daemon log. Without this every Readdir failure looks the
+		// same to the kernel and the only signal is "EIO" — the user
+		// can't tell SQLite contention apart from a real corruption.
+		log.Printf("fs.Readdir(ino=%d): %v", n.ino, err)
 		return nil, syscall.EIO
 	}
 	entries := make([]fuse.DirEntry, len(infos))
