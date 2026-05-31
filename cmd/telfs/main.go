@@ -647,7 +647,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// upload isn't progressing — was Telegram acking? are
 			// we stuck in FLOOD_WAIT? did we get FILE_PART_MISSING?
 			// JSON only for now; rendering is the web's problem.
-			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker(), cfg))
+			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore))
 			if err := metricsSrv.Start(); err != nil {
 				return err
 			}
@@ -908,8 +908,16 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionM
 // tracker's current state as JSON. Format is intentionally simple so
 // the web UI can fetch + render with a few lines of JS, and curl
 // pipes nicely through jq.
-func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
+//
+// The packer, pool, pendingDir, and meta store parameters are used to
+// surface the upload queue depth: how many chunks are waiting in the
+// packer's buffer, how many wires are staged on disk for crash-
+// recovery, how many concurrency slots the pool is using, and how
+// many journal entries are unposted. All of those are cheap to read
+// (one mutex grab + one ReadDir + one SELECT COUNT) on a request that
+// fires every 2 s.
+func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packer, pool *chunk.UploadPool, pendingDir string, mstore *meta.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snap := tr.Snapshot()
 		fmt.Fprintln(w, "{")
@@ -923,6 +931,59 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config) http.HandlerFunc {
 		fmt.Fprintf(w, "  \"total_ok\": %d,\n", snap.TotalOK)
 		fmt.Fprintf(w, "  \"total_err\": %d,\n", snap.TotalErr)
 		fmt.Fprintf(w, "  \"total_bytes\": %d,\n", snap.TotalBytes)
+
+		// Queue depths. Order:
+		//   1. packer pending — chunks buffered in memory awaiting
+		//      flush; small (default ~32 MiB at most).
+		//   2. wires on disk — durable staging from PersistPending;
+		//      reflects chunks dispatched but not yet PutChunk'd.
+		//   3. pool in-flight — uploads holding a concurrency slot.
+		//   4. journal unposted — meta ops not yet on the channel.
+		// All cheap to read on a 2-second poll.
+		packerChunks, packerBytes := 0, int64(0)
+		if packer != nil {
+			packerChunks, packerBytes = packer.QueueDepth()
+		}
+		var pendingFiles int
+		var pendingBytes int64
+		if pendingDir != "" {
+			if ents, err := os.ReadDir(pendingDir); err == nil {
+				for _, e := range ents {
+					if e.IsDir() {
+						continue
+					}
+					pendingFiles++
+					if info, err := e.Info(); err == nil {
+						pendingBytes += info.Size()
+					}
+				}
+			}
+		}
+		var poolInFlight, poolCap int
+		if pool != nil {
+			poolInFlight, poolCap = pool.InFlight(), pool.Cap()
+		}
+		var journalUnposted int
+		if mstore != nil {
+			if v, err := mstore.Stats(r.Context()); err == nil {
+				journalUnposted = int(v.JournalUnposted)
+			}
+		}
+		fmt.Fprintln(w, "  \"queue\": {")
+		fmt.Fprintf(w, "    \"packer_chunks\": %d,\n", packerChunks)
+		fmt.Fprintf(w, "    \"packer_bytes\": %d,\n", packerBytes)
+		fmt.Fprintf(w, "    \"packer_target_bytes\": %d,\n", func() int64 {
+			if packer == nil {
+				return 0
+			}
+			return packer.Target()
+		}())
+		fmt.Fprintf(w, "    \"pending_wires_count\": %d,\n", pendingFiles)
+		fmt.Fprintf(w, "    \"pending_wires_bytes\": %d,\n", pendingBytes)
+		fmt.Fprintf(w, "    \"pool_in_flight\": %d,\n", poolInFlight)
+		fmt.Fprintf(w, "    \"pool_cap\": %d,\n", poolCap)
+		fmt.Fprintf(w, "    \"journal_unposted\": %d\n", journalUnposted)
+		fmt.Fprintln(w, "  },")
 		if !snap.LastSuccess.IsZero() {
 			fmt.Fprintf(w, "  \"last_success_unix\": %d,\n", snap.LastSuccess.Unix())
 			fmt.Fprintf(w, "  \"last_success_age_seconds\": %d,\n", int64(time.Since(snap.LastSuccess).Seconds()))

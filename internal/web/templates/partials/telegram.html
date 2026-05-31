@@ -29,6 +29,56 @@
   </table>
 </div>
 
+<div class="panel">
+  <h3>Upload queue <small>(snapshot every 2 s)</small></h3>
+  <table class="kv">
+    <tr>
+      <td>Pool</td>
+      <td>
+        <strong>{{.State.Queue.PoolInFlight}}</strong> of {{.State.Queue.PoolCap}} concurrency slots in use
+        <small>(MTProto round trips active right now)</small>
+      </td>
+    </tr>
+    <tr>
+      <td>Packer buffer</td>
+      <td>
+        <strong>{{.State.Queue.PackerChunks}}</strong> chunk(s),
+        <strong>{{humanBytes .State.Queue.PackerBytes}}</strong>
+        {{if gt .State.Queue.PackerTargetBytes 0}}
+          <small>(flush triggers at {{humanBytes .State.Queue.PackerTargetBytes}})</small>
+        {{end}}
+      </td>
+    </tr>
+    <tr>
+      <td>Staged on disk</td>
+      <td>
+        <strong>{{.State.Queue.PendingWiresCount}}</strong> wire(s),
+        <strong>{{humanBytes .State.Queue.PendingWiresBytes}}</strong>
+        {{if gt .State.Queue.PendingWiresCount 0}}
+          <small>(dispatched, chunk_map row not yet landed — survives daemon crash)</small>
+        {{else}}
+          <small>(all dispatched chunks have committed)</small>
+        {{end}}
+      </td>
+    </tr>
+    <tr>
+      <td>Journal unposted</td>
+      <td>
+        <strong>{{.State.Queue.JournalUnposted}}</strong> op(s)
+        {{if gt .State.Queue.JournalUnposted 0}}
+          <small>(meta mutations waiting for the next poster tick to land on the channel)</small>
+        {{else}}
+          <small>(every mutation is mirrored to the channel)</small>
+        {{end}}
+      </td>
+    </tr>
+  </table>
+  <p><small>
+    There is no download queue: chunk reads are fetched synchronously on cache
+    miss and the kernel's FUSE driver is what queues them.
+  </small></p>
+</div>
+
 {{if .State.PerMethod}}
 <h3>RPC totals by method</h3>
 <table class="rpc">

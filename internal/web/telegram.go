@@ -19,19 +19,46 @@ import (
 // web process runs separately from the mount daemon, so we have to
 // fetch over HTTP — there's no shared memory between the two.
 type tgState struct {
-	ChannelID             int64        `json:"channel_id"`
-	ChannelTitle          string       `json:"channel_title"`
-	InFlight              int          `json:"in_flight"`
-	TotalOK               int64        `json:"total_ok"`
-	TotalErr              int64        `json:"total_err"`
-	TotalBytes            int64        `json:"total_bytes"`
-	LastSuccessUnix       int64        `json:"last_success_unix"`
-	LastSuccessAgeSeconds int64        `json:"last_success_age_seconds"`
-	LastErrorUnix         int64        `json:"last_error_unix"`
-	LastErrorAgeSeconds   int64        `json:"last_error_age_seconds"`
-	LastErrorMessage      string       `json:"last_error_message"`
-	PerMethod             []tgMethod   `json:"per_method"`
-	Requests              []tgRequest  `json:"requests"`
+	ChannelID             int64       `json:"channel_id"`
+	ChannelTitle          string      `json:"channel_title"`
+	InFlight              int         `json:"in_flight"`
+	TotalOK               int64       `json:"total_ok"`
+	TotalErr              int64       `json:"total_err"`
+	TotalBytes            int64       `json:"total_bytes"`
+	LastSuccessUnix       int64       `json:"last_success_unix"`
+	LastSuccessAgeSeconds int64       `json:"last_success_age_seconds"`
+	LastErrorUnix         int64       `json:"last_error_unix"`
+	LastErrorAgeSeconds   int64       `json:"last_error_age_seconds"`
+	LastErrorMessage      string      `json:"last_error_message"`
+	PerMethod             []tgMethod  `json:"per_method"`
+	Requests              []tgRequest `json:"requests"`
+	Queue                 tgQueue     `json:"queue"`
+}
+
+// tgQueue is the upload-side backlog the daemon surfaces. There's no
+// download-side queue to track: the chunk Reader fetches synchronously
+// on cache miss; there's no separate "download backlog" because the
+// kernel's FUSE driver is the one queuing reads, and we serve them
+// inline. So the queue panel is exclusively an upload-side view.
+type tgQueue struct {
+	// PackerChunks + PackerBytes: chunks waiting in the in-memory
+	// packer buffer for the next flush. PackerTargetBytes is the
+	// trigger threshold; bytes >= target wakes the flusher.
+	PackerChunks      int   `json:"packer_chunks"`
+	PackerBytes       int64 `json:"packer_bytes"`
+	PackerTargetBytes int64 `json:"packer_target_bytes"`
+	// PendingWiresCount + Bytes: wires durably staged on disk under
+	// cache/pending/. Each represents a dispatched chunk whose
+	// chunk_map row hasn't landed yet. Survives daemon crash.
+	PendingWiresCount int   `json:"pending_wires_count"`
+	PendingWiresBytes int64 `json:"pending_wires_bytes"`
+	// PoolInFlight / PoolCap: how many concurrency slots in the
+	// UploadPool are currently held vs the cap.
+	PoolInFlight int `json:"pool_in_flight"`
+	PoolCap      int `json:"pool_cap"`
+	// JournalUnposted: rows in the local journal table not yet
+	// posted to the channel.
+	JournalUnposted int `json:"journal_unposted"`
 }
 
 type tgMethod struct {

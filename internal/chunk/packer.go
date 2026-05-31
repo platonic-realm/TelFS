@@ -145,6 +145,22 @@ func NewPacker(m *meta.Store, u Uploader, threshold int32, target int64, window 
 // the dispatch path.
 func (p *Packer) Threshold() int32 { return p.threshold }
 
+// QueueDepth returns the number of buffered wires + their total
+// bytes. Snapshot under the packer's mutex, so the value is a
+// point-in-time count rather than an instantaneous summary as the
+// flusher drains. Surfaced through the daemon's /telegram JSON for
+// the web UI.
+func (p *Packer) QueueDepth() (chunks int, bytes int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.pending), p.bufBytes
+}
+
+// Target returns the per-flush byte cap (the threshold above which
+// the buffer wakes the flusher). Exposed for the queue panel so the
+// user can compare packer_pending_bytes against the trigger.
+func (p *Packer) Target() int64 { return p.target }
+
 // Submit enqueues a wire for the next packed-blob upload and
 // returns a chan that will deliver the (msgID, packOffset) once
 // the upload lands. The caller MUST receive on the chan — otherwise

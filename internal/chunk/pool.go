@@ -58,6 +58,17 @@ func (p *UploadPool) UploadCtx() context.Context {
 	return p.uploadCtx
 }
 
+// InFlight returns the number of concurrency slots currently held
+// by active uploads. The sem channel is "send-to-acquire"; len(sem)
+// reflects how many tokens have been pushed (= in-flight count).
+// Cheap to call from a status endpoint.
+func (p *UploadPool) InFlight() int { return len(p.sem) }
+
+// Cap returns the upload-concurrency cap this pool was constructed
+// with. Used by the web UI to render "N of M slots in use" without
+// having to know the value out of band.
+func (p *UploadPool) Cap() int { return cap(p.sem) }
+
 // Reservation tracks a pool entry's three resources separately so a
 // pack-route uploader can release just the SEM slot early (freeing a
 // new dispatch to start) while keeping the Pending counter + wg held
