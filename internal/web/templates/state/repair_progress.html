@@ -1,0 +1,56 @@
+{{define "repair_progress"}}
+{{$r := .Repair}}
+<div id="repair-progress"
+     {{if and $r $r.IsRunning}}
+       hx-get="/partials/repair-progress"
+       hx-trigger="every 500ms"
+       hx-swap="outerHTML"
+     {{end}}>
+  {{if not $r}}
+    <p><em>Click <strong>Run repair</strong> to start. The page will live-update with progress here.</em></p>
+  {{else if $r.IsRunning}}
+    <p>
+      <span class="pill acc">running</span>
+      Elapsed {{$r.Duration}} · {{$r.Done}}/{{if $r.Total}}{{$r.Total}}{{else}}?{{end}} inode(s)
+      {{if $r.Total}}· {{$r.Pct}}%{{end}}
+    </p>
+    {{if $r.Total}}
+      <div class="progress-bar"><div class="progress-bar-fill" style="width: {{$r.Pct}}%"></div></div>
+    {{else}}
+      <p><small>Scanning chunk_map for candidates…</small></p>
+    {{end}}
+    {{if $r.LastReport}}
+      <p><small>Last: ino <code>{{$r.LastReport.Ino}}</code> — {{humanBytes $r.LastReport.OldSize}} → {{humanBytes $r.LastReport.NewSize}} ({{$r.LastReport.OldChunks}}→{{$r.LastReport.NewChunks}} chunks)</small></p>
+    {{end}}
+  {{else if $r.IsError}}
+    <p><span class="pill err">error</span> {{$r.Err}}</p>
+    <p><small>Ran for {{$r.Duration}} · processed {{$r.Done}}/{{$r.Total}} inode(s) before failure.</small></p>
+    {{if $r.Reports}}<p><small>Repairs that did land before the error are listed below.</small></p>{{end}}
+  {{else if $r.IsDone}}
+    {{if $r.Reports}}
+      <p>
+        <span class="pill ok">done</span>
+        Repaired {{len $r.Reports}} file(s) in {{$r.Duration}} · reclaimed {{humanBytes $r.BytesSaved}} of unreachable tail bytes
+      </p>
+    {{else}}
+      <p><span class="pill ok">done</span> No partial files to repair · scan took {{$r.Duration}}</p>
+    {{end}}
+  {{end}}
+  {{if and $r $r.Reports}}
+    <table>
+      <thead><tr><th>ino</th><th>first gap</th><th>chunks</th><th class="num">size before</th><th class="num">size after</th></tr></thead>
+      <tbody>
+        {{range $r.Reports}}
+        <tr>
+          <td><code>{{.Ino}}</code></td>
+          <td>idx {{.FirstGapAt}}</td>
+          <td>{{.OldChunks}} → {{.NewChunks}}</td>
+          <td class="num">{{humanBytes .OldSize}}</td>
+          <td class="num">{{humanBytes .NewSize}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  {{end}}
+</div>
+{{end}}

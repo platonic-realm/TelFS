@@ -69,6 +69,7 @@ func (s *Server) registerRoutes() {
 	// FS state + repair.
 	s.mux.HandleFunc("GET /state", s.stateShow)
 	s.mux.HandleFunc("POST /state/repair", s.stateRepair)
+	s.mux.HandleFunc("GET /partials/repair-progress", s.stateRepairProgress)
 
 	// Mount supervisor.
 	s.mux.HandleFunc("GET /mount", s.mountList)

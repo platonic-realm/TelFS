@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -37,9 +38,14 @@ type stateShowData struct {
 	// Warning when a fuse.telfs mount is live (repair while writes are
 	// happening can collide). Best-effort: /proc/mounts can't attribute
 	// mounts to specific profiles.
-	MountActive    bool
-	Supervised     []stateMountRow
-	External       []string
+	MountActive bool
+	Supervised  []stateMountRow
+	External    []string
+
+	// Repair is the snapshot of the current/last RepairPartialFiles
+	// run, or nil if one has never been started this server session.
+	// The template uses it to render the live progress card.
+	Repair *repairRunSnapshot
 }
 
 // stateMountRow is a thin view of a supervised mount for the unmount
@@ -80,6 +86,7 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	d.MountActive = len(activeMounts()) > 0
+	d.Repair = s.repair.Snapshot()
 	for _, mp := range s.sup.List() {
 		d.Supervised = append(d.Supervised, stateMountRow{
 			Profile:    mp.Profile,
@@ -115,13 +122,14 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 		d.Partials = parts
 	}
 
-	s.renderTemplate(w, "state/show.html", d)
+	s.renderTemplateWith(w, "state/show.html", d, "templates/state/repair_progress.html")
 }
 
-// stateRepair runs RepairPartialFiles synchronously and flashes a
-// summary. Refuses when a telfs mount is active to avoid racing with
-// the daemon's writes (best-effort — /proc/mounts can't attribute
-// mounts to specific profiles, so this is a coarse safety net).
+// stateRepair kicks off a RepairPartialFiles run in the background
+// and redirects to /state so the page can show live progress via
+// HTMX poll. Refuses to start a new run if one is already in flight
+// (the tracker is single-slot) or if a telfs mount is active and
+// the user didn't explicitly tick the force checkbox.
 func (s *Server) stateRepair(w http.ResponseWriter, r *http.Request) {
 	if err := s.state.CheckCSRF(r); err != nil {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
@@ -139,27 +147,40 @@ func (s *Server) stateRepair(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/state", http.StatusSeeOther)
 		return
 	}
-	mstore, err := meta.Open(cfg.DBPath())
-	if err != nil {
-		SetFlash(w, "error", "meta.Open: "+err.Error())
+	if !s.repair.Begin() {
+		SetFlash(w, "error", "a repair run is already in flight — wait for it to finish")
 		http.Redirect(w, r, "/state", http.StatusSeeOther)
 		return
 	}
-	defer mstore.Close()
-	reports, err := mstore.RepairPartialFiles(r.Context())
-	if err != nil {
-		SetFlash(w, "error", "repair: "+err.Error())
-		http.Redirect(w, r, "/state", http.StatusSeeOther)
-		return
-	}
-	if len(reports) == 0 {
-		SetFlash(w, "ok", "No partial files to repair.")
-	} else {
-		var saved int64
-		for _, r := range reports {
-			saved += r.OldSize - r.NewSize
+	// Fire-and-forget goroutine. Uses a background ctx so the handler
+	// returning doesn't cancel the work; the daemon-log is the only
+	// safety-net if everything crashes mid-run, but partial repairs
+	// are themselves idempotent.
+	go func() {
+		mstore, err := meta.Open(cfg.DBPath())
+		if err != nil {
+			s.repair.Finish(fmt.Errorf("meta.Open: %w", err))
+			s.opts.Logger.Printf("repair: meta.Open: %v", err)
+			return
 		}
-		SetFlash(w, "ok", fmt.Sprintf("Repaired %d file(s); truncated %s of unreachable tail bytes.", len(reports), humanBytesTpl(saved)))
-	}
+		defer mstore.Close()
+		_, err = mstore.RepairPartialFilesProgress(context.Background(), s.repair.OnProgress)
+		if err != nil {
+			s.opts.Logger.Printf("repair: %v", err)
+		}
+		s.repair.Finish(err)
+	}()
 	http.Redirect(w, r, "/state", http.StatusSeeOther)
+}
+
+// stateRepairProgress returns the HTMX-pollable repair progress
+// fragment. While the run is in flight it re-arms itself
+// (hx-trigger="every 500ms") so the user sees a live counter; once
+// finished the partial returns with no further trigger and the
+// final summary stays visible.
+func (s *Server) stateRepairProgress(w http.ResponseWriter, r *http.Request) {
+	d := struct {
+		Repair *repairRunSnapshot
+	}{Repair: s.repair.Snapshot()}
+	s.renderPartialBlock(w, "state/repair_progress.html", "repair_progress", d)
 }

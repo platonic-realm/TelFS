@@ -140,9 +140,16 @@
         Run anyway (a mount is active — accept the risk).
       </label>
     {{end}}
-    <button type="submit" {{if not .Partials}}disabled{{end}}>Run repair</button>
-    <small>The startup pass also runs this automatically; this button lets you trigger it without remounting.</small>
+    <button type="submit"
+            {{if not .Partials}}disabled{{end}}
+            {{if and .Repair .Repair.IsRunning}}disabled{{end}}>
+      {{if and .Repair .Repair.IsRunning}}Running…{{else}}Run repair{{end}}
+    </button>
+    <small>The startup pass also runs this automatically; this button lets you trigger it without remounting. Progress appears below in real time.</small>
   </form>
+  <hr>
+  <h4>Progress</h4>
+  {{template "repair_progress" .}}
 </section>
 
 <section class="card">

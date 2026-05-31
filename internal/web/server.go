@@ -39,6 +39,7 @@ type Server struct {
 	state  *State
 	logins *loginRegistry
 	sup    *Supervisor
+	repair *RepairTracker
 	mux    *http.ServeMux
 	srv    *http.Server
 }
@@ -69,6 +70,7 @@ func New(opts Options) (*Server, error) {
 		state:  NewState(),
 		logins: newLoginRegistry(),
 		sup:    sup,
+		repair: &RepairTracker{},
 		mux:    http.NewServeMux(),
 	}
 	s.registerRoutes()

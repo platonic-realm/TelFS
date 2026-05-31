@@ -127,6 +127,20 @@ func (s *Store) ScanPartialFiles(ctx context.Context) ([]RepairReport, error) {
 //
 // Returns the list of repaired inodes for logging at startup.
 func (s *Store) RepairPartialFiles(ctx context.Context) ([]RepairReport, error) {
+	return s.RepairPartialFilesProgress(ctx, nil)
+}
+
+// RepairPartialFilesProgress is RepairPartialFiles with a per-inode
+// callback. onProgress(report, idx, total) is invoked after each
+// candidate inode is processed; idx is 1-based, total is the count
+// from the initial scan. Pass nil for the same behavior as
+// RepairPartialFiles. Used by the web UI to surface live progress
+// from a long-running repair instead of blocking the request and
+// flashing only a summary at the end.
+func (s *Store) RepairPartialFilesProgress(
+	ctx context.Context,
+	onProgress func(report *RepairReport, idx, total int),
+) ([]RepairReport, error) {
 	// Single query to find candidate inodes: any inode whose
 	// chunk_map count doesn't equal max(idx)+1 has a gap or
 	// out-of-order distribution. Skip the cheap-case 99.99% of
@@ -153,13 +167,16 @@ func (s *Store) RepairPartialFiles(ctx context.Context) ([]RepairReport, error) 
 	}
 
 	var out []RepairReport
-	for _, ino := range candidates {
+	for i, ino := range candidates {
 		report, err := s.repairOneInode(ctx, ino)
 		if err != nil {
 			return out, fmt.Errorf("repair ino %d: %w", ino, err)
 		}
 		if report != nil {
 			out = append(out, *report)
+		}
+		if onProgress != nil {
+			onProgress(report, i+1, len(candidates))
 		}
 	}
 	return out, nil

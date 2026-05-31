@@ -275,6 +275,22 @@ tr.file td:first-child a { color: var(--fg); }
 tr.file td:first-child a:hover { color: var(--acc); }
 td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg-muted); }
 td.actions { text-align: right; white-space: nowrap; }
+
+/* repair progress bar */
+.progress-bar {
+  width: 100%;
+  max-width: 30rem;
+  height: .5rem;
+  background: var(--bg-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  margin: .35rem 0;
+}
+.progress-bar-fill {
+  height: 100%;
+  background: var(--acc);
+  transition: width .25s ease-out;
+}
 td.actions form { display: inline-flex; }
 td.actions .btn.small, td.actions button.small {
   padding: .15rem .5rem;
