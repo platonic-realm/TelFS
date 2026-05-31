@@ -180,10 +180,7 @@ func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAt
 	}
 	if patch.Mode != nil || patch.UID != nil || patch.GID != nil || patch.Mtime != nil {
 		if err := n.backend.Meta.SetAttrs(ctx, n.ino, patch); err != nil {
-			if errors.Is(err, meta.ErrNotFound) {
-				return syscall.ENOENT
-			}
-			return syscall.EIO
+			return logMetaErr("Setattr.SetAttrs", n.ino, err)
 		}
 	}
 	if size, ok := in.GetSize(); ok {
@@ -192,6 +189,7 @@ func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAt
 		// truncate.
 		if h, ok := fh.(*fileHandle); ok && h != nil {
 			if err := h.writer.Truncate(ctx, int64(size)); err != nil {
+				log.Printf("fs.Setattr.Truncate(ino=%d, size=%d): %v", n.ino, size, err)
 				return syscall.EIO
 			}
 		} else if errno := n.truncate(ctx, int64(size)); errno != 0 {
@@ -200,7 +198,7 @@ func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAt
 	}
 	final, err := n.backend.Meta.GetInode(ctx, n.ino)
 	if err != nil {
-		return syscall.EIO
+		return logMetaErr("Setattr.GetInode", n.ino, err)
 	}
 	fillAttr(&out.Attr, final)
 	return 0
@@ -214,10 +212,12 @@ func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
 	}
 	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
+		log.Printf("fs.truncate.NewWriter(ino=%d): %v", n.ino, err)
 		return syscall.EIO
 	}
 	defer w.Close()
 	if err := w.Truncate(ctx, size); err != nil {
+		log.Printf("fs.truncate.Truncate(ino=%d, size=%d): %v", n.ino, size, err)
 		return syscall.EIO
 	}
 	return 0
@@ -266,10 +266,12 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 	}
 	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
+		log.Printf("fs.Open.NewWriter(ino=%d): %v", n.ino, err)
 		return nil, 0, syscall.EIO
 	}
 	if flags&uint32(syscall.O_TRUNC) != 0 {
 		if err := w.Truncate(ctx, 0); err != nil {
+			log.Printf("fs.Open.Truncate(ino=%d): %v", n.ino, err)
 			w.Close()
 			return nil, 0, syscall.EIO
 		}
@@ -285,6 +287,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 func (n *Node) Read(ctx context.Context, _ gofuse.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	nread, err := n.backend.Reader.ReadAt(ctx, n.ino, dest, off)
 	if err != nil {
+		log.Printf("fs.Read(ino=%d, off=%d, len=%d): %v", n.ino, off, len(dest), err)
 		return nil, syscall.EIO
 	}
 	return fuse.ReadResultData(dest[:nread]), 0
@@ -319,7 +322,7 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 	}
 	child, err := n.backend.Meta.GetInode(ctx, ino)
 	if err != nil {
-		return nil, nil, 0, syscall.EIO
+		return nil, nil, 0, logMetaErr("Create.GetInode", ino, err)
 	}
 	childInode := n.newChildInode(ctx, child)
 	w, werr := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, ino, n.backend.chunkSize(), 0)

@@ -2,6 +2,7 @@ package fs
 
 import (
 	"context"
+	"log"
 	"sync"
 	"syscall"
 
@@ -44,6 +45,7 @@ var (
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	n, err := h.node.backend.Reader.ReadAt(ctx, h.node.ino, dest, off)
 	if err != nil {
+		log.Printf("fs.handle.Read(ino=%d, off=%d, len=%d): %v", h.node.ino, off, len(dest), err)
 		return nil, syscall.EIO
 	}
 	return fuse.ReadResultData(dest[:n]), 0
@@ -55,6 +57,7 @@ func (h *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32,
 	defer h.mu.Unlock()
 	n, err := h.writer.WriteAt(ctx, data, off)
 	if err != nil {
+		log.Printf("fs.handle.Write(ino=%d, off=%d, len=%d): wrote %d, err=%v", h.node.ino, off, len(data), n, err)
 		return uint32(n), syscall.EIO
 	}
 	return uint32(n), 0
@@ -67,6 +70,7 @@ func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.writer.Flush(ctx); err != nil {
+		log.Printf("fs.handle.Flush(ino=%d): %v", h.node.ino, err)
 		return syscall.EIO
 	}
 	return 0
@@ -80,6 +84,7 @@ func (h *fileHandle) Fsync(ctx context.Context, _ uint32) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.writer.Sync(ctx); err != nil {
+		log.Printf("fs.handle.Fsync(ino=%d): %v", h.node.ino, err)
 		return syscall.EIO
 	}
 	return 0
