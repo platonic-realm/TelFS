@@ -64,6 +64,7 @@ func (s *Server) registerRoutes() {
 
 	// Telegram connection state + recent requests.
 	s.mux.HandleFunc("GET /telegram", s.telegramPage)
+	s.mux.HandleFunc("POST /telegram/ratelimit", s.telegramSetRateLimit)
 	s.mux.HandleFunc("GET /partials/telegram", s.telegramPartial)
 
 	// FS state + repair.

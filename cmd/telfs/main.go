@@ -88,6 +88,10 @@ Usage:
                                     Inspect / roll back to a historical snapshot.
   telfs trash {enable [--ttl D], disable, status, list, empty}
                                     Manage the rm safety-net at /.trash.
+  telfs ratelimit {show, set <N>, clear}
+                                    View or change the TG requests/min cap.
+                                    0 = unlimited; running daemon hot-reloads
+                                    within 5 s of a CLI change.
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
 
 Environment:
@@ -150,6 +154,8 @@ func run() error {
 		return cmdDebug(ctx, os.Args[2:])
 	case "doctor":
 		return cmdDoctor(ctx, os.Args[2:])
+	case "ratelimit":
+		return cmdRateLimit(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n%s", os.Args[1], usage)
 		os.Exit(2)
@@ -683,6 +689,42 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			close(journalDone)
 		}()
 
+		// Rate-limit poller: reads meta_kv every few seconds and
+		// applies the value to the gotd middleware so CLI/web edits
+		// propagate without a remount. Starts by applying whatever
+		// value is in meta_kv now — if zero/missing, the limiter
+		// stays unlimited (historical default).
+		applyRateLimit := func() {
+			n, err := metaStore.TGRateLimitPerMin(signalCtx)
+			if err != nil {
+				return
+			}
+			if n != client.RateLimiter().PerMinute() {
+				client.RateLimiter().SetPerMinute(n)
+				if n == 0 {
+					fmt.Fprintln(os.Stderr, "[ratelimit] cleared (unlimited)")
+				} else {
+					fmt.Fprintf(os.Stderr, "[ratelimit] set to %d requests/min\n", n)
+				}
+			}
+		}
+		applyRateLimit()
+		rateLimitCtx, stopRateLimit := context.WithCancel(signalCtx)
+		rateLimitDone := make(chan struct{})
+		go func() {
+			defer close(rateLimitDone)
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-rateLimitCtx.Done():
+					return
+				case <-t.C:
+					applyRateLimit()
+				}
+			}
+		}()
+
 		// Trash GC: reads ttl on every tick so changes via
 		// `telfs trash enable --ttl <D>` take effect without remount.
 		if trashIno != 0 {
@@ -739,6 +781,8 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			<-journalDone
 			stopSnap()
 			<-snapDone
+			stopRateLimit()
+			<-rateLimitDone
 			// Unmount + drain BEFORE the final snapshot. Two-step:
 			//   1. Unmount severs the kernel-to-userspace channel so
 			//      no new FUSE writes can fire; server.Wait drains

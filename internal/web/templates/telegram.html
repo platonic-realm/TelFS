@@ -3,5 +3,37 @@
 
 {{template "telegram_panel" .}}
 
+<section class="card">
+  <h3>Request rate limit</h3>
+  <p><small>
+    Caps outgoing MTProto requests at a per-minute budget. Helps avoid
+    cascading <code>FLOOD_WAIT</code> errors during bursty workloads
+    (tar extracts, mass deletes) at the cost of throughput. The running
+    daemon polls this setting every 5 s — changes take effect without
+    a remount, whether you set it here or via <code>telfs ratelimit set N</code>.
+  </small></p>
+  <dl>
+    <dt>Current setting</dt>
+    <dd>
+      {{if lt .RateLimitPerMin 0}}
+        <span class="pill muted">unknown</span> <small>— couldn't read meta DB (no active profile or DB not initialized)</small>
+      {{else if eq .RateLimitPerMin 0}}
+        <span class="pill muted">unlimited</span> <small>— historical default; no cap on outgoing requests</small>
+      {{else}}
+        <strong>{{.RateLimitPerMin}}</strong> requests/min
+      {{end}}
+    </dd>
+  </dl>
+  <form method="post" action="/telegram/ratelimit">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>
+      Cap (requests/min) — 0 or empty disables the limit
+      <input type="number" name="per_minute" min="0" placeholder="0" value="{{if gt .RateLimitPerMin 0}}{{.RateLimitPerMin}}{{end}}">
+    </label>
+    <button type="submit">Apply</button>
+    <small>Suggested starting point: 60–120 req/min. Lower = safer, higher = faster.</small>
+  </form>
+</section>
+
 <p><small>Source: <code>{{.Source}}</code> · auto-refreshes every 2s via HTMX</small></p>
 {{end}}

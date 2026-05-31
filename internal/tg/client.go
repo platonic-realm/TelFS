@@ -29,8 +29,9 @@ import (
 // drained before they return from the callback. After return, the
 // Session's underlying client is closed and any further use will fail.
 type Client struct {
-	cfg     *config.Config
-	tracker *Tracker
+	cfg       *config.Config
+	tracker   *Tracker
+	rateLimit *RateLimiter
 }
 
 // ErrNotAuthorized is returned by RunSession when no valid local session
@@ -43,12 +44,21 @@ func New(cfg *config.Config) (*Client, error) {
 	if err := cfg.RequireAPI(); err != nil {
 		return nil, err
 	}
-	return &Client{cfg: cfg, tracker: NewTracker(128)}, nil
+	return &Client{
+		cfg:       cfg,
+		tracker:   NewTracker(128),
+		rateLimit: NewRateLimiter(0),
+	}, nil
 }
 
 // Tracker returns the request log + connection-state tracker. The
 // daemon hands this to the web layer for /telegram visibility.
 func (c *Client) Tracker() *Tracker { return c.tracker }
+
+// RateLimiter returns the shared rate limiter. The daemon spawns a
+// poller that watches the meta_kv key and applies SetPerMinute(N) so
+// changes made via CLI or web take effect without a remount.
+func (c *Client) RateLimiter() *RateLimiter { return c.rateLimit }
 
 // newTG builds a fresh underlying gotd client honoring cfg.DC and the
 // session storage path. Our FloodWaiter (internal/tg/floodwait.go)
@@ -65,9 +75,17 @@ func (c *Client) newTG() *telegram.Client {
 	// the waiter swallows it via retry). That way the request log
 	// shows every wire-level attempt, not just the user-facing
 	// outcome.
+	// Middlewares are evaluated from FIRST to LAST in the slice with
+	// the FIRST entry wrapping everything below it. So RateLimiter
+	// (first) is the outermost gate: requests wait at the limiter
+	// BEFORE flooding into FloodWaiter's retry loop or being counted
+	// by TrackingMiddleware as "in flight". That keeps the daemon's
+	// outbound rate bounded by the operator-controlled budget rather
+	// than by Telegram's punitive FLOOD_WAITs.
 	opts := telegram.Options{
 		SessionStorage: storage,
 		Middlewares: []telegram.Middleware{
+			c.rateLimit,
 			NewFloodWaiter(),
 			&TrackingMiddleware{Tracker: c.tracker},
 		},

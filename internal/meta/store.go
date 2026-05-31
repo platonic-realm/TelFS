@@ -189,6 +189,15 @@ const (
 // chunk_map is non-empty.
 const KVCompressionCodec = "compression_codec"
 
+// KVTGRateLimitPerMin caps outbound MTProto requests/minute when
+// non-zero. The daemon polls this key every few seconds and
+// updates its rate.Limiter, so changes from the CLI or web reflect
+// without a remount. Zero/missing means unlimited (the historical
+// default). Trades upload throughput for never tripping Telegram's
+// FLOOD_WAIT — useful when bursty workloads (tar extracts, mass
+// deletes) cause cascading retry storms.
+const KVTGRateLimitPerMin = "tg_rate_limit_per_min"
+
 // Trash safety-net KV keys. When KVTrashEnabled is set to "1", every
 // kernel-issued unlink/rmdir from FUSE is rerouted to a top-level
 // `.trash/` directory; a TTL GC unlinks them for real after
@@ -327,6 +336,38 @@ func (s *Store) SetCompressionCodec(ctx context.Context, name string) error {
 		return fmt.Errorf("meta: unknown compression codec %q (want none or zstd)", name)
 	}
 	return s.PutKV(ctx, KVCompressionCodec, []byte(name))
+}
+
+// TGRateLimitPerMin returns the per-minute cap on outbound MTProto
+// requests, or 0 if unset. 0 means unlimited (historical default).
+func (s *Store) TGRateLimitPerMin(ctx context.Context) (int, error) {
+	v, err := s.GetKV(ctx, KVTGRateLimitPerMin)
+	if errors.Is(err, ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(v)))
+	if err != nil {
+		return 0, fmt.Errorf("meta: %s kv malformed (%q): %w", KVTGRateLimitPerMin, string(v), err)
+	}
+	return n, nil
+}
+
+// SetTGRateLimitPerMin writes the cap. 0 disables the limit (and
+// deletes the key for a clean state). Negative values are rejected.
+func (s *Store) SetTGRateLimitPerMin(ctx context.Context, n int) error {
+	if n < 0 {
+		return fmt.Errorf("meta: rate limit %d must be >= 0", n)
+	}
+	if n == 0 {
+		if err := s.DeleteKV(ctx, KVTGRateLimitPerMin); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		return nil
+	}
+	return s.PutKV(ctx, KVTGRateLimitPerMin, []byte(strconv.Itoa(n)))
 }
 
 // TrashEnabled reports whether the trash safety-net is active for this
