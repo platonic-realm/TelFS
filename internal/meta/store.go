@@ -498,3 +498,39 @@ func isBusyErr(err error) bool {
 	return strings.Contains(msg, "SQLITE_BUSY") ||
 		strings.Contains(msg, "database is locked")
 }
+
+// execWithRetry wraps a single-statement ExecContext with the same
+// retry-on-SQLITE_BUSY logic WithTx already has. Required for hot-
+// path writes that run OUTSIDE of WithTx (PutChunk, MarkJournalPosted,
+// etc.) — under MaxOpenConns(8) those compete with other writers for
+// the SQLite write lock and can lose, returning "database is locked".
+// Without this wrapper that error surfaced verbatim to the writer's
+// uploadOne, which set uploadErr and made the next WriteAt return
+// EIO to tar — even though the chunk bytes were already on Telegram
+// and the row would have landed on a 10ms retry.
+//
+// Same backoff schedule as WithTx (10ms → 500ms cap, 5 attempts).
+func (s *Store) execWithRetry(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	const maxAttempts = 5
+	backoff := 10 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		res, err := s.db.ExecContext(ctx, query, args...)
+		if err == nil {
+			return res, nil
+		}
+		if !isBusyErr(err) || attempt >= maxAttempts {
+			return nil, err
+		}
+		log.Printf("meta.execWithRetry: SQLITE_BUSY on attempt %d/%d, retrying after %s: %v",
+			attempt, maxAttempts, backoff, err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > 500*time.Millisecond {
+			backoff = 500 * time.Millisecond
+		}
+	}
+}

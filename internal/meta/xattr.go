@@ -16,7 +16,7 @@ import (
 // than the channel message text limit (~4 KiB), we'll need to promote
 // large values to chunks. Linux's xattr cap is 64 KiB per value.
 func (s *Store) SetXattr(ctx context.Context, ino int64, name string, value []byte) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.execWithRetry(ctx,
 		`INSERT INTO xattrs(ino, name, value) VALUES (?,?,?)
 		 ON CONFLICT(ino, name) DO UPDATE SET value = excluded.value`,
 		ino, name, value)
@@ -62,7 +62,7 @@ func (s *Store) ListXattrs(ctx context.Context, ino int64) ([]string, error) {
 
 // RemoveXattr deletes an xattr. Returns ErrNotFound if it didn't exist.
 func (s *Store) RemoveXattr(ctx context.Context, ino int64, name string) error {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`DELETE FROM xattrs WHERE ino = ? AND name = ?`, ino, name)
 	if err != nil {
 		return fmt.Errorf("remove xattr %d/%q: %w", ino, name, err)

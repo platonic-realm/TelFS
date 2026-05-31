@@ -18,7 +18,7 @@ import (
 // pre-packer rows decode identically.
 func (s *Store) PutChunk(ctx context.Context, c Chunk) error {
 	packOff, packSize := nullablePackFields(c)
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.execWithRetry(ctx,
 		`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size)
 		   VALUES (?,?,?,?,?,?)
 		 ON CONFLICT(ino, idx) DO UPDATE SET
@@ -93,7 +93,7 @@ func (s *Store) ListChunks(ctx context.Context, ino int64) ([]Chunk, error) {
 // DeleteChunk removes a single chunk_map entry. Returns ErrNotFound if
 // the entry didn't exist.
 func (s *Store) DeleteChunk(ctx context.Context, ino int64, idx int32) error {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`DELETE FROM chunk_map WHERE ino = ? AND idx = ?`, ino, idx)
 	if err != nil {
 		return fmt.Errorf("delete chunk %d/%d: %w", ino, idx, err)
@@ -242,7 +242,7 @@ func (s *Store) RecordChunkBlob(ctx context.Context, hash []byte, msgID int64, s
 	if len(hash) == 0 {
 		return errors.New("RecordChunkBlob: empty hash")
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.execWithRetry(ctx,
 		`INSERT INTO chunk_blob(hash, tg_message_id, size)
 		   VALUES (?,?,?)
 		 ON CONFLICT(hash) DO UPDATE SET
@@ -261,7 +261,7 @@ func (s *Store) RecordChunkBlob(ctx context.Context, hash []byte, msgID int64, s
 // path re-checks aliveness in-line either way). Returns the number of
 // stale rows removed.
 func (s *Store) PruneStaleChunkBlobs(ctx context.Context) (int, error) {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`DELETE FROM chunk_blob
 		  WHERE tg_message_id NOT IN (SELECT DISTINCT tg_message_id FROM chunk_map)`)
 	if err != nil {
@@ -286,7 +286,7 @@ func (s *Store) CountChunkBlobs(ctx context.Context) (int, error) {
 // given inode. Used by truncate when the file shrinks past a chunk
 // boundary. Returns the number of rows deleted.
 func (s *Store) DeleteChunksAbove(ctx context.Context, ino int64, startIdx int32) (int, error) {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`DELETE FROM chunk_map WHERE ino = ? AND idx >= ?`, ino, startIdx)
 	if err != nil {
 		return 0, fmt.Errorf("delete chunks above %d/%d: %w", ino, startIdx, err)

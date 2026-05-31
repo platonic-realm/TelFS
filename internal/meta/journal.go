@@ -21,7 +21,7 @@ type JournalEntry struct {
 // AppendJournal inserts a new journal entry and returns the assigned seq.
 // The entry is not posted (posted_at IS NULL).
 func (s *Store) AppendJournal(ctx context.Context, opJSON []byte) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`INSERT INTO journal(op_json) VALUES (?)`, opJSON)
 	if err != nil {
 		return 0, fmt.Errorf("append journal: %w", err)
@@ -69,7 +69,7 @@ func (s *Store) PendingJournal(ctx context.Context) ([]JournalEntry, error) {
 // MarkJournalPosted records that seq has been posted to the channel.
 // Returns ErrNotFound if no such seq exists.
 func (s *Store) MarkJournalPosted(ctx context.Context, seq int64, postedAt int64) error {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`UPDATE journal SET posted_at = ? WHERE seq = ?`, postedAt, seq)
 	if err != nil {
 		return fmt.Errorf("mark journal %d posted: %w", seq, err)
@@ -121,7 +121,7 @@ func (s *Store) BatchMarkJournalPosted(ctx context.Context, seqs []int64, posted
 		for _, s := range chunk {
 			args = append(args, s)
 		}
-		if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+		if _, err := s.execWithRetry(ctx, query, args...); err != nil {
 			return fmt.Errorf("batch mark journal posted (chunk %d..%d): %w", chunk[0], chunk[len(chunk)-1], err)
 		}
 	}
@@ -131,7 +131,7 @@ func (s *Store) BatchMarkJournalPosted(ctx context.Context, seqs []int64, posted
 // DeleteJournalUpTo removes posted journal rows with seq <= upTo. Called
 // after a snapshot supersedes them.
 func (s *Store) DeleteJournalUpTo(ctx context.Context, upTo int64) (int, error) {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`DELETE FROM journal WHERE seq <= ? AND posted_at IS NOT NULL`, upTo)
 	if err != nil {
 		return 0, fmt.Errorf("delete journal <= %d: %w", upTo, err)

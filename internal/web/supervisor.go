@@ -112,7 +112,19 @@ type StartOpts struct {
 	Readonly   bool
 	AllowOther bool
 	Debug      bool
+	// MetricsAddr binds the daemon's debug HTTP endpoint (/metrics,
+	// /telegram). Empty falls back to DefaultMetricsAddr — that's the
+	// URL the web's Telegram tab fetches from, so the default just
+	// works for a single supervised mount. Multi-profile setups must
+	// pick distinct ports here (the kernel can't share a TCP listen).
+	MetricsAddr string
 }
+
+// DefaultMetricsAddr is the daemon's debug HTTP bind when StartOpts
+// doesn't override. Matches the URL the web's Telegram tab fetches
+// from (internal/web/telegram.go), so the Telegram tab "just works"
+// after a default-options Start.
+const DefaultMetricsAddr = "127.0.0.1:9090"
 
 // Start spawns `telfs mount <mountpoint>` for the given profile,
 // captures stdout/stderr to a per-profile log file, and tracks the
@@ -161,6 +173,11 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 	if opts.Debug {
 		args = append(args, "--debug")
 	}
+	metricsAddr := opts.MetricsAddr
+	if metricsAddr == "" {
+		metricsAddr = DefaultMetricsAddr
+	}
+	args = append(args, "--metrics-addr", metricsAddr)
 	args = append(args, opts.Mountpoint)
 
 	cmd := exec.Command(s.selfPath, args...)

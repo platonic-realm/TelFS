@@ -133,7 +133,7 @@ func (s *Store) SetAttrs(ctx context.Context, ino int64, p SetAttrsPatch) error 
 		args = append(args, *p.Mtime)
 	}
 	args = append(args, ino)
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`UPDATE inodes SET `+joinComma(cols)+` WHERE ino = ?`, args...)
 	if err != nil {
 		return fmt.Errorf("update inode %d: %w", ino, err)

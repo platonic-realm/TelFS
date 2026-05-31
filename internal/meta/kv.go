@@ -23,7 +23,7 @@ func (s *Store) GetKV(ctx context.Context, key string) ([]byte, error) {
 
 // PutKV upserts a meta_kv entry.
 func (s *Store) PutKV(ctx context.Context, key string, value []byte) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.execWithRetry(ctx,
 		`INSERT INTO meta_kv(key, value) VALUES (?,?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		key, value)
@@ -35,7 +35,7 @@ func (s *Store) PutKV(ctx context.Context, key string, value []byte) error {
 
 // DeleteKV removes a key. Returns ErrNotFound if absent.
 func (s *Store) DeleteKV(ctx context.Context, key string) error {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.execWithRetry(ctx,
 		`DELETE FROM meta_kv WHERE key = ?`, key)
 	if err != nil {
 		return fmt.Errorf("delete kv %q: %w", key, err)
