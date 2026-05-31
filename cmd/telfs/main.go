@@ -706,7 +706,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// delay the "Mounted at" line. Errors are logged but not
 		// fatal — they don't break the mount, just leave staged
 		// wires for the next attempt.
-		go recoverPending(signalCtx, pendingDir, packer)
+		go recoverPending(signalCtx, pendingDir, packer, metaStore)
 
 		// Stall watchdog: if there's chunk work pending but no
 		// upload completion has registered in metrics for a while,
@@ -925,7 +925,7 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config) http.HandlerFunc {
 // Runs in a goroutine so it doesn't delay the "Mounted at" message.
 // Errors from individual entries are logged but don't abort the
 // recovery — leftover entries will be retried on the next startup.
-func recoverPending(ctx context.Context, dir string, packer *chunk.Packer) {
+func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstore *meta.Store) {
 	entries, err := chunk.ScanPending(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pending: scan:", err)
@@ -934,8 +934,38 @@ func recoverPending(ctx context.Context, dir string, packer *chunk.Packer) {
 	if len(entries) == 0 {
 		return
 	}
-	fmt.Printf("Recovering %d pending upload(s) from %s…\n", len(entries), dir)
+	// First pass: drop entries whose inode no longer exists. Those
+	// are orphan wires from a chunk whose file was unlinked between
+	// PersistPending and Packer.flush. Re-submitting them would
+	// just fail at PutChunk (foreign-key violation against the
+	// missing inode), leaving the .bin file on disk forever.
+	// `gc` doesn't reach pending/ either, so without this step
+	// these files accumulate across crashes.
+	live := entries[:0]
+	orphans := 0
 	for _, e := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := mstore.GetInode(ctx, e.Ino); err != nil {
+			if errors.Is(err, meta.ErrNotFound) {
+				_ = chunk.DeletePending(e.Path)
+				orphans++
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "pending: probe ino %d: %v\n", e.Ino, err)
+			continue
+		}
+		live = append(live, e)
+	}
+	if orphans > 0 {
+		fmt.Printf("Cleaned %d orphan pending wire(s) (inode gone)\n", orphans)
+	}
+	if len(live) == 0 {
+		return
+	}
+	fmt.Printf("Recovering %d pending upload(s) from %s…\n", len(live), dir)
+	for _, e := range live {
 		if ctx.Err() != nil {
 			return
 		}
