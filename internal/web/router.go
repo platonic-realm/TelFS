@@ -57,6 +57,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /encrypt/init", s.encryptInitForm)
 	s.mux.HandleFunc("POST /encrypt/init", s.encryptInitSubmit)
 
+	// Compression.
+	s.mux.HandleFunc("GET /compression", s.compressShow)
+	s.mux.HandleFunc("GET /compression/init", s.compressInitForm)
+	s.mux.HandleFunc("POST /compression/init", s.compressInitSubmit)
+
 	// Telegram connection state + recent requests.
 	s.mux.HandleFunc("GET /telegram", s.telegramPage)
 	s.mux.HandleFunc("GET /partials/telegram", s.telegramPartial)

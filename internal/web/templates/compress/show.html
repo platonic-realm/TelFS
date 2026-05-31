@@ -1,0 +1,24 @@
+{{define "content"}}
+<h2>Compression</h2>
+{{if not .HasMeta}}
+<p><em>No metadata DB yet for this profile.</em></p>
+{{else}}
+<section class="card">
+  <h3>Current codec</h3>
+  <dl>
+    <dt>Codec</dt><dd><code>{{.Codec}}</code></dd>
+    <dt>Chunks committed</dt><dd>{{.ChunkCount}}</dd>
+  </dl>
+  {{if eq .Codec "none"}}
+  <p>Chunk payloads are uploaded uncompressed.</p>
+  {{else}}
+  <p>Chunk payloads are zstd-compressed before encryption + upload. Decompression happens transparently on read.</p>
+  {{end}}
+  {{if .HasChunks}}
+  <p><small>The codec is locked once chunks exist — switching mid-FS would shred every chunk written under the old one. To change, start a fresh profile and <code>cp -r</code> your data.</small></p>
+  {{else}}
+  <p><a href="/compression/init" class="btn">Change codec</a></p>
+  {{end}}
+</section>
+{{end}}
+{{end}}

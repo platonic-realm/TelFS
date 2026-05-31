@@ -1,0 +1,26 @@
+{{define "content"}}
+<h2>Change compression codec</h2>
+{{if .HasChunks}}
+<div class="flash error">
+  This filesystem already has chunks. The codec can only be changed on a fresh
+  TelFS. Create a new profile and <code>cp -r</code> your data over.
+</div>
+<p><a href="/compression" class="btn">Back</a></p>
+{{else}}
+<form method="post" action="/compression/init">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <p>Current codec: <code>{{.CurrentCodec}}</code></p>
+  <label>
+    <input type="radio" name="codec" value="none" {{if eq .CurrentCodec "none"}}checked{{end}}>
+    <strong>none</strong> — chunks upload as-is. No CPU cost on read/write.
+  </label>
+  <label>
+    <input type="radio" name="codec" value="zstd" {{if eq .CurrentCodec "zstd"}}checked{{end}}>
+    <strong>zstd</strong> — compress before encryption + upload. Saves bandwidth/storage on compressible data; costs a small CPU hit per chunk.
+  </label>
+  <button type="submit">Apply</button>
+  <a href="/compression" class="btn">Cancel</a>
+</form>
+<p><small>The chosen codec is recorded in <code>meta_kv.compression_codec</code> and becomes immutable as soon as the first chunk is written.</small></p>
+{{end}}
+{{end}}
