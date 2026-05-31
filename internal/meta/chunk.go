@@ -171,60 +171,67 @@ func (s *Store) AllChunkMessageIDs(ctx context.Context) (map[int64]struct{}, err
 // against `chunk_map` as the source of truth) can never delete the
 // shared message between the aliveness check and the new row's commit.
 func (s *Store) ReuseChunkByHash(ctx context.Context, ino int64, idx int32, hash []byte) (reused bool, msgID int64, size int32, err error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, 0, 0, err
-	}
-	defer tx.Rollback()
-
-	var blobMsgID int64
-	var blobSize int32
-	err = tx.QueryRowContext(ctx,
-		`SELECT tg_message_id, size FROM chunk_blob WHERE hash = ?`, hash).
-		Scan(&blobMsgID, &blobSize)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, 0, 0, tx.Commit()
-	}
-	if err != nil {
-		return false, 0, 0, fmt.Errorf("reuse lookup: %w", err)
-	}
-	// Aliveness gate: the blob index can outlive the underlying message
-	// if `telfs gc` ran since the blob was indexed. Only reuse when at
-	// least one chunk_map row still references the message.
-	var probe int
-	err = tx.QueryRowContext(ctx,
-		`SELECT 1 FROM chunk_map WHERE tg_message_id = ? LIMIT 1`, blobMsgID).Scan(&probe)
-	if errors.Is(err, sql.ErrNoRows) {
-		// Stale entry: chunk_map no longer holds it, treat as miss. We
-		// don't delete the row here — the upload path replaces it with
-		// the fresh msg id.
-		return false, 0, 0, tx.Commit()
-	}
-	if err != nil {
-		return false, 0, 0, fmt.Errorf("reuse alive-check: %w", err)
-	}
-	// Live hit. Insert the new chunk_map row in the same tx. Use
-	// INSERT OR REPLACE in case (ino, idx) is being overwritten.
-	// NOTE: pack_offset/pack_size are explicitly cleared to NULL —
-	// if the previous occupant of this slot was a packed extent
-	// and we're now reusing a NON-packed message via dedup, leaving
-	// the old pack fields in place would point the Reader at a
-	// stale offset in the wrong message.
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size)
-		   VALUES (?,?,?,?,NULL,NULL)
-		 ON CONFLICT(ino, idx) DO UPDATE SET
-		   tg_message_id = excluded.tg_message_id,
-		   size          = excluded.size,
-		   pack_offset   = NULL,
-		   pack_size     = NULL`,
-		ino, idx, blobMsgID, blobSize); err != nil {
-		return false, 0, 0, fmt.Errorf("reuse put chunk: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, 0, 0, err
-	}
-	return true, blobMsgID, blobSize, nil
+	// Route through WithTx so we inherit retry-on-SQLITE_BUSY. The
+	// dedup hot path runs from many writer goroutines concurrently
+	// and used to ad-hoc BeginTx, which hit "database is locked"
+	// under the new MaxOpenConns(8) setting because raw BeginTx
+	// doesn't retry. The closure captures the outputs.
+	var (
+		outReused bool
+		outMsgID  int64
+		outSize   int32
+	)
+	err = s.WithTx(ctx, func(tx *sql.Tx) error {
+		var blobMsgID int64
+		var blobSize int32
+		qerr := tx.QueryRowContext(ctx,
+			`SELECT tg_message_id, size FROM chunk_blob WHERE hash = ?`, hash).
+			Scan(&blobMsgID, &blobSize)
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return nil
+		}
+		if qerr != nil {
+			return fmt.Errorf("reuse lookup: %w", qerr)
+		}
+		// Aliveness gate: the blob index can outlive the underlying
+		// message if `telfs gc` ran since the blob was indexed. Only
+		// reuse when at least one chunk_map row still references the
+		// message.
+		var probe int
+		aerr := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM chunk_map WHERE tg_message_id = ? LIMIT 1`, blobMsgID).Scan(&probe)
+		if errors.Is(aerr, sql.ErrNoRows) {
+			// Stale entry: chunk_map no longer holds it, treat as
+			// miss. We don't delete the row here — the upload path
+			// replaces it with the fresh msg id.
+			return nil
+		}
+		if aerr != nil {
+			return fmt.Errorf("reuse alive-check: %w", aerr)
+		}
+		// Live hit. Insert the new chunk_map row in the same tx.
+		// pack_offset/pack_size are explicitly cleared to NULL — if
+		// the previous occupant of this slot was a packed extent and
+		// we're now reusing a NON-packed message via dedup, leaving
+		// the old pack fields in place would point the Reader at a
+		// stale offset in the wrong message.
+		if _, ierr := tx.ExecContext(ctx,
+			`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size)
+			   VALUES (?,?,?,?,NULL,NULL)
+			 ON CONFLICT(ino, idx) DO UPDATE SET
+			   tg_message_id = excluded.tg_message_id,
+			   size          = excluded.size,
+			   pack_offset   = NULL,
+			   pack_size     = NULL`,
+			ino, idx, blobMsgID, blobSize); ierr != nil {
+			return fmt.Errorf("reuse put chunk: %w", ierr)
+		}
+		outReused = true
+		outMsgID = blobMsgID
+		outSize = blobSize
+		return nil
+	})
+	return outReused, outMsgID, outSize, err
 }
 
 // RecordChunkBlob upserts the (hash → msg_id, size) index entry after a

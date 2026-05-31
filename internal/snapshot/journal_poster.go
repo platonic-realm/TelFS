@@ -121,17 +121,20 @@ func (p *Poster) drainOnce(ctx context.Context) error {
 			return fmt.Errorf("post batch first_seq=%d last_seq=%d: %w",
 				batch[0].Seq, batch[len(batch)-1].Seq, err)
 		}
-		// Mark every seq in the batch posted. We do this serially
-		// after the upload returns success; if MarkJournalPosted
-		// fails partway, the next tick re-posts the not-yet-marked
-		// tail (same recovery model as per-op behavior). At most
-		// batchSize ops are duplicated on the channel for a single
-		// crash — orphan dedup is `gc`'s job.
-		nowUnix := time.Now().Unix()
-		for _, e := range batch {
-			if err := p.Meta.MarkJournalPosted(ctx, e.Seq, nowUnix); err != nil {
-				return fmt.Errorf("mark posted seq=%d: %w", e.Seq, err)
-			}
+		// Mark every seq in the batch posted in ONE batched UPDATE.
+		// The previous per-seq loop kept the (single) DB connection
+		// busy for hundreds of ms while it issued N small UPDATEs,
+		// blocking every FUSE op queued behind it long enough for
+		// some kernel-side contexts to time out — surfacing in
+		// userspace as EIO from rm/tar under load. One batched
+		// UPDATE finishes in a couple of ms regardless of batch size.
+		seqs := make([]int64, len(batch))
+		for i, e := range batch {
+			seqs[i] = e.Seq
+		}
+		if err := p.Meta.BatchMarkJournalPosted(ctx, seqs, time.Now().Unix()); err != nil {
+			return fmt.Errorf("mark posted (batch first_seq=%d last_seq=%d): %w",
+				batch[0].Seq, batch[len(batch)-1].Seq, err)
 		}
 	}
 	return nil

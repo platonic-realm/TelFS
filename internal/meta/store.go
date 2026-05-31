@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,16 +38,26 @@ func Open(path string) (*Store, error) {
 	}
 	// Pragma options are passed via the connection URL.
 	// _pragma=foreign_keys(1) is required for ON DELETE CASCADE to fire.
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)"
+	// busy_timeout is generous (60s) so a queued reader/writer waits
+	// out long checkpoints or batch writes instead of returning
+	// SQLITE_BUSY to the caller — which under load surfaces as EIO
+	// to userspace (rm/tar). Plain "wait it out" is fine; SQLite is
+	// honest about busy and doesn't deadlock.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(60000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("meta: open %s: %w", path, err)
 	}
-	// TODO(M3): re-evaluate this cap. WAL allows many concurrent readers
-	// alongside one writer, so capping conns to 1 serializes the FUSE
-	// daemon's parallel reads needlessly. For M2's test workload it's
-	// invisible; for the read-mount in M3 it's a contention point.
-	db.SetMaxOpenConns(1)
+	// MaxOpenConns(1) used to be set here as a conservative default,
+	// but it bottlenecks the FUSE workload badly: every Lookup,
+	// Readdir, Getattr queues behind any in-flight write transaction,
+	// and a heavy write (e.g., a journal-poster batch UPDATE) blocks
+	// all reads for hundreds of ms — long enough for kernel-side
+	// FUSE op contexts to time out and surface as EIO in userspace.
+	// WAL allows many concurrent readers alongside one writer, so
+	// raising the cap lets reads parallelize freely. Writes still
+	// serialize at the SQLite level; busy_timeout absorbs that.
+	db.SetMaxOpenConns(8)
 
 	s := &Store{db: db}
 	if err := s.initSchema(context.Background()); err != nil {
@@ -418,7 +429,43 @@ func firstLine(s string) string {
 // WithTx runs fn in a single transaction. fn must use the *sql.Tx for all
 // DB access. On error, the transaction is rolled back; on success, it's
 // committed.
+//
+// Retries on SQLITE_BUSY (or its synonyms) up to txMaxAttempts times
+// with exponential backoff. SQLite returns BUSY when a write tx can't
+// acquire the database write lock within busy_timeout — this is the
+// scenario where MaxOpenConns > 1 lets multiple goroutines race for
+// the SQLite-level write lock and one loses. fn MUST be idempotent
+// across retries; that's the contract for every existing caller (each
+// is a self-contained set of inserts/updates wrapped in BEGIN, and a
+// rolled-back tx leaves no observable state behind).
 func (s *Store) WithTx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
+	const txMaxAttempts = 5
+	backoff := 10 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		err = s.withTxOnce(ctx, fn)
+		if err == nil {
+			return nil
+		}
+		if !isBusyErr(err) || attempt >= txMaxAttempts {
+			return err
+		}
+		log.Printf("meta.WithTx: SQLITE_BUSY on attempt %d/%d, retrying after %s: %v",
+			attempt, txMaxAttempts, backoff, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > 500*time.Millisecond {
+			backoff = 500 * time.Millisecond
+		}
+	}
+}
+
+// withTxOnce is the single-attempt transaction body. Split out from
+// WithTx so the retry loop in WithTx stays readable.
+func (s *Store) withTxOnce(ctx context.Context, fn func(*sql.Tx) error) (err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
@@ -437,4 +484,17 @@ func (s *Store) WithTx(ctx context.Context, fn func(*sql.Tx) error) (err error) 
 		err = tx.Commit()
 	}()
 	return fn(tx)
+}
+
+// isBusyErr reports whether err is (or wraps) one of modernc.org/sqlite's
+// busy-condition errors. We string-match because the modernc driver doesn't
+// expose its constants in a stable API surface; the substrings are stable
+// across driver versions ("SQLITE_BUSY", "database is locked").
+func isBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") ||
+		strings.Contains(msg, "database is locked")
 }

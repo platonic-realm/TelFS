@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // JournalEntry is a row in the `journal` table — a write-ahead record of a
@@ -79,6 +80,50 @@ func (s *Store) MarkJournalPosted(ctx context.Context, seq int64, postedAt int64
 	}
 	if n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// BatchMarkJournalPosted marks every seq in seqs as posted at the
+// given time, in ONE single UPDATE statement and ONE transaction.
+//
+// The naive form — calling MarkJournalPosted in a loop — issues N
+// separate UPDATEs on the same shared DB connection, which under
+// MaxOpenConns(1) holds the connection for the entire loop. With a
+// 1000-op batch from the journal poster that's hundreds of
+// milliseconds of head-of-line blocking for every FUSE op queued
+// behind it, surfacing to userspace as EIO when those ops' contexts
+// time out waiting for the connection.
+//
+// Empty slice is a no-op. Does not validate that every seq exists;
+// the journal poster only feeds in seqs it just received from
+// PendingJournal so they're guaranteed live.
+func (s *Store) BatchMarkJournalPosted(ctx context.Context, seqs []int64, postedAt int64) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	// One placeholder per seq + the postedAt: build the IN clause.
+	// SQLite tolerates up to 999 host parameters by default; chunk if
+	// the batch is larger.
+	const chunkSz = 800 // leave headroom under SQLITE_LIMIT_VARIABLE_NUMBER
+	for start := 0; start < len(seqs); start += chunkSz {
+		end := start + chunkSz
+		if end > len(seqs) {
+			end = len(seqs)
+		}
+		chunk := seqs[start:end]
+		// `?,?,?,?,...` with len(chunk) entries.
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1] // trim trailing comma
+		query := "UPDATE journal SET posted_at = ? WHERE seq IN (" + placeholders + ")"
+		args := make([]any, 0, 1+len(chunk))
+		args = append(args, postedAt)
+		for _, s := range chunk {
+			args = append(args, s)
+		}
+		if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("batch mark journal posted (chunk %d..%d): %w", chunk[0], chunk[len(chunk)-1], err)
+		}
 	}
 	return nil
 }

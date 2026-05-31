@@ -80,3 +80,51 @@ func TestLastJournalSeqIsMonotonicAcrossDeletes(t *testing.T) {
 		t.Fatalf("LastJournalSeq = %d, want %d", last, seq)
 	}
 }
+
+// TestBatchMarkJournalPosted verifies the batched form marks every
+// listed seq as posted in a single round-trip. Also exercises the
+// chunking path by passing a batch larger than the internal chunk
+// size — the multiple internal UPDATEs must still mark everything.
+func TestBatchMarkJournalPosted(t *testing.T) {
+	s := newTestStore(t)
+	ctx := ctxT(t)
+	// Append 1500 entries so we exceed one internal chunk (800).
+	for i := 0; i < 1500; i++ {
+		if _, err := s.AppendJournal(ctx, []byte(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := s.PendingJournal(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1500 {
+		t.Fatalf("pending = %d, want 1500", len(pending))
+	}
+	seqs := make([]int64, len(pending))
+	for i, e := range pending {
+		seqs[i] = e.Seq
+	}
+	if err := s.BatchMarkJournalPosted(ctx, seqs, 42); err != nil {
+		t.Fatalf("BatchMarkJournalPosted: %v", err)
+	}
+	// After batching, PendingJournal must be empty.
+	stillPending, err := s.PendingJournal(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stillPending) != 0 {
+		t.Fatalf("after batch mark, pending = %d, want 0 (first not-posted seq = %d)",
+			len(stillPending), stillPending[0].Seq)
+	}
+}
+
+// TestBatchMarkJournalPostedEmpty is a no-op on an empty slice — no
+// SQL is issued, no error returned. The journal poster relies on this
+// when a tick draws an empty PendingJournal.
+func TestBatchMarkJournalPostedEmpty(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.BatchMarkJournalPosted(ctxT(t), nil, 1); err != nil {
+		t.Fatalf("BatchMarkJournalPosted(nil): %v", err)
+	}
+}
