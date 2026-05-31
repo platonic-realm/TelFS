@@ -461,6 +461,21 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	}
 	defer metaStore.Close()
 
+	// Startup repair: a previous daemon may have died mid-upload
+	// (FLOOD_WAIT, kill, OOM, etc.) and left files whose chunk_map
+	// has gaps. Truncate each such inode to its largest contiguous
+	// prefix BEFORE the FUSE server starts so user-visible reads
+	// don't EIO on the gap. Idempotent; cheap on a clean FS.
+	if repaired, err := metaStore.RepairPartialFiles(signalCtx); err != nil {
+		fmt.Fprintln(os.Stderr, "[repair] warning:", err)
+	} else if len(repaired) > 0 {
+		fmt.Printf("Repaired %d partial file(s) from a prior crash:\n", len(repaired))
+		for _, r := range repaired {
+			fmt.Printf("  ino %d: size %d → %d (had %d chunks, first gap at idx %d, kept %d)\n",
+				r.Ino, r.OldSize, r.NewSize, r.OldChunks, r.FirstGapAt, r.NewChunks)
+		}
+	}
+
 	client, err := tg.New(cfg)
 	if err != nil {
 		return err
