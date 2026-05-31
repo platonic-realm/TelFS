@@ -342,6 +342,18 @@ func (s *Server) browseDelete(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
 			return
 		}
+		// Belt-and-suspenders: os.RemoveAll claims success when it
+		// thinks every entry is gone, but a buggy/transiently-failing
+		// FUSE daemon can lie (e.g., return ENOENT for an entry that
+		// actually still exists, which RemoveAll treats as "already
+		// deleted"). Verify the target really is gone before flashing
+		// OK — otherwise the user sees a green checkmark while their
+		// data is still on disk.
+		if _, err := os.Lstat(abs); err == nil {
+			SetFlash(w, "error", fmt.Sprintf("delete (recursive): os.RemoveAll returned success but %s is still on disk. The FUSE daemon may have silently failed mid-walk — check its log and try again.", abs))
+			http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
+			return
+		}
 		SetFlash(w, "ok", "deleted directory "+path.Base(p)+" (recursive)")
 		http.Redirect(w, r, browseDirHref(at, parent), http.StatusSeeOther)
 		return

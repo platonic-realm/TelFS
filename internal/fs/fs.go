@@ -152,7 +152,7 @@ func (n *Node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 func (n *Node) Getattr(ctx context.Context, _ gofuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	in, err := n.backend.Meta.GetInode(ctx, n.ino)
 	if err != nil {
-		return syscall.ENOENT
+		return logMetaErr("Getattr", n.ino, err)
 	}
 	fillAttr(&out.Attr, in)
 	return 0
@@ -228,7 +228,7 @@ func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
 func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
 	in, err := n.backend.Meta.Lookup(ctx, n.ino, name)
 	if err != nil {
-		return nil, syscall.ENOENT
+		return nil, logMetaErr("Lookup", n.ino, err)
 	}
 	childInode := n.newChildInode(ctx, in)
 	fillAttr(&out.Attr, in)
@@ -240,13 +240,7 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*go
 func (n *Node) Readdir(ctx context.Context) (gofuse.DirStream, syscall.Errno) {
 	infos, err := n.backend.Meta.ReaddirInfo(ctx, n.ino)
 	if err != nil {
-		// Log the underlying error so transient EIOs (SQLite busy
-		// timeout, ctx cancellation, ...) are diagnosable from the
-		// daemon log. Without this every Readdir failure looks the
-		// same to the kernel and the only signal is "EIO" — the user
-		// can't tell SQLite contention apart from a real corruption.
-		log.Printf("fs.Readdir(ino=%d): %v", n.ino, err)
-		return nil, syscall.EIO
+		return nil, logMetaErr("Readdir", n.ino, err)
 	}
 	entries := make([]fuse.DirEntry, len(infos))
 	for i, e := range infos {
@@ -416,7 +410,7 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	}
 	in, err := n.backend.Meta.Lookup(ctx, n.ino, name)
 	if err != nil {
-		return syscall.ENOENT
+		return logMetaErr("Unlink.lookup", n.ino, err)
 	}
 	if in.Kind == meta.KindDir {
 		return syscall.EISDIR
@@ -448,7 +442,7 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	}
 	in, err := n.backend.Meta.Lookup(ctx, n.ino, name)
 	if err != nil {
-		return syscall.ENOENT
+		return logMetaErr("Rmdir.lookup", n.ino, err)
 	}
 	if in.Kind != meta.KindDir {
 		return syscall.ENOTDIR
@@ -645,6 +639,28 @@ func mapMetaErr(err error) syscall.Errno {
 		return syscall.ENOTDIR
 	}
 	return syscall.EIO
+}
+
+// logMetaErr maps a meta error to its POSIX errno AND logs any
+// non-sentinel cause (SQL errors, ctx cancellation, ...). The
+// callers used to do `if err != nil { return syscall.ENOENT }`
+// blindly — which the kernel reported as "this thing doesn't exist"
+// and Go's os.RemoveAll then treated as "already deleted, success".
+// So a transient SQLite busy timeout deep in a tree-wipe used to
+// silently produce a "deleted everything" result while leaving
+// files in place. Routing through this helper instead means the
+// kernel sees EIO on real errors (RemoveAll surfaces them), and
+// the daemon log records what actually went wrong.
+func logMetaErr(op string, ino int64, err error) syscall.Errno {
+	if err == nil {
+		return 0
+	}
+	if !errors.Is(err, meta.ErrNotFound) && !errors.Is(err, meta.ErrExists) &&
+		!errors.Is(err, meta.ErrNotEmpty) && !errors.Is(err, meta.ErrIsDir) &&
+		!errors.Is(err, meta.ErrNotDir) {
+		log.Printf("fs.%s(ino=%d): %v", op, ino, err)
+	}
+	return mapMetaErr(err)
 }
 
 // isUserXattr reports whether `name` is in Linux's "user." xattr
