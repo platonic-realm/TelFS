@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fs"
@@ -11,6 +12,19 @@ import (
 
 	"telfs/internal/chunk"
 )
+
+// seekThresholdBytes is the gap (between previous read end and new
+// read start) that we treat as a non-sequential seek. Below the
+// threshold, prefetch stays on; at or above it, the handle calls
+// Reader.ReadAtKnownNoPrefetch so the prior in-flight prefetches
+// get cancelled (freeing bandwidth for the seek's foreground chunk)
+// and no new prefetches get scheduled for this read.
+//
+// 16 MiB = four 4 MiB chunks of slack. Catches movie scrubbing
+// (seeks of seconds-to-minutes worth of stream) without flagging
+// the kernel's natural readahead-driven jitter (which stays
+// within one or two chunks of the previous read).
+const seekThresholdBytes int64 = 16 << 20
 
 // fileHandle is the per-Open state for a regular file. It implements
 // the go-fuse v2 FileHandle interfaces for Read, Write, Flush, Release,
@@ -27,6 +41,33 @@ type fileHandle struct {
 
 	mu     sync.Mutex
 	writer *chunk.Writer
+
+	// metaCached holds the inode's invariant-during-read fields:
+	// chunkSize (per-inode tier, set at first dispatch) and size
+	// (file length at Open time). Reader.ReadAt fetches both per
+	// call by default; populating them on the handle skips that
+	// SQL row when we can guarantee they're current.
+	//
+	// dirty trips on the first Write through this handle. While
+	// dirty, the cached size is potentially stale (the writer may
+	// have extended the file), so Read falls back to the
+	// GetInode-per-call path. Pure-read workloads (cp, md5sum,
+	// ffmpeg streaming, gcc reads) leave dirty=false and get the
+	// SQL row eliminated.
+	chunkSize int64
+	size      int64
+	dirty     bool
+
+	// lastReadEnd is the byte offset immediately past the previous
+	// Read's range, atomically updated. The next Read compares its
+	// own offset to this value to detect a non-sequential seek
+	// (player scrubbing a movie, jump in an editor). On seek the
+	// handle calls Reader.ReadAtKnownNoPrefetch, which cancels the
+	// stale prefetches and avoids scheduling new ones — both of
+	// which would otherwise compete with the foreground chunk for
+	// bandwidth. Initialized to -1 so the first Read always
+	// prefetches normally.
+	lastReadEnd atomic.Int64
 }
 
 // Implements the go-fuse v2 file-handle interfaces.
@@ -43,11 +84,52 @@ var (
 // this matches typical filesystem semantics where reads serve persisted
 // data and writers explicitly flush to make their data durable.
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	n, err := h.node.backend.Reader.ReadAt(ctx, h.node.ino, dest, off)
+	// Seek detection: compare this read's start to the previous
+	// read's end. A big gap (forward or backward) means the player /
+	// editor scrubbed — the prefetcher's prior queue is now junk and
+	// should be cancelled. -1 means "never read" (first Read after
+	// Open), which we treat as sequential so initial reads prefetch.
+	prevEnd := h.lastReadEnd.Load()
+	seek := false
+	if prevEnd >= 0 {
+		gap := off - prevEnd
+		if gap < 0 {
+			gap = -gap
+		}
+		seek = gap > seekThresholdBytes
+	}
+
+	// Fast path: use cached chunkSize + size from Open time, skipping
+	// Reader's per-call GetInode SQL row. Only safe when this handle
+	// hasn't been written to — a dirty handle's size may have moved
+	// past the cached value, and the fall-back GetInode preserves
+	// correctness in that case.
+	var (
+		n   int
+		err error
+	)
+	switch {
+	case seek && h.chunkSize > 0 && !h.dirty:
+		n, err = h.node.backend.Reader.ReadAtKnownNoPrefetch(ctx, h.node.ino, dest, off, h.chunkSize, h.size)
+	case seek:
+		// Dirty / cold handle on a seek: still cancel the prefetches
+		// (the Reader exposes that via a sibling method that falls
+		// back to GetInode), but no chunkSize hint to pass.
+		n, err = h.node.backend.Reader.ReadAtKnownNoPrefetch(ctx, h.node.ino, dest, off, 0, 0)
+	case h.chunkSize > 0 && !h.dirty:
+		n, err = h.node.backend.Reader.ReadAtKnown(ctx, h.node.ino, dest, off, h.chunkSize, h.size)
+	default:
+		n, err = h.node.backend.Reader.ReadAt(ctx, h.node.ino, dest, off)
+	}
 	if err != nil {
 		log.Printf("fs.handle.Read(ino=%d, off=%d, len=%d): %v", h.node.ino, off, len(dest), err)
 		return nil, syscall.EIO
 	}
+	// Record the END of this read so the next call can detect a seek.
+	// Use the requested length, not n, so a short-at-EOF read still
+	// counts as sequential continuation when the player then reads
+	// the next file region.
+	h.lastReadEnd.Store(off + int64(len(dest)))
 	return fuse.ReadResultData(dest[:n]), 0
 }
 
@@ -60,6 +142,10 @@ func (h *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32,
 		log.Printf("fs.handle.Write(ino=%d, off=%d, len=%d): wrote %d, err=%v", h.node.ino, off, len(data), n, err)
 		return uint32(n), syscall.EIO
 	}
+	// Trip the dirty flag so subsequent Reads on this handle fall
+	// back to the GetInode-per-call path (the cached size is
+	// potentially stale after a write extended the file).
+	h.dirty = true
 	return uint32(n), 0
 }
 

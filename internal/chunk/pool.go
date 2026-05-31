@@ -35,6 +35,14 @@ type UploadPool struct {
 	// row lands. Empty string disables persistence (used by tests
 	// that mock the uploader and don't care about restart recovery).
 	PendingDir string
+
+	// PendingIndex is the in-process map (ino, idx) → on-disk path
+	// that accelerates Reader.tryPendingFallback by skipping the
+	// O(N) filepath.Glob over PendingDir. Maintained by the writer
+	// (on PersistPending success) and the packer (on DeletePending
+	// success), and consulted by the reader. Nil disables the
+	// acceleration; the disk scan still works.
+	PendingIndex *PendingIndex
 }
 
 // NewUploadPool constructs a pool with the given concurrency cap.

@@ -13,21 +13,36 @@ import (
 	"telfs/internal/meta"
 )
 
-// PrefetchWindow is how many chunks past the current ReadAt cursor
-// the Reader speculatively fetches. Sequential reads (cp, md5sum, cat,
-// video playback) benefit because the round trip for chunk N+k happens
-// in the background while the kernel is still consuming chunk N. The
-// window matches DefaultUploadConcurrency on the write side — the
-// same 4 in-flight gotd transfers a typical residential uplink can
-// sustain.
-const PrefetchWindow = 4
+// DefaultPrefetchWindow is the speculative-read window: how many
+// chunks past the current ReadAt cursor the Reader schedules
+// background fetches for. Each scheduled chunk is fetched through
+// the cache miss path (which itself parallelises 4 ways inside one
+// DownloadDocumentRange), so window × concurrency is the upper
+// bound on in-flight prefetch RPCs.
+//
+// Picked conservatively: too-deep prefetch starves the FOREGROUND
+// download for bandwidth, which is felt most painfully on movie
+// seeks — the kernel issues a 4 MiB read at the new position, and
+// the player can't decode until our cache.Get for that chunk
+// returns. Adding 4 prefetches × 4 gotd threads = 16 background
+// RPCs to compete with would slow the foreground to 1/5 of
+// bandwidth. 4 is the sweet spot: enough lookahead to mask round-
+// trip latency on sequential streams, not enough to starve seeks.
+const DefaultPrefetchWindow = 4
 
-// PrefetchConcurrency caps simultaneous prefetch RPCs. Independent of
-// PrefetchWindow because windows can pile up if a Read sweeps fast
-// through many small reads (e.g., kernel readahead chunked into
-// 128 KiB requests) — we want at most this many gotd downloads in
-// flight regardless.
-const PrefetchConcurrency = 4
+// DefaultPrefetchConcurrency caps simultaneous prefetchOne
+// goroutines, not RPCs — each one can fire 4 concurrent
+// UploadGetFile requests through the parallel ranged fetcher. 2
+// prefetchers × 4 RPCs = 8 in-flight prefetch reads, which leaves
+// most of the network for the foreground chunk a player is
+// actually waiting on.
+const DefaultPrefetchConcurrency = 2
+
+// PrefetchWindow / PrefetchConcurrency are kept as legacy aliases
+// for tests and existing callers that referenced the constants.
+// New code should use Reader.SetPrefetch or the Default* constants.
+const PrefetchWindow = DefaultPrefetchWindow
+const PrefetchConcurrency = DefaultPrefetchConcurrency
 
 // Reader orchestrates random-offset reads of a TelFS file by walking
 // chunk_map, consulting the disk LRU cache, and pulling missing chunks
@@ -55,17 +70,38 @@ type Reader struct {
 	// pre-dispatch wire under <pendingDir>/<ino>-<idx>-*.bin and
 	// decode it inline. Zero values disable the fallback (no
 	// pending dir, no cipher, no codec).
-	pendingDir string
-	cipher     crypto.Cipher
-	codec      compress.Codec
+	pendingDir   string
+	pendingIndex *PendingIndex // optional in-process accelerator over the dir scan
+	cipher       crypto.Cipher
+	codec        compress.Codec
 
 	// Prefetch state. prefetchSem caps in-flight fetches; inflight is
 	// a per-Key dedup so two consecutive ReadAt calls don't both kick
 	// off the same fetch. Both protect against pathological wasted
 	// network calls, not against correctness — the cache already
 	// dedups concurrent inserts for the same key.
-	prefetchSem chan struct{}
-	inflight    sync.Map // Key → struct{}
+	prefetchSem    chan struct{}
+	inflight       sync.Map // Key → struct{}
+	prefetchWindow int      // chunks ahead of cursor to warm
+
+	// prefetchGroups is a per-inode cancellable context for in-
+	// flight prefetches. A seek (handled by the file-handle's
+	// no-prefetch read path) cancels the previous prefetches for
+	// that inode so they don't keep eating bandwidth the foreground
+	// chunk needs. Sequential reads keep the same context alive.
+	// nil entries are treated as "no active prefetch group" — the
+	// new prefetch creates one.
+	prefetchGroups sync.Map // ino → *prefetchGroup
+}
+
+// prefetchGroup is the per-inode prefetch context that the seek
+// path cancels. New reads on the same inode that detect a seek
+// pull the current entry, call cancel, and let scheduleAhead
+// install a fresh one. Sequential reads reuse the existing group
+// so prefetches in flight continue.
+type prefetchGroup struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewReader wires up the read path. chunkSize is normally ChunkSize but
@@ -75,11 +111,31 @@ func NewReader(m *meta.Store, c *Cache, pending *PendingInodes, chunkSize int64)
 		chunkSize = ChunkSize
 	}
 	return &Reader{
-		meta:        m,
-		cache:       c,
-		pending:     pending,
-		chunkSize:   chunkSize,
-		prefetchSem: make(chan struct{}, PrefetchConcurrency),
+		meta:           m,
+		cache:          c,
+		pending:        pending,
+		chunkSize:      chunkSize,
+		prefetchSem:    make(chan struct{}, DefaultPrefetchConcurrency),
+		prefetchWindow: DefaultPrefetchWindow,
+	}
+}
+
+// SetPrefetch overrides the read-ahead window and concurrency at
+// runtime. Window > 0 changes how many chunks past the read cursor
+// get speculatively scheduled; Concurrency > 0 resizes the
+// prefetchOne semaphore (capping simultaneous prefetch goroutines).
+// Either value may be 0/negative to leave that side unchanged.
+//
+// Safe to call before any ReadAt has run. Calling after concurrent
+// reads have already started will not break anything in flight
+// (the old sem keeps draining), but the new cap only applies to
+// fresh prefetches.
+func (r *Reader) SetPrefetch(window, concurrency int) {
+	if window > 0 {
+		r.prefetchWindow = window
+	}
+	if concurrency > 0 {
+		r.prefetchSem = make(chan struct{}, concurrency)
 	}
 }
 
@@ -99,36 +155,33 @@ func (r *Reader) SetPendingFallback(pendingDir string, cipher crypto.Cipher, cod
 	r.codec = codec
 }
 
+// SetPendingIndex installs an in-process accelerator over the disk
+// scan: tryPendingFallback consults the index first (O(1) map
+// lookup) and only falls back to filepath.Glob when the index
+// reports a miss. Optional — index nil disables the acceleration
+// and the existing Glob fallback handles everything.
+func (r *Reader) SetPendingIndex(idx *PendingIndex) {
+	r.pendingIndex = idx
+}
+
 // ReadAt fills dest with bytes from ino starting at off. Returns the
 // number of bytes actually written into dest; if the request runs past
 // EOF, the short return is the truncated portion (no error).
 //
 // Missing chunks (chunk_map entry not present at idx) are treated as
-// EOF — when a write extends a file we record chunk entries as we go, so
-// a gap means the file ends there.
+// EOF — when a write extends a file we record chunk entries as we go,
+// so a gap means the file ends there.
+//
+// There is NO unconditional pending.Wait up here, even when a writer
+// recently dispatched chunks for this ino. The barrier still exists,
+// but we only fall back to it when both chunk_map AND the on-disk
+// staging dir come up empty. Reads of freshly-written files (whose
+// plaintext wires are already on disk under cache/pending/) skip the
+// network round-trip entirely.
 func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) (int, error) {
 	if len(dest) == 0 {
 		return 0, nil
 	}
-	// Per-inode chunk size: each file picks its tier at first
-	// dispatch; the value is stored on the inode row. Look it up
-	// once per ReadAt and use that for idx math (instead of the
-	// reader's FS-default chunkSize). One extra GetInode per
-	// ReadAt — comparable to the per-chunk GetChunk cost already
-	// in the loop below.
-	//
-	// Note: there is NO unconditional pending.Wait up here, even
-	// when a writer recently dispatched chunks for this ino. The
-	// barrier still exists, but we only fall back to it when both
-	// chunk_map AND the on-disk staging dir come up empty. That way
-	// reads of freshly-written files (whose plaintext wires are
-	// already on disk under cache/pending/) skip the network round-
-	// trip entirely — they're served from the staging dir at memory
-	// speed. The barrier matters for the corner case where the
-	// packer's flush has DELETED the staged wire but PutChunk
-	// hasn't committed the row yet (a very brief window inside
-	// flush()); ReadFromStaging-or-wait sequencing handles that
-	// without paying the barrier cost on the common path.
 	in, err := r.meta.GetInode(ctx, ino)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
@@ -140,8 +193,108 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 	if chunkSize <= 0 {
 		chunkSize = r.chunkSize
 	}
+	return r.readAt(ctx, ino, dest, off, chunkSize, in.Size, r.prefetchWindow)
+}
+
+// ReadAtKnown is the fast-path entry point used when the caller (a
+// file handle) already knows the inode's chunkSize + size. Skips the
+// per-call GetInode SQL row. The caller is responsible for the
+// freshness of size — a handle that has been written through should
+// fall back to ReadAt instead.
+//
+// Negative or zero chunkSize falls through to ReadAt; a hinted size
+// of 0 is treated as "unknown / unbounded" (the chunk_map miss path
+// will surface a genuine missing chunk as data lost, which is the
+// correct behavior — readers past true EOF wouldn't ask via this
+// path anyway because the kernel knows the file size from Getattr).
+func (r *Reader) ReadAtKnown(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64) (int, error) {
+	if chunkSize <= 0 {
+		return r.ReadAt(ctx, ino, dest, off)
+	}
+	return r.readAt(ctx, ino, dest, off, chunkSize, size, r.prefetchWindow)
+}
+
+// ReadAtKnownNoPrefetch is ReadAtKnown but skips background
+// prefetch scheduling AND cancels any in-flight prefetches that
+// were targeting this inode from a previous read. Used by the
+// file-handle's seek detection: after a non-sequential jump, the
+// previously-queued prefetches are downloading data the player
+// no longer needs, and competing with the new foreground chunk
+// for bandwidth. The next sequential read picks prefetch back up.
+func (r *Reader) ReadAtKnownNoPrefetch(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64) (int, error) {
+	r.cancelPrefetchesForIno(ino)
+	if chunkSize <= 0 {
+		// Fall back to the GetInode path but still pass window=0.
+		in, err := r.meta.GetInode(ctx, ino)
+		if err != nil {
+			if errors.Is(err, meta.ErrNotFound) {
+				return 0, nil
+			}
+			return 0, fmt.Errorf("read get inode %d: %w", ino, err)
+		}
+		cs := in.ChunkSize
+		if cs <= 0 {
+			cs = r.chunkSize
+		}
+		return r.readAt(ctx, ino, dest, off, cs, in.Size, 0)
+	}
+	return r.readAt(ctx, ino, dest, off, chunkSize, size, 0)
+}
+
+// cancelPrefetchesForIno cancels the prefetchGroup associated with
+// ino, if any. The cancelled goroutines drop their reservation and
+// exit; new prefetches scheduled by subsequent reads install a fresh
+// group. Safe to call concurrently; idempotent for an unknown ino.
+func (r *Reader) cancelPrefetchesForIno(ino int64) {
+	if g, ok := r.prefetchGroups.LoadAndDelete(ino); ok {
+		if pg, ok := g.(*prefetchGroup); ok && pg.cancel != nil {
+			pg.cancel()
+		}
+	}
+}
+
+// prefetchCtxFor returns the cancellable context for prefetches on
+// ino. Creates a fresh group on first call (or after cancellation).
+// All prefetches scheduled within the same read share one context;
+// a seek calls cancelPrefetchesForIno to drop them as a unit.
+func (r *Reader) prefetchCtxFor(ino int64) context.Context {
+	if g, ok := r.prefetchGroups.Load(ino); ok {
+		if pg, ok := g.(*prefetchGroup); ok {
+			return pg.ctx
+		}
+	}
+	pg := &prefetchGroup{}
+	pg.ctx, pg.cancel = context.WithCancel(context.Background())
+	if actual, loaded := r.prefetchGroups.LoadOrStore(ino, pg); loaded {
+		// Lost the race; cancel the throwaway and use the winner.
+		pg.cancel()
+		if existing, ok := actual.(*prefetchGroup); ok {
+			return existing.ctx
+		}
+	}
+	return pg.ctx
+}
+
+func (r *Reader) readAt(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, inSize int64, prefetchWindow int) (int, error) {
+	if len(dest) == 0 {
+		return 0, nil
+	}
 	startIdx := int32(off / chunkSize)
 	endIdx := int32((off + int64(len(dest)) - 1) / chunkSize)
+
+	// Bulk metadata fetch: one SELECT for the foreground range +
+	// prefetch window instead of one per chunk. The Reader's hot
+	// loop now consults a map; misses (chunks not in chunk_map)
+	// fall through to the staging fallback / barrier path inside
+	// fetchOne, exactly as before. Stale rows on a concurrent
+	// delete surface as a cache.Get error downstream — same outcome
+	// as today's per-call GetChunk.
+	rangeCount := int(endIdx-startIdx) + 1 + prefetchWindow
+	chunkBatch, _ := r.meta.GetChunksRange(ctx, ino, startIdx, rangeCount)
+	chunkMap := make(map[int32]meta.Chunk, len(chunkBatch))
+	for _, c := range chunkBatch {
+		chunkMap[c.Idx] = c
+	}
 
 	written := 0
 	cur := off
@@ -151,9 +304,11 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 		// Kick off read-ahead BEFORE we block on the current chunk —
 		// the network round-trip for chunks idx+1..idx+W can overlap
 		// with this chunk's fetch.
-		r.scheduleAhead(ino, idx+1, PrefetchWindow)
+		if prefetchWindow > 0 {
+			r.scheduleAheadFromBatch(ino, idx+1, prefetchWindow, chunkMap)
+		}
 
-		data, err := r.fetchOne(ctx, ino, idx, chunkSize, in.Size)
+		data, err := r.fetchOne(ctx, ino, idx, chunkSize, inSize, chunkMap)
 		if err != nil {
 			return written, err
 		}
@@ -207,9 +362,18 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 // site you have "fetch this chunk or terminate" semantics, and the
 // three-tier dance lives in one named function with a single happy
 // path.
-func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, inSize int64) ([]byte, error) {
+func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, inSize int64, batch map[int32]meta.Chunk) ([]byte, error) {
 	chunkStart := int64(idx) * chunkSize
 
+	// Tier 1: chunk_map. Prefer the pre-fetched batch (one SELECT
+	// for the whole ReadAt) — only fall through to a per-idx
+	// GetChunk if the batch didn't include this idx (which can
+	// happen when the foreground range was much larger than the
+	// initial pre-fetch, or when the row was committed by the
+	// packer between the batch fetch and now).
+	if c, ok := batch[idx]; ok {
+		return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
+	}
 	c, err := r.meta.GetChunk(ctx, ino, idx)
 	if err == nil {
 		return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
@@ -277,15 +441,23 @@ func (r *Reader) tryPendingFallback(ino int64, idx int32) ([]byte, bool, error) 
 	if r.pendingDir == "" {
 		return nil, false, nil
 	}
-	pattern := filepath.Join(r.pendingDir, fmt.Sprintf("%d-%d-*.bin", ino, idx))
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return nil, false, fmt.Errorf("pending glob %s: %w", pattern, err)
+	// Fast path: the in-process index knows the path. One map
+	// lookup + one ReadFile instead of a directory scan.
+	var path string
+	if p, ok := r.pendingIndex.Lookup(ino, idx); ok {
+		path = p
+	} else {
+		pattern := filepath.Join(r.pendingDir, fmt.Sprintf("%d-%d-*.bin", ino, idx))
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, false, fmt.Errorf("pending glob %s: %w", pattern, err)
+		}
+		if len(matches) == 0 {
+			return nil, false, nil
+		}
+		path = matches[0]
 	}
-	if len(matches) == 0 {
-		return nil, false, nil
-	}
-	wire, err := os.ReadFile(matches[0])
+	wire, err := os.ReadFile(path)
 	if err != nil {
 		// File could have been deleted by the packer between Glob
 		// and ReadFile (race with a completing flush). Treat as
@@ -295,7 +467,7 @@ func (r *Reader) tryPendingFallback(ino int64, idx int32) ([]byte, bool, error) 
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, false, nil
 		}
-		return nil, false, fmt.Errorf("read pending %s: %w", matches[0], err)
+		return nil, false, fmt.Errorf("read pending %s: %w", path, err)
 	}
 	// Reverse the writer pipeline: decrypt → decompress.
 	plaintext := wire
@@ -316,43 +488,54 @@ func (r *Reader) tryPendingFallback(ino int64, idx int32) ([]byte, bool, error) 
 	return plaintext, true, nil
 }
 
-// scheduleAhead fires off background prefetches for chunks
-// [startIdx, startIdx+count). Skips chunks that are already cached or
-// already being fetched. Uses Background ctx so the prefetch survives
-// the originating ReadAt's return — the next ReadAt for that idx will
-// see a warm cache.
-func (r *Reader) scheduleAhead(ino int64, startIdx int32, count int) {
+// scheduleAheadFromBatch fires off background prefetches for chunks
+// [startIdx, startIdx+count). Skips chunks already cached or in
+// flight, and skips chunks NOT present in the batch (those are past
+// EOF or not yet committed — fetching them would just hit
+// ErrNotFound). All prefetches scheduled in the same window share a
+// per-inode cancellable context so a subsequent seek-read can
+// cancel them as a group via cancelPrefetchesForIno.
+func (r *Reader) scheduleAheadFromBatch(ino int64, startIdx int32, count int, batch map[int32]meta.Chunk) {
+	pctx := r.prefetchCtxFor(ino)
 	for offset := 0; offset < count; offset++ {
 		idx := startIdx + int32(offset)
 		key := Key{Ino: ino, Idx: idx}
 		if r.cache.Has(key) {
 			continue
 		}
-		// Dedup: a previous ReadAt may already have a prefetch in flight
-		// for this key.
+		c, ok := batch[idx]
+		if !ok {
+			continue
+		}
 		if _, loaded := r.inflight.LoadOrStore(key, struct{}{}); loaded {
 			continue
 		}
-		go r.prefetchOne(ino, idx, key)
+		go r.prefetchOne(pctx, ino, key, c)
 	}
 }
 
 // prefetchOne acquires a sem slot then warms the cache for a single
-// chunk. Errors are silent — prefetch is best-effort; the caller's own
-// ReadAt will surface a real error when it asks for the chunk later.
-func (r *Reader) prefetchOne(ino int64, idx int32, key Key) {
+// chunk. Takes a pre-resolved Chunk (from the batch) so no SQL round
+// trip is needed inside the prefetcher. Errors are silent — prefetch
+// is best-effort; the caller's own ReadAt will surface a real error
+// when it asks for the chunk later. The pctx is the per-inode
+// prefetch context; a seek cancels it and this goroutine exits as
+// soon as cache.Get notices.
+func (r *Reader) prefetchOne(pctx context.Context, ino int64, key Key, c meta.Chunk) {
 	defer r.inflight.Delete(key)
+	// Bail before consuming a sem slot if we were already cancelled.
+	select {
+	case <-pctx.Done():
+		return
+	default:
+	}
 	// Bounded concurrency. If the queue is full, this prefetch waits;
 	// that's the backpressure we want — sequential reads will catch up.
-	ctx := context.Background()
-	r.prefetchSem <- struct{}{}
-	defer func() { <-r.prefetchSem }()
-
-	c, err := r.meta.GetChunk(ctx, ino, idx)
-	if err != nil {
-		// Past EOF or missing — nothing to warm.
+	select {
+	case r.prefetchSem <- struct{}{}:
+	case <-pctx.Done():
 		return
 	}
-	// cache.Get does the fetch + decrypt + disk persist on miss.
-	_, _ = r.cache.Get(ctx, key, c.TGMessageID, c.PackOffset, c.PackSize)
+	defer func() { <-r.prefetchSem }()
+	_, _ = r.cache.Get(pctx, key, c.TGMessageID, c.PackOffset, c.PackSize)
 }

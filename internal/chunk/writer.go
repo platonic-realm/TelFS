@@ -826,6 +826,7 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 				return
 			}
 			pendingPath = p
+			w.pool.PendingIndex.RecordPersist(w.ino, idx, p)
 		}
 		// Release the upload SEM slot before waiting on the packer's
 		// result chan — the packer runs its own serialized flusher,

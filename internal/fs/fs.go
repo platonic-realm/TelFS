@@ -278,6 +278,21 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 		}
 	}
 	h := &fileHandle{node: n, writer: w}
+	h.lastReadEnd.Store(-1) // sentinel: first Read counts as sequential
+	// Populate the Read fast-path cache: one GetInode at Open time
+	// to capture chunkSize + size. While the handle stays clean (no
+	// writes), every Read skips its own GetInode SQL row and uses
+	// these values. The first Write trips dirty=true on the handle,
+	// which forces subsequent Reads back to ReadAt (which re-fetches
+	// the inode) — covers the case where a write extended the file
+	// past the cached size.
+	if in, err := n.backend.Meta.GetInode(ctx, n.ino); err == nil {
+		h.chunkSize = in.ChunkSize
+		if h.chunkSize <= 0 {
+			h.chunkSize = n.backend.chunkSize()
+		}
+		h.size = in.Size
+	}
 	// FOPEN_KEEP_CACHE keeps the kernel's page cache valid across opens,
 	// which is correct because we invalidate the read cache on writes.
 	return h, fuse.FOPEN_KEEP_CACHE, 0
@@ -333,6 +348,7 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 		return nil, nil, 0, syscall.EIO
 	}
 	h := &fileHandle{node: childInode.Operations().(*Node), writer: w}
+	h.lastReadEnd.Store(-1)
 	fillAttr(&out.Attr, child)
 	return childInode, h, fuse.FOPEN_KEEP_CACHE, 0
 }

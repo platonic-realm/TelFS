@@ -78,6 +78,12 @@ type Packer struct {
 	target    int64
 	window    time.Duration
 
+	// pendingIndex mirrors the on-disk pending dir for O(1) reader
+	// fallback lookups. Set via SetPendingIndex from the daemon's
+	// main loop after constructing the index. nil disables — the
+	// disk scan still works, just slower.
+	pendingIndex *PendingIndex
+
 	mu       sync.Mutex
 	pending  []packReq
 	bufBytes int64
@@ -161,6 +167,13 @@ func (p *Packer) QueueDepth() (chunks int, bytes int64) {
 // user can compare packer_pending_bytes against the trigger.
 func (p *Packer) Target() int64 { return p.target }
 
+// SetPendingIndex wires the in-process pending index so the packer
+// can keep it in sync with the on-disk source of truth as it
+// DeletePendings (on flush success and on FK-violation drop).
+func (p *Packer) SetPendingIndex(idx *PendingIndex) {
+	p.pendingIndex = idx
+}
+
 // DropInode discards every pending wire for ino that hasn't reached
 // the flush batch yet. Called when ino is unlinked so we don't waste
 // upload bandwidth on a chunk whose inode no longer exists — the
@@ -193,6 +206,7 @@ func (p *Packer) DropInode(ino int64) int {
 		if r.pendingPath != "" {
 			_ = DeletePending(r.pendingPath)
 		}
+		p.pendingIndex.UnrecordPersist(r.ino, r.idx)
 		close(r.result)
 	}
 	return len(dropped)
@@ -421,6 +435,7 @@ func (p *Packer) flush() {
 				if r.pendingPath != "" {
 					_ = DeletePending(r.pendingPath)
 				}
+				p.pendingIndex.UnrecordPersist(r.ino, r.idx)
 				fmt.Fprintf(os.Stderr, "[packer] dropped orphan chunk ino=%d/%d (inode gone, msg %d kept for GC)\n", r.ino, r.idx, msgID)
 				close(r.result)
 				continue
@@ -435,6 +450,7 @@ func (p *Packer) flush() {
 		if r.pendingPath != "" {
 			_ = DeletePending(r.pendingPath)
 		}
+		p.pendingIndex.UnrecordPersist(r.ino, r.idx)
 		r.result <- packResult{msgID: int64(msgID), packOff: offsets[i]}
 		close(r.result)
 	}

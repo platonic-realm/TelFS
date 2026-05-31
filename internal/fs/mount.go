@@ -5,6 +5,8 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"telfs/internal/chunk"
 )
 
 // MountOptions configures a TelFS mount.
@@ -42,6 +44,23 @@ func Mount(opts MountOptions, b *Backend) (*serverHandle, error) {
 	// Our Setattr already accepts mtime updates, which is the one mode
 	// change writeback_cache introduces on the upcall side.
 	fuseOpts.MountOptions.ExtraCapabilities = fuse.CAP_WRITEBACK_CACHE
+	// MaxReadAhead controls how much the kernel reads ahead on top of
+	// the actual read() syscall. The default (128 KiB on Linux) is
+	// tuned for local-filesystem workloads where readahead is cheap;
+	// for TelFS each kernel-side read becomes a FUSE round trip into
+	// Node.Read → Reader.ReadAt, where we coalesce against chunk
+	// boundaries. Setting MaxReadAhead to one chunk lets the kernel
+	// issue whole-chunk reads, which collapses 32 round trips (the
+	// 128 KiB-per-call default vs the 4 MiB chunk) into one. The
+	// chunk pipeline's prefetcher then does its work AHEAD of the
+	// next chunk instead of mid-chunk.
+	fuseOpts.MountOptions.MaxReadAhead = int(chunk.ChunkSize)
+	// MaxBackground caps how many concurrent FUSE requests the kernel
+	// dispatches before queuing further ones. The default (12) is
+	// tight enough that a multi-threaded reader can stall behind
+	// background prefetches; raising it lets the prefetcher and
+	// foreground reads coexist freely.
+	fuseOpts.MountOptions.MaxBackground = 64
 
 	srv, err := gofuse.Mount(opts.MountPoint, root, fuseOpts)
 	if err != nil {

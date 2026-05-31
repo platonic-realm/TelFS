@@ -429,6 +429,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	noRecover := fs.Bool("no-recover", false, "skip cold-mount recovery from channel snapshot (starts with an empty DB if local DB is missing)")
 	metricsAddr := fs.String("metrics-addr", "", "bind a Prometheus /metrics endpoint at this addr (default: off). Example: 127.0.0.1:9090")
 	cacheCap := fs.String("cache-cap", "", "override the LRU disk-cache size cap (e.g. 8GiB, 512MiB, 2GB). Flag wins over config; empty falls through to config.toml's cache_cap; that falls through to 1 GiB.")
+	prefetchWindow := fs.Int("prefetch-window", 0, "how many chunks past the current read cursor to speculatively warm (0 = default 8). Bigger = more parallel reads in flight for sequential streams; smaller = less wasted bandwidth on random reads.")
+	prefetchConcurrency := fs.Int("prefetch-concurrency", 0, "max prefetchOne goroutines (0 = default 4). Each one can issue 4 concurrent upload.getFile RPCs through the parallel ranged fetcher.")
+	memCacheCap := fs.String("mem-cache-cap", "", "in-RAM hot-tier cache size (e.g. 128MiB, 1GiB, 0 to disable). Empty falls through to 128 MiB. Reads hit the mem tier first, skipping os.ReadFile on hot chunks.")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] [--cache-cap SIZE] <mountpoint>")
 		fs.PrintDefaults()
@@ -609,6 +612,23 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		// In-RAM hot tier. Default 128 MiB; "0" disables entirely.
+		// Errors on the flag parse abort the mount — operator typo
+		// shouldn't silently degrade to the default.
+		memCap := chunk.DefaultMemCacheCapBytes
+		if *memCacheCap != "" {
+			n, perr := config.ParseHumanBytes(*memCacheCap)
+			if perr != nil {
+				return fmt.Errorf("--mem-cache-cap: %w", perr)
+			}
+			memCap = n
+		}
+		if memCap > 0 {
+			cache.SetMemCache(chunk.NewMemCache(memCap))
+			fmt.Fprintf(os.Stderr, "mem cache: %s (%d bytes)\n", humanBytes(memCap), memCap)
+		} else {
+			fmt.Fprintln(os.Stderr, "mem cache: disabled")
+		}
 		// Backend-global upload pool: one concurrency cap and one
 		// long-lived ctx shared across every file handle on the
 		// mount. With async close, individual Writers no longer own
@@ -628,28 +648,48 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}
 		chunk.CleanupPendingTmp(pendingDir)
 		pool.PendingDir = pendingDir
+		// In-process pending index: accelerates Reader.tryPendingFallback
+		// by skipping the O(N) Glob over the pending dir on every miss.
+		// Writer populates it after PersistPending; packer drops entries
+		// after DeletePending. Reader consults it before falling back
+		// to a disk scan, so a stale entry just falls through harmlessly.
+		pendingIndex := chunk.NewPendingIndex()
+		pool.PendingIndex = pendingIndex
 		reader := chunk.NewReader(metaStore, cache, pool.Pending, chunkSize)
 		// Wire the staging-dir fallback so reads of freshly-written
 		// chunks succeed even when chunk_map hasn't seen its row yet
 		// (the wire is on disk, encoded the same way the Writer's
 		// dispatch encoded it — same cipher, same codec).
 		reader.SetPendingFallback(pendingDir, cipher, codec)
+		reader.SetPendingIndex(pendingIndex)
+		// Prefetch knobs: CLI flag wins (forced override), otherwise
+		// the defaults from chunk.DefaultPrefetch* take effect inside
+		// NewReader. Reader.SetPrefetch leaves a zero/negative value
+		// untouched so passing one direction doesn't accidentally
+		// reset the other to the default.
+		if *prefetchWindow > 0 || *prefetchConcurrency > 0 {
+			reader.SetPrefetch(*prefetchWindow, *prefetchConcurrency)
+		}
 		// Small-file packer: aggregates chunks smaller than
 		// chunk.DefaultPackThreshold into shared TG blobs to amortize
 		// the per-message RTT. Nil-safe — Writer falls back to
 		// direct upload when no packer is wired.
 		packer := chunk.NewPacker(metaStore, sess, 0, 0, 0)
+		packer.SetPendingIndex(pendingIndex)
 		// Cancel pending wires on unlink. When a file is deleted while
 		// some of its chunks are still buffered in the packer (tar
 		// overwriting an extracted tree, rm -rf during an upload, etc.),
 		// uploading those chunks would just produce orphan TG messages
 		// that the packer's PutChunk then FK-rejects. DropInode pulls
 		// them from the queue before the upload happens — saving the
-		// bandwidth AND removing the log spam.
+		// bandwidth AND removing the log spam. Also clears any leftover
+		// index entries for the inode (DropByIno) since the packer
+		// can't reach the index from inside DropInode without help.
 		metaStore.SetInodeDeletedCallback(func(ino int64) {
 			if n := packer.DropInode(ino); n > 0 {
 				fmt.Fprintf(os.Stderr, "[packer] dropped %d pending wire(s) for unlinked ino=%d\n", n, ino)
 			}
+			pendingIndex.DropByIno(ino)
 		})
 
 		backend := &telfsfs.Backend{
@@ -820,7 +860,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// delay the "Mounted at" line. Errors are logged but not
 		// fatal — they don't break the mount, just leave staged
 		// wires for the next attempt.
-		go recoverPending(signalCtx, pendingDir, packer, metaStore)
+		go recoverPending(signalCtx, pendingDir, packer, metaStore, pendingIndex)
 
 		// Stall watchdog: if there's chunk work pending but no
 		// upload completion has registered in metrics for a while,
@@ -1152,7 +1192,7 @@ func checkFusermount() {
 // Runs in a goroutine so it doesn't delay the "Mounted at" message.
 // Errors from individual entries are logged but don't abort the
 // recovery — leftover entries will be retried on the next startup.
-func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstore *meta.Store) {
+func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstore *meta.Store, pendingIndex *chunk.PendingIndex) {
 	entries, err := chunk.ScanPending(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pending: scan:", err)
@@ -1196,6 +1236,10 @@ func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstor
 		if ctx.Err() != nil {
 			return
 		}
+		// Populate the index so Reader fallbacks during the recovery
+		// window go through the O(1) lookup instead of a Glob scan.
+		// The packer will UnrecordPersist on each successful PutChunk.
+		pendingIndex.RecordPersist(e.Ino, e.Idx, e.Path)
 		wire, err := os.ReadFile(e.Path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "pending: read %s: %v\n", e.Path, err)

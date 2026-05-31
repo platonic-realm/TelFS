@@ -4,7 +4,99 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
+
+// PendingIndex is an in-process map (Ino, Idx) → on-disk path for
+// pending wires. The Reader consults it on chunk_map miss to find
+// the staged wire in O(1), replacing a filepath.Glob over the entire
+// pending dir (which scales with queue depth and was measurable on
+// kernel-untar workloads).
+//
+// The index is a CACHE in front of the disk source of truth: the
+// disk is authoritative, the index is best-effort acceleration. A
+// missing index entry MUST fall back to the disk scan — recovery
+// state or an unsynced concurrent write could leave a wire on disk
+// that the index doesn't know about. Reader.tryPendingFallback
+// preserves the Glob fallback on index miss.
+//
+// Concurrency: a single sync.RWMutex; reads dominate (every pending-
+// chunk read does one), writes are rare (one per upload).
+type PendingIndex struct {
+	mu sync.RWMutex
+	m  map[Key]string
+}
+
+// NewPendingIndex returns an empty index. Hand it to the daemon's
+// reader (Reader.SetPendingIndex) and to the writer/packer paths
+// that update it (RecordPersist, UnrecordPersist, DropByIno).
+func NewPendingIndex() *PendingIndex {
+	return &PendingIndex{m: make(map[Key]string)}
+}
+
+// RecordPersist registers a freshly-persisted wire's path. Called
+// from the writer after PersistPending succeeds.
+func (p *PendingIndex) RecordPersist(ino int64, idx int32, path string) {
+	if p == nil || path == "" {
+		return
+	}
+	p.mu.Lock()
+	p.m[Key{Ino: ino, Idx: idx}] = path
+	p.mu.Unlock()
+}
+
+// UnrecordPersist drops the index entry for (ino, idx). Called from
+// the packer after DeletePending lands (chunk_map row committed or
+// FK-violation drop).
+func (p *PendingIndex) UnrecordPersist(ino int64, idx int32) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	delete(p.m, Key{Ino: ino, Idx: idx})
+	p.mu.Unlock()
+}
+
+// Lookup returns the on-disk path for (ino, idx) if known. Reader
+// uses this in the fallback fast path before falling back to a Glob
+// of the pending dir (which costs O(N) in queue depth).
+func (p *PendingIndex) Lookup(ino int64, idx int32) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	p.mu.RLock()
+	path, ok := p.m[Key{Ino: ino, Idx: idx}]
+	p.mu.RUnlock()
+	return path, ok
+}
+
+// DropByIno removes every entry for ino. Called by Packer.DropInode
+// when an unlink discards in-flight wires; mirrors what
+// DropInode + DeletePending do on disk so the next Reader fallback
+// doesn't return a stale path that points at a just-deleted file.
+func (p *PendingIndex) DropByIno(ino int64) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	for k := range p.m {
+		if k.Ino == ino {
+			delete(p.m, k)
+		}
+	}
+	p.mu.Unlock()
+}
+
+// Len reports the current entry count. Used by /cache JSON and tests.
+func (p *PendingIndex) Len() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.RLock()
+	n := len(p.m)
+	p.mu.RUnlock()
+	return n
+}
 
 // PendingDirName is the subdirectory under the cache root where
 // wire bytes awaiting upload + chunk_map land are staged. Existence

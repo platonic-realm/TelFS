@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 
+	"golang.org/x/sync/singleflight"
+
 	"telfs/internal/compress"
 	"telfs/internal/crypto"
 	"telfs/internal/metrics"
@@ -79,6 +81,38 @@ type Cache struct {
 	entries   map[Key]*entry
 	order     *list.List // front = MRU, back = LRU
 	totalSize int64
+
+	// misses merges concurrent Get calls for the same Key onto a
+	// single miss-path execution. Without it, a FUSE Read goroutine
+	// and the Reader's prefetcher can race for the same chunk —
+	// each downloads + decrypts + decompresses + writes-to-disk in
+	// parallel before one of them wins the LRU insert race. The
+	// in-flight check at LRU-insert time only deduped the LRU
+	// entry; the network and CPU work was wasted.
+	misses singleflight.Group
+
+	// mem is an optional in-RAM hot tier sitting in front of disk.
+	// When set, Cache.Get checks RAM first and only falls through
+	// to os.ReadFile on miss; successful disk reads populate RAM
+	// so the next access pays one map lookup, no syscall. Nil
+	// disables the tier; disk-only behavior is preserved.
+	mem *MemCache
+}
+
+// SetMemCache installs the optional in-RAM hot tier. Pass nil to
+// disable. Idempotent; safe to call before or after concurrent
+// reads have started (the swap is a single pointer write — Go's
+// memory model makes the pointer load safe even without atomics
+// because callers that race a SetMemCache will either see the
+// old (nil/old MemCache) or new value, both of which are safe).
+func (c *Cache) SetMemCache(m *MemCache) {
+	c.mem = m
+}
+
+// MemCache returns the installed in-RAM tier, or nil if disabled.
+// Used by metrics so the /cache JSON can report size + cap.
+func (c *Cache) MemCache() *MemCache {
+	return c.mem
 }
 
 // NewCache creates (or reopens) a Cache rooted at dir. The directory is
@@ -180,28 +214,68 @@ func (c *Cache) SizeBytes() int64 {
 // packOffset==0 && packSize==0 means "unpacked" — Get uses the full
 // fetched bytes (the historical behavior).
 func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset int64, packSize int32) ([]byte, error) {
+	// Tier 0: in-RAM hot cache, if enabled. One map lookup; no
+	// syscall on hit. Skipped if no mem tier is installed.
+	if data, ok := c.mem.Get(key); ok {
+		metrics.CacheHits.Inc()
+		metrics.MemCacheHits.Inc()
+		return data, nil
+	}
 	// Hit path: bump LRU under lock; then read off disk outside lock.
 	c.mu.Lock()
 	if e, ok := c.entries[key]; ok {
 		c.order.MoveToFront(e.el)
 		c.mu.Unlock()
 		metrics.CacheHits.Inc()
-		return os.ReadFile(filepath.Join(c.dir, key.fileName()))
+		data, err := os.ReadFile(filepath.Join(c.dir, key.fileName()))
+		if err == nil {
+			// Promote into the mem tier so the next access is a map
+			// lookup, not a syscall. The mem cache evicts itself once
+			// it crosses its own cap.
+			c.mem.Put(key, data)
+		}
+		return data, err
 	}
 	c.mu.Unlock()
 	metrics.CacheMisses.Inc()
 
-	// Miss path: fetch outside the lock. Fetcher returns the bytes
-	// stored in TG (ciphertext if encryption is enabled, plaintext
-	// otherwise). Inverse of the write-side pipeline:
-	//
-	//   wire ── decrypt ──▶ compressed ── decompress ──▶ plaintext
-	//
-	// For packed chunks we prefer a RangedFetcher (one upload.getFile
-	// per ~1 MiB) so we don't download the entire shared blob just to
-	// access one extent — that scaling matters as the packer batches
-	// more chunks per message. RangedFetcher is optional; if absent,
-	// we fall back to whole-message Fetch + client-side slice.
+	// Miss path. Funnel through singleflight so two callers asking
+	// for the same key share one fetch + decrypt + decompress + disk
+	// write. singleflight keys are strings; the chunk Key has a fixed
+	// integer shape, so a short binary-ish encoding is fine.
+	sfKey := fmt.Sprintf("%d/%d", key.Ino, key.Idx)
+	v, err, shared := c.misses.Do(sfKey, func() (any, error) {
+		// Recheck the cache once we've serialized: a parallel miss may
+		// have populated it while we were queued.
+		c.mu.Lock()
+		if e, ok := c.entries[key]; ok {
+			c.order.MoveToFront(e.el)
+			c.mu.Unlock()
+			return os.ReadFile(filepath.Join(c.dir, key.fileName()))
+		}
+		c.mu.Unlock()
+		return c.fetchAndStore(ctx, key, tgMessageID, packOffset, packSize)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if shared {
+		metrics.CacheMergedMisses.Inc()
+	}
+	data, ok := v.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("cache.Get singleflight returned %T, want []byte", v)
+	}
+	return data, nil
+}
+
+// fetchAndStore is the actual miss path: download (range or whole),
+// slice if packed, decrypt, decompress, persist to disk, insert into
+// the LRU. Split out of Get so singleflight can wrap it cleanly.
+func (c *Cache) fetchAndStore(ctx context.Context, key Key, tgMessageID int64, packOffset int64, packSize int32) ([]byte, error) {
+	// Fetch. For packed chunks we prefer a RangedFetcher (one
+	// upload.getFile per ~1 MiB) so we don't download the entire
+	// shared blob just to access one extent.
 	var fetched []byte
 	if packSize > 0 {
 		if rf, ok := c.fetcher.(RangedFetcher); ok {
@@ -210,15 +284,11 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset 
 				return nil, fmt.Errorf("ranged fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
 			}
 			fetched = b
-			metrics.ChunksDownloaded.Inc()
-			metrics.BytesDownloaded.Add(int64(len(b)))
 		} else {
 			b, err := c.fetcher.Fetch(ctx, key, tgMessageID)
 			if err != nil {
 				return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
 			}
-			metrics.ChunksDownloaded.Inc()
-			metrics.BytesDownloaded.Add(int64(len(b)))
 			fetched = b
 		}
 	} else {
@@ -226,16 +296,14 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset 
 		if err != nil {
 			return nil, fmt.Errorf("fetch chunk %d/%d (msg=%d): %w", key.Ino, key.Idx, tgMessageID, err)
 		}
-		metrics.ChunksDownloaded.Inc()
-		metrics.BytesDownloaded.Add(int64(len(b)))
 		fetched = b
 	}
-	// Slice if packed: the fetched blob holds many chunks back-to-back.
-	// packSize > 0 marks this chunk as a sub-extent. packOffset == 0 is
-	// valid (start-of-blob); packSize is the load-bearing signal.
-	// When we used the ranged fetcher above, `fetched` already
-	// contains exactly the extent's bytes (offset 0 in the buffer),
-	// so we adjust the slice base accordingly.
+	metrics.ChunksDownloaded.Inc()
+	metrics.BytesDownloaded.Add(int64(len(fetched)))
+
+	// Slice if packed. When we used the ranged fetcher above,
+	// `fetched` already contains exactly the extent's bytes (offset 0
+	// in the buffer), so packBase stays 0.
 	var packBase int64
 	if packSize > 0 {
 		if _, ranged := c.fetcher.(RangedFetcher); !ranged {
@@ -269,8 +337,6 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// A concurrent miss could have inserted the same key; in that case
-	// just drop our duplicate write attempt and use what's there.
 	if existing, ok := c.entries[key]; ok {
 		c.order.MoveToFront(existing.el)
 		return data, nil
@@ -280,6 +346,9 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset 
 	c.entries[key] = e
 	c.totalSize += e.size
 	c.evictLocked()
+	// Populate the mem tier with the freshly-decoded plaintext so
+	// the immediate next read for this key is a one-lookup hit.
+	c.mem.Put(key, data)
 	return data, nil
 }
 
@@ -294,10 +363,12 @@ func (c *Cache) Has(key Key) bool {
 	return ok
 }
 
-// Invalidate removes a chunk from the cache (both in-memory and on
-// disk). Used after a chunk overwrite so subsequent reads don't return
-// stale data. Returns true if the chunk was actually in the cache.
+// Invalidate removes a chunk from the cache (RAM tier + LRU + on
+// disk). Used after a chunk overwrite so subsequent reads don't
+// return stale data. Returns true if the chunk was actually in the
+// disk LRU.
 func (c *Cache) Invalidate(key Key) bool {
+	c.mem.Invalidate(key)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[key]

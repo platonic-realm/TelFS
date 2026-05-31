@@ -16,9 +16,19 @@ import (
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"golang.org/x/sync/errgroup"
 
 	"telfs/internal/config"
 )
+
+// DownloadRangeParallelism caps the number of concurrent
+// upload.getFile RPCs issued for a single DownloadDocumentRange
+// call. The download rate-limit lane (default unlimited) is the
+// outer budget; this just bounds how many gotd round trips one
+// chunk-read can have in flight at once. Matches the upload
+// pool's default concurrency so the two sides see symmetric
+// budgets at the gotd layer.
+const DownloadRangeParallelism = 4
 
 // ErrNotConnected is returned by Session methods called while no
 // gotd client is bound (during a reconnect window, or before the
@@ -41,7 +51,26 @@ type Session struct {
 
 	apiMu sync.RWMutex
 	api   *tg.Client
+
+	// docCache memoizes channels.getMessages → *tg.Document lookups
+	// so a chunk download doesn't pay an extra round trip just to
+	// recover the FileReference. Telegram-documented stable
+	// FileReference lifetime is ~30 min; we use 20 min for headroom.
+	// On FILE_REFERENCE_EXPIRED we invalidate the entry; the
+	// existing single-retry path in DownloadDocument{,Range} refetches.
+	docCache sync.Map // map[int64]*docCacheEntry, keyed by msgID
 }
+
+type docCacheEntry struct {
+	doc       *tg.Document
+	fetchedAt time.Time
+}
+
+// docCacheTTL is how long a cached *tg.Document (and its
+// FileReference) stays usable. Conservative under TG's ~30-min
+// guarantee — if a download fails with FILE_REFERENCE_EXPIRED
+// despite this, the entry gets invalidated and refreshed.
+const docCacheTTL = 20 * time.Minute
 
 // Tracker returns the request log this session writes to (shared
 // with the parent Client). Used by the web /telegram handler.
@@ -384,8 +413,11 @@ func (s *Session) DownloadDocument(ctx context.Context, msgID int, w io.Writer) 
 	if !tgerr.Is(err, "FILE_REFERENCE_EXPIRED") {
 		return n, err
 	}
-	// Refresh the file_reference and retry once.
-	doc, err = s.fetchDocument(ctx, msgID)
+	// Cached FileReference is stale — drop it so we don't keep
+	// returning the same expired token from docCache, then refresh
+	// from the wire and retry once.
+	s.invalidateDocument(msgID)
+	doc, err = s.refreshDocument(ctx, msgID)
 	if err != nil {
 		return 0, fmt.Errorf("refresh file_reference: %w", err)
 	}
@@ -432,11 +464,50 @@ func (s *Session) DownloadDocumentRange(ctx context.Context, msgID int, w io.Wri
 	if !tgerr.Is(err, "FILE_REFERENCE_EXPIRED") {
 		return n, err
 	}
-	doc, err = s.fetchDocument(ctx, msgID)
+	s.invalidateDocument(msgID)
+	doc, err = s.refreshDocument(ctx, msgID)
 	if err != nil {
 		return 0, fmt.Errorf("refresh file_reference: %w", err)
 	}
 	return s.streamDocumentRange(ctx, doc, w, offset, length)
+}
+
+// rangePart is one upload.getFile request: a 4 KiB-aligned
+// [offset, offset+limit) sub-range that never crosses a 1 MiB
+// boundary. Pre-computed up front so the parallel workers can chew
+// through the list without coordinating on cursor math.
+type rangePart struct {
+	offset int64
+	limit  int64
+}
+
+// planRangeParts splits the aligned range [alignedStart, alignedEnd)
+// into 1 MiB-bounded chunks. Each chunk is at most rangePartSize and
+// never spans a 1 MiB boundary (Telegram returns LIMIT_INVALID for
+// such requests). Returned in offset order; an empty range produces
+// an empty slice.
+func planRangeParts(alignedStart, alignedEnd int64) []rangePart {
+	if alignedEnd <= alignedStart {
+		return nil
+	}
+	// Worst-case cap = aligned span / (smallest possible request),
+	// which can't go below 4 KiB; in practice it's close to
+	// (span / 1 MiB) + 1. Slightly over-allocate to skip a regrowth.
+	parts := make([]rangePart, 0, (alignedEnd-alignedStart)/rangePartSize+2)
+	cur := alignedStart
+	for cur < alignedEnd {
+		limit := int64(rangePartSize)
+		if cur+limit > alignedEnd {
+			limit = alignedEnd - cur
+		}
+		mibBoundary := ((cur / (1 << 20)) + 1) * (1 << 20)
+		if cur+limit > mibBoundary {
+			limit = mibBoundary - cur
+		}
+		parts = append(parts, rangePart{offset: cur, limit: limit})
+		cur += limit
+	}
+	return parts
 }
 
 func (s *Session) streamDocumentRange(ctx context.Context, doc *tg.Document, w io.Writer, offset, length int64) (int64, error) {
@@ -456,77 +527,101 @@ func (s *Session) streamDocumentRange(ctx context.Context, doc *tg.Document, w i
 	end := offset + length
 	alignedEnd := ((end + rangeAlignment - 1) / rangeAlignment) * rangeAlignment
 	startOffsetInResult := offset - alignedStart
-	wanted := length
 
-	var written int64
-	cur := alignedStart
-	for cur < alignedEnd {
-		limit := int64(rangePartSize)
-		if cur+limit > alignedEnd {
-			limit = alignedEnd - cur
-		}
-		// Telegram rejects a single upload.getFile that crosses a
-		// 1 MiB boundary with rpc error 400 LIMIT_INVALID — even when
-		// the request is otherwise 4 KiB-aligned and under 1 MiB long.
-		// Pack-route extents start at arbitrary offsets inside the
-		// packed blob, so a 1 MiB request from a mid-blob offset almost
-		// always straddles one of these boundaries. Clamp every
-		// request to the next 1 MiB boundary so the loop just makes
-		// one extra round when an extent spans the line, instead of
-		// blowing up the entire read.
-		mibBoundary := ((cur / (1 << 20)) + 1) * (1 << 20)
-		if cur+limit > mibBoundary {
-			limit = mibBoundary - cur
-		}
-		req := &tg.UploadGetFileRequest{
-			Precise:  true,
-			Location: loc,
-			Offset:   cur,
-			Limit:    int(limit),
-		}
-		res, err := api.UploadGetFile(ctx, req)
+	parts := planRangeParts(alignedStart, alignedEnd)
+	if len(parts) == 0 {
+		return 0, nil
+	}
+	// Fan out: up to DownloadRangeParallelism workers fetch parts
+	// concurrently into a slice indexed by part position. The
+	// in-order writer below stitches them together. The single-part
+	// case (a small slice that fits in one MiB block) short-circuits
+	// to the serial fast path so we don't pay errgroup overhead for
+	// a one-RPC read.
+	results := make([][]byte, len(parts))
+	if len(parts) == 1 {
+		b, err := fetchRangePart(ctx, api, loc, parts[0])
 		if err != nil {
-			return written, err
+			return 0, err
 		}
-		f, ok := res.(*tg.UploadFile)
-		if !ok {
-			return written, fmt.Errorf("unexpected getFile response %T", res)
+		results[0] = b
+	} else {
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(DownloadRangeParallelism)
+		for i := range parts {
+			i := i
+			g.Go(func() error {
+				b, err := fetchRangePart(gCtx, api, loc, parts[i])
+				if err != nil {
+					return err
+				}
+				results[i] = b
+				return nil
+			})
 		}
-		// Drop the leading surplus on the first part (caller didn't
-		// want bytes [alignedStart, offset)), and the trailing surplus
-		// on the last part once we've satisfied `wanted` bytes.
-		bytes := f.Bytes
-		if cur == alignedStart && startOffsetInResult > 0 {
-			if int64(len(bytes)) <= startOffsetInResult {
-				cur += int64(len(bytes))
+		if err := g.Wait(); err != nil {
+			return 0, err
+		}
+	}
+
+	// In-order stitch + write. Apply the leading-surplus trim on
+	// the first part, the trailing-want trim across the tail, and
+	// stop early on a short response (TG's EOF signal).
+	var written int64
+	wanted := length
+	for i, partBytes := range results {
+		if i == 0 && startOffsetInResult > 0 {
+			if int64(len(partBytes)) <= startOffsetInResult {
+				// First part was entirely surplus — caller's offset
+				// landed past the end of the first response. Drop and
+				// fall through; the loop terminates when wanted hits 0
+				// or when a later part comes up short.
 				continue
 			}
-			bytes = bytes[startOffsetInResult:]
+			partBytes = partBytes[startOffsetInResult:]
 		}
-		if int64(len(bytes)) > wanted {
-			bytes = bytes[:wanted]
+		if int64(len(partBytes)) > wanted {
+			partBytes = partBytes[:wanted]
 		}
-		if len(bytes) == 0 {
+		if len(partBytes) == 0 {
 			break
 		}
-		n, err := w.Write(bytes)
+		n, werr := w.Write(partBytes)
 		written += int64(n)
 		wanted -= int64(n)
-		if err != nil {
-			return written, err
+		if werr != nil {
+			return written, werr
 		}
 		if wanted <= 0 {
 			break
 		}
-		// If Telegram returned fewer bytes than the request limit,
-		// we've hit EOF on the file; stop early instead of looping
-		// forever asking for bytes that don't exist.
-		if int64(len(f.Bytes)) < limit {
+		// Short response = EOF. No need to read subsequent parts.
+		if int64(len(results[i])) < parts[i].limit {
 			break
 		}
-		cur += limit
 	}
 	return written, nil
+}
+
+// fetchRangePart issues one upload.getFile RPC for a planned part
+// and returns its bytes. Called from N parallel workers in
+// streamDocumentRange.
+func fetchRangePart(ctx context.Context, api *tg.Client, loc *tg.InputDocumentFileLocation, p rangePart) ([]byte, error) {
+	req := &tg.UploadGetFileRequest{
+		Precise:  true,
+		Location: loc,
+		Offset:   p.offset,
+		Limit:    int(p.limit),
+	}
+	res, err := api.UploadGetFile(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	f, ok := res.(*tg.UploadFile)
+	if !ok {
+		return nil, fmt.Errorf("unexpected getFile response %T", res)
+	}
+	return f.Bytes, nil
 }
 
 // downloadThreads is the parallelism inside ONE document download.
@@ -643,7 +738,26 @@ func (s *Session) getMessage(ctx context.Context, msgID int) (*tg.Message, error
 }
 
 // fetchDocument retrieves the document attached to a channel message.
+// Honors the docCache on the Session — a previously-fetched document
+// whose FileReference hasn't yet expired comes back directly without
+// a round trip. Callers that need a guaranteed-fresh reference
+// (e.g. after FILE_REFERENCE_EXPIRED) should call refreshDocument
+// instead.
 func (s *Session) fetchDocument(ctx context.Context, msgID int) (*tg.Document, error) {
+	key := int64(msgID)
+	if v, ok := s.docCache.Load(key); ok {
+		if e, ok := v.(*docCacheEntry); ok && time.Since(e.fetchedAt) < docCacheTTL {
+			return e.doc, nil
+		}
+	}
+	return s.refreshDocument(ctx, msgID)
+}
+
+// refreshDocument unconditionally re-fetches and re-caches the
+// document. Used both by the cache-miss path inside fetchDocument
+// and by the FILE_REFERENCE_EXPIRED retry path in DownloadDocument /
+// DownloadDocumentRange.
+func (s *Session) refreshDocument(ctx context.Context, msgID int) (*tg.Document, error) {
 	msg, err := s.getMessage(ctx, msgID)
 	if err != nil {
 		return nil, err
@@ -656,7 +770,15 @@ func (s *Session) fetchDocument(ctx context.Context, msgID int) (*tg.Document, e
 	if !ok {
 		return nil, fmt.Errorf("message %d document is %T (expected *tg.Document)", msgID, media.Document)
 	}
+	s.docCache.Store(int64(msgID), &docCacheEntry{doc: doc, fetchedAt: time.Now()})
 	return doc, nil
+}
+
+// invalidateDocument drops a cached entry for msgID. Called by the
+// FILE_REFERENCE_EXPIRED handlers so the next fetchDocument call
+// goes back to the wire even if the entry hasn't aged out.
+func (s *Session) invalidateDocument(msgID int) {
+	s.docCache.Delete(int64(msgID))
 }
 
 // extractNewMessageID walks the UpdatesClass returned by SendMessage /

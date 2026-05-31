@@ -90,6 +90,47 @@ func (s *Store) ListChunks(ctx context.Context, ino int64) ([]Chunk, error) {
 	return out, rows.Err()
 }
 
+// GetChunksRange returns chunk_map entries for (ino) where idx is in
+// [fromIdx, fromIdx+count). Result is in ascending idx order; missing
+// rows are simply omitted (the caller correlates by Chunk.Idx). Used
+// by the Reader to pre-fetch metadata for a sequential read + its
+// prefetch window in one round trip, replacing N+1 GetChunk calls
+// with a single SELECT … BETWEEN.
+//
+// Negative or zero count returns an empty slice. The bound is
+// inclusive on fromIdx and exclusive on fromIdx+count, matching Go
+// slicing semantics.
+func (s *Store) GetChunksRange(ctx context.Context, ino int64, fromIdx int32, count int) ([]Chunk, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size
+		   FROM chunk_map
+		  WHERE ino = ? AND idx >= ? AND idx < ?
+		  ORDER BY idx`,
+		ino, fromIdx, int64(fromIdx)+int64(count))
+	if err != nil {
+		return nil, fmt.Errorf("get chunks range %d [%d,%d): %w", ino, fromIdx, int64(fromIdx)+int64(count), err)
+	}
+	defer rows.Close()
+	out := make([]Chunk, 0, count)
+	for rows.Next() {
+		var c Chunk
+		var packOff sql.NullInt64
+		var packSize sql.NullInt64
+		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize); err != nil {
+			return nil, err
+		}
+		if packSize.Valid {
+			c.PackOffset = packOff.Int64
+			c.PackSize = int32(packSize.Int64)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // DeleteChunk removes a single chunk_map entry. Returns ErrNotFound if
 // the entry didn't exist.
 func (s *Store) DeleteChunk(ctx context.Context, ino int64, idx int32) error {

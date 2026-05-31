@@ -133,6 +133,8 @@ var (
 	DedupHits         = Default.AddCounter("telfs_dedup_hits_total", "Plaintext-hash dedup hits avoided one upload.")
 	CacheHits         = Default.AddCounter("telfs_cache_hits_total", "Local LRU cache hits.")
 	CacheMisses       = Default.AddCounter("telfs_cache_misses_total", "Local LRU cache misses (forced a fetch).")
+	CacheMergedMisses = Default.AddCounter("telfs_cache_merged_misses_total", "Cache misses that piggy-backed on an already-in-flight fetch for the same chunk (singleflight wins).")
+	MemCacheHits      = Default.AddCounter("telfs_memcache_hits_total", "In-RAM hot-tier cache hits — served without an os.ReadFile.")
 	FloodWaits        = Default.AddCounter("telfs_flood_waits_total", "FLOOD_WAIT responses observed and slept through.")
 	UploadErrors      = Default.AddCounter("telfs_upload_errors_total", "Chunk uploads that returned a non-FLOOD_WAIT error.")
 	BytesUploaded     = Default.AddCounter("telfs_bytes_uploaded_total", "Bytes (post-compression, post-encryption) sent to the channel.")

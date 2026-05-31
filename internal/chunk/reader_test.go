@@ -254,10 +254,16 @@ func TestReadAtSchedulesPrefetch(t *testing.T) {
 		done <- n
 	}()
 
-	// Wait until chunks 0..PrefetchWindow are seen by the fetcher.
-	// The exact set depends on scheduling order, but we expect at
-	// least 2 in-flight (current + first prefetch).
-	expected := PrefetchWindow + 1
+	// Wait until chunks 0..min(window,concurrency) are seen by the
+	// fetcher. The window controls how MANY chunks are scheduled
+	// ahead; the concurrency caps how many of those actually fire
+	// at once. With window > concurrency we'd see the foreground
+	// plus the concurrency cap, not the full window.
+	scheduled := PrefetchWindow
+	if PrefetchConcurrency < scheduled {
+		scheduled = PrefetchConcurrency
+	}
+	expected := scheduled + 1
 	deadline := time.After(2 * time.Second)
 	for {
 		if int(slow.inner.calls.Load()) >= expected {
