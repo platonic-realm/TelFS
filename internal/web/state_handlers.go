@@ -37,7 +37,17 @@ type stateShowData struct {
 	// Warning when a fuse.telfs mount is live (repair while writes are
 	// happening can collide). Best-effort: /proc/mounts can't attribute
 	// mounts to specific profiles.
-	MountActive bool
+	MountActive    bool
+	Supervised     []stateMountRow
+	External       []string
+}
+
+// stateMountRow is a thin view of a supervised mount for the unmount
+// shortcut on /state — just enough to render a button.
+type stateMountRow struct {
+	Profile    string
+	Mountpoint string
+	Status     string
 }
 
 func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +80,14 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	d.MountActive = len(activeMounts()) > 0
+	for _, mp := range s.sup.List() {
+		d.Supervised = append(d.Supervised, stateMountRow{
+			Profile:    mp.Profile,
+			Mountpoint: mp.Mountpoint,
+			Status:     mp.Status(),
+		})
+	}
+	d.External = s.sup.ExternalMounts()
 
 	if _, err := os.Stat(cfg.DBPath()); err != nil {
 		s.renderTemplate(w, "state/show.html", d)

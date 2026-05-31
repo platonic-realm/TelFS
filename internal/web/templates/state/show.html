@@ -12,6 +12,53 @@
   </dl>
 </section>
 
+{{if and (not .Supervised) (not .External)}}
+<section class="card">
+  <h3>Active mounts</h3>
+  <p><em>No fuse.telfs mounts on this host. <a href="/mount/new">Start one</a> to access files.</em></p>
+</section>
+{{else}}
+<section class="card">
+  <h3>Active mounts</h3>
+  <p><small>Stop a mount before running repair so the daemon doesn't race writes with us. Start it back up from the <a href="/mount/new">Mounts page</a> when repair is done.</small></p>
+  <table>
+    <thead><tr><th>Mountpoint</th><th>Origin</th><th>Status</th><th class="actions">Actions</th></tr></thead>
+    <tbody>
+      {{range .Supervised}}
+      <tr>
+        <td><code>{{.Mountpoint}}</code></td>
+        <td><a href="/mount/{{.Profile}}">supervised: {{.Profile}}</a></td>
+        <td><span class="pill ok">{{.Status}}</span></td>
+        <td class="actions">
+          <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline"
+                onsubmit="return confirm('Stop the supervised mount for {{.Profile}}?');">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <button type="submit" class="danger">Stop</button>
+          </form>
+        </td>
+      </tr>
+      {{end}}
+      {{range .External}}
+      <tr>
+        <td><code>{{.}}</code></td>
+        <td><span class="pill muted">external</span></td>
+        <td><span class="pill muted">running</span></td>
+        <td class="actions">
+          <form method="post" action="/mount/unmount-external" style="display:inline"
+                onsubmit="return confirm('Unmount {{.}}? Any process with open files there will see I/O errors.');">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="mountpoint" value="{{.}}">
+            <input type="hidden" name="return_to" value="/state">
+            <button type="submit" class="danger">Unmount</button>
+          </form>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}
+
 {{if not .HasMeta}}
 <section class="card">
   <p><em>No metadata DB yet for this profile.</em></p>
@@ -83,7 +130,7 @@
     <p><span class="pill ok">clean</span> No partial-upload artifacts to repair. The scan covers every chunk_map row; if a daemon crashes mid-upload, the next startup pass will surface it here.</p>
   {{end}}
   {{if .MountActive}}
-    <p><strong>Heads up:</strong> a <code>fuse.telfs</code> mount is currently active on this host. Repair while writes are in flight can race with the daemon's own DB writes — stop the mount from the <a href="/mount">Mounts page</a> first when possible.</p>
+    <p><strong>Heads up:</strong> a <code>fuse.telfs</code> mount is currently active. Repair while writes are in flight can race with the daemon's own DB writes — use the <strong>Unmount</strong> button above first, run the repair, then remount from the <a href="/mount/new">Mounts page</a>.</p>
   {{end}}
   <form method="post" action="/state/repair">
     <input type="hidden" name="csrf" value="{{.CSRF}}">

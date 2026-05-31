@@ -31,10 +31,26 @@
 {{if .External}}
 <section class="card">
   <h3>External <span class="pill muted">not started by web</span></h3>
-  <p><small>Mounted from a separate terminal. Not stoppable from here.</small></p>
-  <ul class="plain">
-    {{range .External}}<li><code>{{.}}</code></li>{{end}}
-  </ul>
+  <p><small>Mounted from a separate terminal. Unmount issues <code>fusermount -u</code> directly; if open files block it, falls back to a lazy detach (<code>fusermount -u -z</code>) so the mount disappears from the namespace immediately.</small></p>
+  <table>
+    <thead><tr><th>Mountpoint</th><th class="actions">Actions</th></tr></thead>
+    <tbody>
+      {{range .External}}
+      <tr>
+        <td><code>{{.}}</code></td>
+        <td class="actions">
+          <form method="post" action="/mount/unmount-external" style="display:inline"
+                onsubmit="return confirm('Unmount {{.}}? Any process with open files there will see I/O errors.');">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="mountpoint" value="{{.}}">
+            <input type="hidden" name="return_to" value="/mount">
+            <button type="submit" class="danger">Unmount</button>
+          </form>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
 </section>
 {{end}}
 

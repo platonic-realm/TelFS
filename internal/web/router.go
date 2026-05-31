@@ -74,6 +74,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /mount", s.mountList)
 	s.mux.HandleFunc("GET /mount/new", s.mountNewForm)
 	s.mux.HandleFunc("POST /mount/start", s.mountStart)
+	s.mux.HandleFunc("POST /mount/unmount-external", s.mountUnmountExternal)
 	s.mux.HandleFunc("GET /mount/{profile}", s.mountDetail)
 	s.mux.HandleFunc("POST /mount/{profile}/stop", s.mountStop)
 	s.mux.HandleFunc("GET /mount/{profile}/log", s.mountLog)

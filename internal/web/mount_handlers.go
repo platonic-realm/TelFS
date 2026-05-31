@@ -111,6 +111,32 @@ func (s *Server) mountStart(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/mount/"+profile, http.StatusSeeOther)
 }
 
+// ── POST /mount/unmount-external ──────────────────────────────────
+//
+// Targets a mount that wasn't started by this web server (no child
+// process under our supervision). Validates the mountpoint is in
+// /proc/mounts as fuse.telfs and runs `fusermount -u`, falling back
+// to `-u -z` on EBUSY. Use the per-profile /mount/{profile}/stop
+// path for supervised mounts so their child gets a clean SIGTERM.
+func (s *Server) mountUnmountExternal(w http.ResponseWriter, r *http.Request) {
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	mountpoint := strings.TrimSpace(r.FormValue("mountpoint"))
+	redirectTo := r.FormValue("return_to")
+	if redirectTo == "" {
+		redirectTo = "/mount"
+	}
+	if err := s.sup.UnmountExternal(mountpoint); err != nil {
+		SetFlash(w, "error", "unmount: "+err.Error())
+		http.Redirect(w, r, redirectTo, http.StatusSeeOther)
+		return
+	}
+	SetFlash(w, "ok", "unmounted "+mountpoint)
+	http.Redirect(w, r, redirectTo, http.StatusSeeOther)
+}
+
 // ── POST /mount/{profile}/stop ────────────────────────────────────
 
 func (s *Server) mountStop(w http.ResponseWriter, r *http.Request) {

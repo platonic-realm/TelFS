@@ -266,6 +266,51 @@ func (mp *MountProcess) TailLog(maxBytes int64) (string, error) {
 	return string(b), nil
 }
 
+// UnmountExternal unmounts a fuse.telfs mount that was started outside
+// this web server. Refuses any path not currently present in
+// /proc/mounts as fuse.telfs — defense against being aimed at an
+// unrelated mountpoint. Refuses supervised mountpoints too; those go
+// through Stop() so their child process gets a clean SIGTERM first.
+//
+// Tries the polite `fusermount -u` first; on EBUSY (open files) falls
+// back to `fusermount -u -z` (lazy detach — mount disappears from the
+// namespace immediately, lingering FDs unmap once closed).
+func (s *Supervisor) UnmountExternal(mountpoint string) error {
+	mountpoint = strings.TrimSpace(mountpoint)
+	if mountpoint == "" {
+		return errors.New("mountpoint is required")
+	}
+	// Refuse if this is one of our supervised mounts — Stop() is the
+	// right path so the child process exits cleanly first.
+	s.mu.Lock()
+	for _, p := range s.procs {
+		if p.Mountpoint == mountpoint {
+			s.mu.Unlock()
+			return fmt.Errorf("mountpoint %q is supervised; use Stop on the Mounts page instead", mountpoint)
+		}
+	}
+	s.mu.Unlock()
+	// Confirm the mountpoint is actually a fuse.telfs entry right now.
+	found := false
+	for _, m := range scanProcMounts() {
+		if m == mountpoint {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("mountpoint %q is not currently mounted as fuse.telfs", mountpoint)
+	}
+	if err := exec.Command("fusermount", "-u", mountpoint).Run(); err == nil {
+		return nil
+	}
+	// EBUSY or stuck — try the lazy form.
+	if err := exec.Command("fusermount", "-u", "-z", mountpoint).Run(); err != nil {
+		return fmt.Errorf("fusermount -u -z %s: %w", mountpoint, err)
+	}
+	return nil
+}
+
 // ExternalMounts returns fuse.telfs mountpoints in /proc/mounts that
 // are NOT supervised here. Used to flag "ran outside the web UI" mounts
 // on the dashboard without offering to stop them.
