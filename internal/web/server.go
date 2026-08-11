@@ -29,7 +29,7 @@ type Options struct {
 	Logger *log.Logger
 	// SelfPath: filesystem path to the running telfs binary. The mount
 	// supervisor re-execs it to spawn `telfs mount` children. Defaults
-	// to os.Args[0] when empty.
+	// to os.Executable() (with os.Args[0] as last resort) when empty.
 	SelfPath string
 }
 
@@ -59,7 +59,17 @@ func New(opts Options) (*Server, error) {
 	}
 	selfPath := opts.SelfPath
 	if selfPath == "" {
-		selfPath = os.Args[0]
+		// os.Executable resolves /proc/self/exe — immune to argv[0]
+		// weirdness. Resolving argv[0] by hand broke for bare names
+		// the shell found but Go's LookPath couldn't (e.g. literal
+		// `~/...` PATH entries that the shell expands and LookPath
+		// doesn't): the fallback made "telfs" absolute against the
+		// cwd and errored with "self binary not found at ~/telfs".
+		if exe, err := os.Executable(); err == nil {
+			selfPath = exe
+		} else {
+			selfPath = os.Args[0]
+		}
 	}
 	sup, err := NewSupervisor(selfPath)
 	if err != nil {
