@@ -17,11 +17,11 @@ import (
 
 type channelShowData struct {
 	pageBase
-	HasAPI   bool
-	HasAuth  bool
-	IsBot    bool
-	Bound    bool
-	Channel  channelView
+	HasAPI  bool
+	HasAuth bool
+	IsBot   bool
+	Bound   bool
+	Channel channelView
 }
 
 func (s *Server) channelShow(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +137,22 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 		SetFlash(w, "error", "bot mode: access_hash is required (bots can't auto-discover it)")
 		http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
 		return
+	}
+	// Rebind guard (mirrors `telfs channel set`): once chunk_map
+	// references messages they live in the CURRENTLY-bound channel;
+	// rebinding orphans every read and misdirects writes, snapshots
+	// and gc. The web form has no --force — use a fresh profile (or
+	// the CLI) for deliberate rebinds.
+	if cfg.Channel.ID != 0 && cfg.Channel.ID != id {
+		if mstore, merr := openMetaExisting(); merr == nil {
+			has, rerr := mstore.HasAnyChunks(r.Context())
+			mstore.Close()
+			if rerr == nil && has {
+				SetFlash(w, "error", fmt.Sprintf("this profile has data in the currently-bound channel (id=%d) — rebinding would orphan all of it. Create a new profile for a new channel, or use `telfs channel set --force` if you really mean it.", cfg.Channel.ID))
+				http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
+				return
+			}
+		}
 	}
 	client, err := tg.New(cfg)
 	if err != nil {

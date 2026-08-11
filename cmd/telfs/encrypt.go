@@ -68,13 +68,13 @@ func cmdEncryptInit(ctx context.Context, args []string) error {
 	if _, err := metaStore.GetKV(ctx, crypto.KVMode); err == nil {
 		return errors.New("encrypt init: encryption is already enabled for this filesystem")
 	}
-	refs, err := metaStore.AllChunkMessageIDs(ctx)
+	hasChunks, err := metaStore.HasAnyChunks(ctx)
 	if err != nil {
 		return err
 	}
-	if len(refs) > 0 {
-		return fmt.Errorf("encrypt init: refuses to enable encryption when chunks already exist (%d chunks in chunk_map). "+
-			"Start a fresh TelFS instance with a new channel and `cp -r` your data over to encrypt existing files.", len(refs))
+	if hasChunks {
+		return errors.New("encrypt init: refuses to enable encryption when chunks already exist in chunk_map. " +
+			"Start a fresh TelFS instance with a new channel and `cp -r` your data over to encrypt existing files.")
 	}
 	// Same guard for the dedup index: a non-empty chunk_blob from a
 	// prior plaintext lifetime points at messages we'd now be
@@ -172,13 +172,13 @@ func cipherForMode(mode string, dek []byte) (crypto.Cipher, error) {
 // cmdEncryptRotate changes the passphrase without re-encrypting any
 // chunks. Only available on v2 FSes (those initialized after v0.14):
 //
-//   1. Prompt for current passphrase, derive old KEK, unwrap DEK.
-//   2. Prompt for new passphrase (+ confirmation), derive new KEK
-//      with a fresh salt, re-wrap the same DEK.
-//   3. Persist new salt + new argon (in case defaults changed) +
-//      new wrapped DEK + new canary (encrypted under DEK — unchanged
-//      semantics, but we re-seal so it's consistent with anyone who
-//      later inspects).
+//  1. Prompt for current passphrase, derive old KEK, unwrap DEK.
+//  2. Prompt for new passphrase (+ confirmation), derive new KEK
+//     with a fresh salt, re-wrap the same DEK.
+//  3. Persist new salt + new argon (in case defaults changed) +
+//     new wrapped DEK + new canary (encrypted under DEK — unchanged
+//     semantics, but we re-seal so it's consistent with anyone who
+//     later inspects).
 //
 // Atomicity: each PutKV is its own SQL statement. If we crash mid-
 // rotation, the FS may end up with a hybrid of old-mode/new-mode

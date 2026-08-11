@@ -486,7 +486,40 @@ func (s *Server) resolveBrowsePath(at, p string) (string, string, string, error)
 	if err != nil || strings.HasPrefix(relCheck, "..") {
 		return "", "", "", errors.New("path escapes mountpoint")
 	}
+	// Symlink containment: the lexical checks above can't see a
+	// symlink STORED INSIDE the TelFS tree that points outside it
+	// (e.g. → /home/user/.ssh). http.ServeFile and os.ReadDir happily
+	// follow those, turning the browser into an arbitrary-local-file
+	// reader. Resolve symlinks and re-check containment on the real
+	// path — against the CANONICAL mountpoint, so a mountpoint that
+	// is itself reached through a symlinked prefix still validates.
+	// A path that doesn't exist yet (mkdir/newfile targets) resolves
+	// its parent instead.
+	canonAt := at
+	if c, cerr := filepath.EvalSymlinks(at); cerr == nil {
+		canonAt = c
+	}
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		if !pathWithin(canonAt, resolved) {
+			return "", "", "", errors.New("path resolves outside the mountpoint (symlink escape)")
+		}
+	} else if os.IsNotExist(rerr) {
+		parent := filepath.Dir(abs)
+		if resolvedParent, perr := filepath.EvalSymlinks(parent); perr == nil && !pathWithin(canonAt, resolvedParent) {
+			return "", "", "", errors.New("path resolves outside the mountpoint (symlink escape)")
+		}
+	}
 	return at, rel, abs, nil
+}
+
+// pathWithin reports whether target is at (or under) root after both
+// have been cleaned. root itself counts as within.
+func pathWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
 }
 
 // isKnownMount returns true if `at` is one of our supervised mountpoints

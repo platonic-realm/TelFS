@@ -177,6 +177,33 @@ func (s *Store) AllChunks(ctx context.Context) ([]Chunk, error) {
 	return out, rows.Err()
 }
 
+// HasAnyChunks reports whether chunk_map has at least one row. Use
+// this for emptiness probes instead of AllChunkMessageIDs — at TB
+// scale the latter loads millions of ids into a map just to test
+// len() > 0.
+func (s *Store) HasAnyChunks(ctx context.Context) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM chunk_map LIMIT 1`).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("has any chunks: %w", err)
+	}
+	return true, nil
+}
+
+// CountChunks returns the total chunk_map row count. One COUNT(*)
+// index walk — display-friendly without materializing ids.
+func (s *Store) CountChunks(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunk_map`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count chunks: %w", err)
+	}
+	return n, nil
+}
+
 // AllChunkMessageIDs returns the distinct set of Telegram message ids
 // currently referenced by the chunk_map. Used by `telfs gc` to identify
 // orphan chunk messages in the channel.

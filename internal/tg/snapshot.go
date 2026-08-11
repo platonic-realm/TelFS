@@ -90,13 +90,14 @@ func (s *Session) FindLatestSnapshot(ctx context.Context, fsUUID string, pageLim
 				return &LatestSnapshot{MessageID: msg.ID, Caption: cap}, nil
 			}
 		}
-		// Paginate.
-		last := msgs[len(msgs)-1]
-		lastMsg, ok := last.(*tg.Message)
+		// Paginate. lastMessageID handles service/empty messages so a
+		// pin or title change at a page boundary doesn't truncate the
+		// scan (which recovery would misread as "no snapshot").
+		next, ok := lastMessageID(msgs)
 		if !ok {
 			return nil, nil
 		}
-		offsetID = lastMsg.ID
+		offsetID = next
 	}
 	return nil, nil
 }
@@ -152,12 +153,11 @@ func (s *Session) ListSnapshots(ctx context.Context, fsUUID string, max int) ([]
 				}
 			}
 		}
-		last := msgs[len(msgs)-1]
-		lastMsg, ok := last.(*tg.Message)
+		next, ok := lastMessageID(msgs)
 		if !ok {
 			break
 		}
-		offsetID = lastMsg.ID
+		offsetID = next
 	}
 	return out, nil
 }

@@ -46,7 +46,10 @@
       <button type="submit">Make active</button>
     </form>
     {{end}}
-    <a href="/profiles/{{.Name}}/export" class="btn">Export bundle</a>
+    <form method="post" action="/profiles/{{.Name}}/export" style="display:inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit">Export bundle</button>
+    </form>
     <form method="post" action="/profiles/{{.Name}}/delete" style="display:inline" onsubmit="return confirm('Delete profile {{.Name}}? Local data only — channel data is untouched.');">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <button type="submit" class="danger">Delete</button>

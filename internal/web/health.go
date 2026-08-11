@@ -33,16 +33,18 @@ func (s *Server) healthPartial(w http.ResponseWriter, r *http.Request) {
 }
 
 func classifyHealth(state tgPageData) (kind, label, tip string) {
+	// Labels are terse panel-lamp captions; the colored dot itself is
+	// drawn by CSS (.pill::before), so no emoji here.
 	if !state.Online {
-		return "err", "🔴 offline", "Daemon /telegram endpoint unreachable. Start a mount with --metrics-addr."
+		return "err", "link down", "Daemon /telegram endpoint unreachable. Start a mount with --metrics-addr."
 	}
 	q := state.State.Queue
 	// Red conditions first — they win over yellow.
 	if state.State.LastErrorAgeSeconds > 0 && state.State.LastErrorAgeSeconds < 30 {
-		return "err", "🔴 issue", fmt.Sprintf("Last error %ds ago: %s", state.State.LastErrorAgeSeconds, state.State.LastErrorMessage)
+		return "err", "link fault", fmt.Sprintf("Last error %ds ago: %s", state.State.LastErrorAgeSeconds, state.State.LastErrorMessage)
 	}
 	if q.PendingWiresCount >= 1000 {
-		return "err", "🔴 leak", fmt.Sprintf("%d wires staged on disk — FK-violation cleanup may be lagging. Check the daemon log.", q.PendingWiresCount)
+		return "err", "backlog", fmt.Sprintf("%d wires staged on disk — FK-violation cleanup may be lagging. Check the daemon log.", q.PendingWiresCount)
 	}
 	// Yellow conditions.
 	var yellowReasons []string
@@ -56,7 +58,7 @@ func classifyHealth(state tgPageData) (kind, label, tip string) {
 		yellowReasons = append(yellowReasons, fmt.Sprintf("%d wires staged", q.PendingWiresCount))
 	}
 	if len(yellowReasons) > 0 {
-		return "warn", "🟡 busy", strings.Join(yellowReasons, " · ")
+		return "warn", "link busy", strings.Join(yellowReasons, " · ")
 	}
 	// Green — fall through.
 	parts := []string{"Daemon online"}
@@ -66,7 +68,7 @@ func classifyHealth(state tgPageData) (kind, label, tip string) {
 	if q.PendingWiresCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d wire(s) staged (draining)", q.PendingWiresCount))
 	}
-	return "ok", "🟢 healthy", strings.Join(parts, " · ")
+	return "ok", "link ok", strings.Join(parts, " · ")
 }
 
 // hasFloodWaitInLast5Min scans the Recent RPCs ring for any flood-

@@ -15,10 +15,10 @@ import (
 
 type encryptShowData struct {
 	pageBase
-	HasMeta  bool
-	Enabled  bool
-	Mode     string
-	Argon    string
+	HasMeta bool
+	Enabled bool
+	Mode    string
+	Argon   string
 }
 
 func (s *Server) encryptShow(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +60,7 @@ func (s *Server) encryptInitForm(w http.ResponseWriter, r *http.Request) {
 	if cfg, err := config.Load(); err == nil {
 		if _, err := os.Stat(cfg.DBPath()); err == nil {
 			if mstore, err := meta.Open(cfg.DBPath()); err == nil {
-				if refs, err := mstore.AllChunkMessageIDs(r.Context()); err == nil && len(refs) > 0 {
+				if has, err := mstore.HasAnyChunks(r.Context()); err == nil && has {
 					d.HasChunks = true
 				}
 				mstore.Close()
@@ -110,17 +110,31 @@ func (s *Server) encryptInitSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/encrypt/init", http.StatusSeeOther)
 		return
 	}
-	refs, err := mstore.AllChunkMessageIDs(ctx)
+	has, err := mstore.HasAnyChunks(ctx)
 	if err != nil {
 		SetFlash(w, "error", "scan chunk_map: "+err.Error())
 		http.Redirect(w, r, "/encrypt/init", http.StatusSeeOther)
 		return
 	}
-	if len(refs) > 0 {
-		SetFlash(w, "error", fmt.Sprintf("refuses to enable encryption when %d chunk(s) exist. Start a fresh TelFS with `cp -r` your data.", len(refs)))
+	if has {
+		SetFlash(w, "error", "refuses to enable encryption when chunks exist. Start a fresh TelFS with `cp -r` your data.")
 		http.Redirect(w, r, "/encrypt/init", http.StatusSeeOther)
 		return
 	}
+	// Same guard the CLI applies: a non-empty dedup index from a prior
+	// plaintext lifetime points at messages we'd now be encrypting —
+	// leaving stale rows is unsafe.
+	if n, err := mstore.CountChunkBlobs(ctx); err == nil && n > 0 {
+		SetFlash(w, "error", fmt.Sprintf("chunk_blob index has %d entries from a prior plaintext lifetime; clear local state before enabling encryption", n))
+		http.Redirect(w, r, "/encrypt/init", http.StatusSeeOther)
+		return
+	}
+	// v2 scheme, matching `telfs encrypt init`: the passphrase derives
+	// a KEK which wraps a random per-FS DEK. The DEK encrypts chunks;
+	// rotation re-wraps the DEK without re-encrypting anything. The
+	// web path used to write the legacy v1 layout (passphrase-derived
+	// key used directly — no rotation possible, ever), silently giving
+	// wizard users a worse filesystem than the CLI promised.
 	salt, err := crypto.NewSalt()
 	if err != nil {
 		SetFlash(w, "error", "salt: "+err.Error())
@@ -128,9 +142,22 @@ func (s *Server) encryptInitSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params := crypto.DefaultArgonParams()
-	key := crypto.DeriveKey([]byte(pass1), salt, params)
-	defer zeroBytes(key)
-	cipher, err := crypto.NewAESGCM(key)
+	kek := crypto.DeriveKey([]byte(pass1), salt, params)
+	defer zeroBytes(kek)
+	dek, err := crypto.NewDEK()
+	if err != nil {
+		SetFlash(w, "error", "dek: "+err.Error())
+		http.Redirect(w, r, "/encrypt/init", http.StatusSeeOther)
+		return
+	}
+	defer zeroBytes(dek)
+	wrappedDEK, err := crypto.WrapDEK(kek, dek)
+	if err != nil {
+		SetFlash(w, "error", "wrap dek: "+err.Error())
+		http.Redirect(w, r, "/encrypt/init", http.StatusSeeOther)
+		return
+	}
+	cipher, err := crypto.NewAESGCM(dek)
 	if err != nil {
 		SetFlash(w, "error", "cipher: "+err.Error())
 		http.Redirect(w, r, "/encrypt/init", http.StatusSeeOther)
@@ -152,10 +179,11 @@ func (s *Server) encryptInitSubmit(w http.ResponseWriter, r *http.Request) {
 		k string
 		v []byte
 	}{
-		{crypto.KVMode, []byte(crypto.ModeAESGCMv1)},
+		{crypto.KVMode, []byte(crypto.ModeAESGCMv2)},
 		{crypto.KVSalt, salt},
 		{crypto.KVArgon, argonJSON},
 		{crypto.KVCanary, canary},
+		{crypto.KVWrappedDEK, wrappedDEK},
 	} {
 		if err := mstore.PutKV(ctx, kv.k, kv.v); err != nil {
 			SetFlash(w, "error", "persist "+kv.k+": "+err.Error())
@@ -163,7 +191,7 @@ func (s *Server) encryptInitSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	SetFlash(w, "ok", "encryption enabled. Save your passphrase — there's no recovery for lost passphrases.")
+	SetFlash(w, "ok", "encryption enabled (aes-gcm-v2). Save your passphrase — there's no recovery for lost passphrases.")
 	http.Redirect(w, r, "/encrypt", http.StatusSeeOther)
 }
 

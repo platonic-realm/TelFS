@@ -32,7 +32,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /profiles/{name}", s.profilesShow)
 	s.mux.HandleFunc("POST /profiles/{name}/use", s.profilesUse)
 	s.mux.HandleFunc("POST /profiles/{name}/delete", s.profilesDelete)
-	s.mux.HandleFunc("GET /profiles/{name}/export", s.profilesExport)
+	// POST + CSRF, not GET: the bundle contains session.json — a live
+	// MTProto session = full Telegram account takeover. A GET could be
+	// triggered cross-origin (img/script/anchor) by any page the
+	// operator's browser visits.
+	s.mux.HandleFunc("POST /profiles/{name}/export", s.profilesExport)
 	s.mux.HandleFunc("GET /profiles/import", s.profilesImportForm)
 	s.mux.HandleFunc("POST /profiles/import", s.profilesImport)
 

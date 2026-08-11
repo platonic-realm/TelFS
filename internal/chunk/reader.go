@@ -198,25 +198,25 @@ func (r *Reader) ReadAt(ctx context.Context, ino int64, dest []byte, off int64) 
 	if chunkSize <= 0 {
 		chunkSize = r.chunkSize
 	}
-	return r.readAt(ctx, ino, dest, off, chunkSize, in.Size, r.prefetchWindow)
+	return r.readAt(ctx, ino, dest, off, chunkSize, in.Size, in.Sparse, r.prefetchWindow)
 }
 
 // ReadAtKnown is the fast-path entry point used when the caller (a
-// file handle) already knows the inode's chunkSize + size. Skips the
-// per-call GetInode SQL row. The caller is responsible for the
-// freshness of size — a handle that has been written through should
-// fall back to ReadAt instead.
+// file handle) already knows the inode's chunkSize + size + sparse
+// flag. Skips the per-call GetInode SQL row. The caller is
+// responsible for the freshness of size — a handle that has been
+// written through should fall back to ReadAt instead.
 //
 // Negative or zero chunkSize falls through to ReadAt; a hinted size
 // of 0 is treated as "unknown / unbounded" (the chunk_map miss path
 // will surface a genuine missing chunk as data lost, which is the
 // correct behavior — readers past true EOF wouldn't ask via this
 // path anyway because the kernel knows the file size from Getattr).
-func (r *Reader) ReadAtKnown(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64) (int, error) {
+func (r *Reader) ReadAtKnown(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64, sparse bool) (int, error) {
 	if chunkSize <= 0 {
 		return r.ReadAt(ctx, ino, dest, off)
 	}
-	return r.readAt(ctx, ino, dest, off, chunkSize, size, r.prefetchWindow)
+	return r.readAt(ctx, ino, dest, off, chunkSize, size, sparse, r.prefetchWindow)
 }
 
 // ReadAtKnownSeek is the seek path: a non-sequential jump just
@@ -229,7 +229,7 @@ func (r *Reader) ReadAtKnown(ctx context.Context, ino int64, dest []byte, off in
 // window (SeekPrefetchWindow) for the new burst so the forward
 // reads land in the cache instead of forcing serial fetches that
 // add up to minutes of latency on per-RPC-throttled networks.
-func (r *Reader) ReadAtKnownSeek(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64) (int, error) {
+func (r *Reader) ReadAtKnownSeek(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64, sparse bool) (int, error) {
 	r.cancelPrefetchesForIno(ino)
 	if chunkSize <= 0 {
 		in, err := r.meta.GetInode(ctx, ino)
@@ -243,9 +243,9 @@ func (r *Reader) ReadAtKnownSeek(ctx context.Context, ino int64, dest []byte, of
 		if cs <= 0 {
 			cs = r.chunkSize
 		}
-		return r.readAt(ctx, ino, dest, off, cs, in.Size, SeekPrefetchWindow)
+		return r.readAt(ctx, ino, dest, off, cs, in.Size, in.Sparse, SeekPrefetchWindow)
 	}
-	return r.readAt(ctx, ino, dest, off, chunkSize, size, SeekPrefetchWindow)
+	return r.readAt(ctx, ino, dest, off, chunkSize, size, sparse, SeekPrefetchWindow)
 }
 
 // ReadAtKnownNoPrefetch is the same as ReadAtKnown but with the
@@ -254,7 +254,7 @@ func (r *Reader) ReadAtKnownSeek(ctx context.Context, ino int64, dest []byte, of
 // metadata, debug tools); the file-handle's seek path uses
 // ReadAtKnownSeek instead, which DOES prefetch but at a larger
 // window.
-func (r *Reader) ReadAtKnownNoPrefetch(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64) (int, error) {
+func (r *Reader) ReadAtKnownNoPrefetch(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, size int64, sparse bool) (int, error) {
 	r.cancelPrefetchesForIno(ino)
 	if chunkSize <= 0 {
 		in, err := r.meta.GetInode(ctx, ino)
@@ -268,9 +268,9 @@ func (r *Reader) ReadAtKnownNoPrefetch(ctx context.Context, ino int64, dest []by
 		if cs <= 0 {
 			cs = r.chunkSize
 		}
-		return r.readAt(ctx, ino, dest, off, cs, in.Size, 0)
+		return r.readAt(ctx, ino, dest, off, cs, in.Size, in.Sparse, 0)
 	}
-	return r.readAt(ctx, ino, dest, off, chunkSize, size, 0)
+	return r.readAt(ctx, ino, dest, off, chunkSize, size, sparse, 0)
 }
 
 // cancelPrefetchesForIno cancels the prefetchGroup associated with
@@ -307,7 +307,7 @@ func (r *Reader) prefetchCtxFor(ino int64) context.Context {
 	return pg.ctx
 }
 
-func (r *Reader) readAt(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, inSize int64, prefetchWindow int) (int, error) {
+func (r *Reader) readAt(ctx context.Context, ino int64, dest []byte, off int64, chunkSize, inSize int64, sparse bool, prefetchWindow int) (int, error) {
 	if len(dest) == 0 {
 		return 0, nil
 	}
@@ -340,33 +340,68 @@ func (r *Reader) readAt(ctx context.Context, ino int64, dest []byte, off int64, 
 			r.scheduleAheadFromBatch(ino, idx+1, prefetchWindow, chunkMap)
 		}
 
-		data, err := r.fetchOne(ctx, ino, idx, chunkSize, inSize, chunkMap)
+		data, err := r.fetchOne(ctx, ino, idx, chunkSize, inSize, sparse, chunkMap)
 		if err != nil {
 			return written, err
 		}
-		if data == nil {
-			// fetchOne returns nil + nil error when the loop has
-			// walked past EOF (idx >= ceil(in.Size / chunkSize)).
-			return written, nil
-		}
 		chunkStart := int64(idx) * chunkSize
+		// logicalLen is how many bytes this chunk logically holds.
+		// Non-sparse: exactly the fetched data (data == nil ⇒ EOF).
+		// Sparse: the extent [chunkStart, min(chunkStart+chunkSize,
+		// size)) — a nil data is a hole (all zeros) and short data is
+		// zero-padded, because holes and short boundary chunks are
+		// legitimate in a sparse file.
+		var logicalLen int64
+		if sparse {
+			if chunkStart >= inSize {
+				return written, nil // true EOF
+			}
+			logicalLen = inSize - chunkStart
+			if logicalLen > chunkSize {
+				logicalLen = chunkSize
+			}
+			// data longer than the logical extent (stale row past a
+			// shrink) is clamped by the relEnd bound below and never
+			// escapes to the caller.
+		} else {
+			if data == nil {
+				// fetchOne returns nil + nil error when the loop has
+				// walked past EOF (idx >= ceil(in.Size / chunkSize)).
+				return written, nil
+			}
+			logicalLen = int64(len(data))
+		}
 		relStart := cur - chunkStart
-		// relEnd is bounded by both the requested range AND the actual
-		// chunk size (the last chunk is short).
+		// relEnd is bounded by both the requested range AND the
+		// chunk's logical length (the last chunk is short).
 		relEnd := relStart + (end - cur)
-		if relEnd > int64(len(data)) {
-			relEnd = int64(len(data))
+		if relEnd > logicalLen {
+			relEnd = logicalLen
 		}
 		if relStart >= relEnd {
 			break // nothing more to read from this chunk
 		}
-		n := copy(dest[written:], data[relStart:relEnd])
-		written += n
-		cur += int64(n)
+		// Copy the real bytes that exist, zero-fill the rest of the
+		// span (hole tail). dest is a reused kernel buffer, so the
+		// zeros must be written explicitly.
+		n := 0
+		if relStart < int64(len(data)) {
+			realEnd := relEnd
+			if realEnd > int64(len(data)) {
+				realEnd = int64(len(data))
+			}
+			n = copy(dest[written:], data[relStart:realEnd])
+		}
+		span := int(relEnd - relStart)
+		for i := written + n; i < written+span; i++ {
+			dest[i] = 0
+		}
+		written += span
+		cur += int64(span)
 		// If we got less than the full requested range from this chunk
 		// (because the chunk was short — last chunk of file), we're at
 		// EOF regardless of dest's remaining space.
-		if int64(len(data)) < chunkSize && relEnd == int64(len(data)) {
+		if logicalLen < chunkSize && relEnd == logicalLen {
 			break
 		}
 	}
@@ -394,7 +429,7 @@ func (r *Reader) readAt(ctx context.Context, ino int64, dest []byte, off int64, 
 // site you have "fetch this chunk or terminate" semantics, and the
 // three-tier dance lives in one named function with a single happy
 // path.
-func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, inSize int64, batch map[int32]meta.Chunk) ([]byte, error) {
+func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, inSize int64, sparse bool, batch map[int32]meta.Chunk) ([]byte, error) {
 	chunkStart := int64(idx) * chunkSize
 
 	// Tier 1: chunk_map. Prefer the pre-fetched batch (one SELECT
@@ -450,11 +485,16 @@ func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, 
 			return pdata, nil
 		}
 	}
-	// chunk_map empty, staging empty, no pending upload to wait
-	// for. inode.size says there should be bytes here, but every
-	// source has come up empty — surface EIO so the caller knows
-	// the data is genuinely gone instead of returning silent zero-
-	// fill that the kernel would happily pad with NULs.
+	// chunk_map empty, staging empty, no pending upload to wait for.
+	// For a SPARSE file this is a legitimate hole — the caller
+	// zero-fills the extent. For everything else, inode.size says
+	// there should be bytes here but every source has come up empty —
+	// surface EIO so the caller knows the data is genuinely gone
+	// instead of returning silent zero-fill that the kernel would
+	// happily pad with NULs.
+	if sparse {
+		return nil, nil
+	}
 	return nil, fmt.Errorf("chunk %d/%d: missing from chunk_map AND staging (data lost)", ino, idx)
 }
 

@@ -6,7 +6,6 @@ import (
 	"os"
 	"strconv"
 
-	"telfs/internal/config"
 	"telfs/internal/meta"
 )
 
@@ -23,12 +22,21 @@ Two independent lanes:
   download  — upload.getFile only (cache misses, range reads, etc.).
 
 usage:
-  telfs ratelimit show                          print both caps
+  telfs ratelimit show                          print mode + both caps
   telfs ratelimit set <N>                       set UPLOAD cap to N req/min
   telfs ratelimit set --download <N>            set DOWNLOAD cap to N req/min
   telfs ratelimit set --upload <U> --download <D>   set both at once
-  telfs ratelimit clear                         disable BOTH caps
-  telfs ratelimit clear --upload | --download   disable one lane
+  telfs ratelimit clear                         clear BOTH caps
+  telfs ratelimit clear --upload | --download   clear one lane
+  telfs ratelimit mode <adaptive|manual>        pick the upload-lane governor
+
+Modes (upload lane):
+  adaptive (default) — the daemon manages the cap by AIMD: halve on
+      FLOOD_WAIT, slowly raise during active-and-quiet periods. A
+      non-zero "set" value pins the cap (suspending AIMD); clearing
+      resumes AIMD from a conservative start.
+  manual — no automatic control. "set" applies raw and clearing means
+      UNLIMITED. Use on fat links where the adaptive ceiling is too low.
 
 Use this when bursty workloads (tar extracts, mass deletes) trigger
 cascading FLOOD_WAITs on the upload side. Throttle uploads first; leave
@@ -40,18 +48,25 @@ func cmdRateLimit(ctx context.Context, args []string) error {
 		fmt.Fprint(os.Stderr, ratelimitUsage)
 		os.Exit(2)
 	}
-	cfg, err := config.Load()
+	if args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+		fmt.Print(ratelimitUsage)
+		return nil
+	}
+	// openMeta stat-checks before opening: a bare `ratelimit show` on
+	// a fresh profile must NOT bootstrap an empty db.sqlite (whose
+	// fresh fs_uuid would then block cold-mount recovery).
+	mstore, err := openMeta(ctx)
 	if err != nil {
 		return err
-	}
-	mstore, err := meta.Open(cfg.DBPath())
-	if err != nil {
-		return fmt.Errorf("open meta: %w", err)
 	}
 	defer mstore.Close()
 
 	switch args[0] {
 	case "show":
+		mode, err := mstore.TGRateLimitMode(ctx)
+		if err != nil {
+			return err
+		}
 		up, err := mstore.TGRateLimitPerMin(ctx)
 		if err != nil {
 			return err
@@ -60,15 +75,26 @@ func cmdRateLimit(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("upload   rate limit: %s\n", fmtRL(up))
+		fmt.Printf("mode:                %s\n", mode)
+		if mode == "adaptive" && up == 0 {
+			fmt.Printf("upload   rate limit: adaptive (AIMD-managed)\n")
+		} else {
+			fmt.Printf("upload   rate limit: %s\n", fmtRL(up))
+		}
 		fmt.Printf("download rate limit: %s\n", fmtRL(down))
 		return nil
 	case "set":
 		return setRateLimits(ctx, mstore, args[1:])
 	case "clear":
 		return clearRateLimits(ctx, mstore, args[1:])
-	case "-h", "--help", "help":
-		fmt.Print(ratelimitUsage)
+	case "mode":
+		if len(args) != 2 {
+			return fmt.Errorf("ratelimit mode: expected adaptive or manual")
+		}
+		if err := mstore.SetTGRateLimitMode(ctx, args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("rate limit mode: %s — takes effect within 5 s\n", args[1])
 		return nil
 	default:
 		fmt.Fprintf(os.Stderr, "unknown ratelimit subcommand %q\n\n%s", args[0], ratelimitUsage)

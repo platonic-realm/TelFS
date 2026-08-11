@@ -42,11 +42,35 @@ type MountProcess struct {
 	// done closes when the process has been observed to exit. For
 	// supervised procs this happens in the goroutine that ran
 	// cmd.Wait. For adopted procs Status() lazily closes it the
-	// first time it sees the pid has died.
-	done chan struct{}
+	// first time it sees the pid has died. Multiple observers can
+	// race to be "first" (concurrent Status calls, Reconcile), so
+	// the close funnels through doneOnce.
+	done     chan struct{}
+	doneOnce sync.Once
 	// exitErr captures the result of cmd.Wait(); read only after <-done.
 	// Always nil for adopted procs (we never reaped them).
 	exitErr error
+}
+
+// markDone closes done exactly once, no matter how many observers
+// notice the exit concurrently. A bare close() here used to panic
+// when two requests both rendered Status() of a freshly-dead adopted
+// pid.
+func (m *MountProcess) markDone() {
+	m.doneOnce.Do(func() { close(m.done) })
+}
+
+// fusermountHelper resolves the FUSE unmount helper: fusermount3
+// (fuse3) first, then legacy fusermount. fuse3-only distros ship no
+// "fusermount" name at all, so hardcoding it made every emergency
+// unmount here a silent no-op.
+func fusermountHelper() string {
+	for _, name := range []string{"fusermount3", "fusermount"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return "fusermount"
 }
 
 // Status is the short label shown in the UI. For adopted procs
@@ -69,7 +93,7 @@ func (m *MountProcess) Status() string {
 	// if the process is alive; errors otherwise. Cheap (one syscall).
 	if m.Adopted && m.Pid > 0 {
 		if err := syscall.Kill(m.Pid, 0); err != nil {
-			close(m.done)
+			m.markDone()
 			return "exited"
 		}
 	}
@@ -178,6 +202,18 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 	// duplicate spawn that would fight for the same FUSE channel.
 	s.Reconcile()
 
+	// Reserve the profile slot UNDER THE LOCK before spawning: the
+	// old check-unlock-spawn-lock-insert dance let two concurrent
+	// Start calls (double-click on the form) both pass the check and
+	// spawn two daemons onto one db.sqlite + session.json — a data
+	// race at every layer below. The placeholder registers as
+	// "running" (done not closed) so the second caller refuses.
+	placeholder := &MountProcess{
+		Profile:    opts.Profile,
+		Mountpoint: opts.Mountpoint,
+		Started:    time.Now(),
+		done:       make(chan struct{}),
+	}
 	s.mu.Lock()
 	if existing := s.procs[opts.Profile]; existing != nil {
 		select {
@@ -193,17 +229,30 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 			return nil, fmt.Errorf("profile %q already has a %s mount at %s — stop it first", opts.Profile, origin, existing.Mountpoint)
 		}
 	}
+	s.procs[opts.Profile] = placeholder
 	s.mu.Unlock()
+	// From here every failure path must release the reservation.
+	unreserve := func() {
+		s.mu.Lock()
+		if s.procs[opts.Profile] == placeholder {
+			delete(s.procs, opts.Profile)
+		}
+		s.mu.Unlock()
+		placeholder.markDone()
+	}
 
 	if info, err := os.Stat(opts.Mountpoint); err != nil {
+		unreserve()
 		return nil, fmt.Errorf("mountpoint %s: %w", opts.Mountpoint, err)
 	} else if !info.IsDir() {
+		unreserve()
 		return nil, fmt.Errorf("mountpoint %s is not a directory", opts.Mountpoint)
 	}
 
 	logPath := mountLogPath(opts.Profile)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
+		unreserve()
 		return nil, fmt.Errorf("open log %s: %w", logPath, err)
 	}
 
@@ -244,6 +293,7 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
+		unreserve()
 		return nil, fmt.Errorf("spawn %s mount: %w", s.selfPath, err)
 	}
 
@@ -259,19 +309,23 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 	go func() {
 		mp.exitErr = cmd.Wait()
 		logFile.Close()
-		close(mp.done)
+		mp.markDone()
 	}()
 
 	s.mu.Lock()
-	s.procs[opts.Profile] = mp
+	s.procs[opts.Profile] = mp // replaces the reservation placeholder
 	s.mu.Unlock()
+	placeholder.markDone() // release anyone blocked on the reservation
 	return mp, nil
 }
 
 // Stop signals the mount daemon for the given profile and waits up
-// to 25 seconds — matching the in-mount watchdog. After that, it
-// SIGKILLs the process and runs `fusermount -u -z` as a last-ditch
-// unmount.
+// to 35 seconds — comfortably past the daemon's own 30-second
+// shutdown watchdog, so orderly teardown (drain + final snapshot)
+// always gets to finish before we SIGKILL. (An earlier 25 s value
+// undercut the daemon's budget and could SIGKILL it mid-final-
+// snapshot, leaving a stale WAL behind.) After that, it SIGKILLs the
+// process and runs the fusermount helper as a last-ditch unmount.
 //
 // Works for both supervised (started by us) and adopted (discovered
 // in /proc, started outside this web) procs. The branching is
@@ -292,20 +346,17 @@ func (s *Supervisor) Stop(profile string) error {
 	default:
 	}
 	_ = signalProc(mp, syscall.SIGTERM)
-	if waitForExit(mp, 25*time.Second) {
+	if waitForExit(mp, 35*time.Second) {
 		return nil
 	}
 	// Last-ditch: SIGKILL + lazy unmount.
 	_ = signalProc(mp, syscall.SIGKILL)
-	if err := exec.Command("fusermount", "-u", "-z", mp.Mountpoint).Run(); err != nil {
+	if err := exec.Command(fusermountHelper(), "-u", "-z", mp.Mountpoint).Run(); err != nil {
 		return fmt.Errorf("kill + lazy unmount failed: %w", err)
 	}
-	// Close the done channel for adopted procs so Status flips.
-	select {
-	case <-mp.done:
-	default:
-		close(mp.done)
-	}
+	// Mark done for adopted procs so Status flips. markDone is
+	// sync.Once-guarded — safe unconditionally.
+	mp.markDone()
 	return nil
 }
 
@@ -340,7 +391,7 @@ func waitForExit(mp *MountProcess, timeout time.Duration) bool {
 		case <-tick.C:
 			if mp.Adopted && mp.Pid > 0 {
 				if err := syscall.Kill(mp.Pid, 0); err != nil {
-					close(mp.done)
+					mp.markDone()
 					return true
 				}
 			}
@@ -413,11 +464,11 @@ func (s *Supervisor) UnmountExternal(mountpoint string) error {
 	if !found {
 		return fmt.Errorf("mountpoint %q is not currently mounted as fuse.telfs", mountpoint)
 	}
-	if err := exec.Command("fusermount", "-u", mountpoint).Run(); err == nil {
+	if err := exec.Command(fusermountHelper(), "-u", mountpoint).Run(); err == nil {
 		return nil
 	}
 	// EBUSY or stuck — try the lazy form.
-	if err := exec.Command("fusermount", "-u", "-z", mountpoint).Run(); err != nil {
+	if err := exec.Command(fusermountHelper(), "-u", "-z", mountpoint).Run(); err != nil {
 		return fmt.Errorf("fusermount -u -z %s: %w", mountpoint, err)
 	}
 	return nil
@@ -468,7 +519,7 @@ func (s *Supervisor) Reconcile() {
 		default:
 		}
 		if mp.Adopted && mp.Pid > 0 && syscall.Kill(mp.Pid, 0) != nil {
-			close(mp.done)
+			mp.markDone()
 			delete(s.procs, prof)
 		}
 	}

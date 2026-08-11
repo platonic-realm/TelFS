@@ -21,14 +21,20 @@ const (
 	// KindSnapshot is a TelFS snapshot: document with a JSON caption
 	// that parses with k:"snap".
 	KindSnapshot
+	// KindJournal is a journal-op batch (or legacy single op):
+	// document with a JSON caption that parses with k:"j". gc prunes
+	// these once every retained snapshot already covers their seqs.
+	KindJournal
 )
 
 // ChannelMessage is the GC-friendly view of one channel message.
 type ChannelMessage struct {
 	ID         int
+	Date       int // unix seconds the message was posted (0 if unknown)
 	Kind       MessageKind
 	HasDoc     bool // true if MessageMediaDocument was attached
 	SnapCap    SnapshotCaption
+	JnlCap     JournalCaption // populated when Kind == KindJournal
 	RawCaption string
 }
 
@@ -74,14 +80,33 @@ func (s *Session) WalkChannelMessages(ctx context.Context, pageLimit int, fn fun
 				return err
 			}
 		}
-		last := msgs[len(msgs)-1]
-		lastMsg, ok := last.(*tg.Message)
+		next, ok := lastMessageID(msgs)
 		if !ok {
+			// Page of nothing but unidentifiable entries — can't
+			// advance the cursor, so stop rather than loop forever.
 			return nil
 		}
-		offsetID = lastMsg.ID
+		offsetID = next
 	}
 	return nil
+}
+
+// lastMessageID returns the ID of the last message in a page regardless
+// of its concrete class (Message, MessageService, MessageEmpty — all
+// carry an ID). Earlier code bailed out of pagination entirely when the
+// page's last element wasn't a *tg.Message, which silently truncated
+// every scan at the first pin / title-change / service message — the
+// recovery scanner would then conclude "no snapshot" on a channel that
+// had one a page further back.
+func lastMessageID(msgs []tg.MessageClass) (int, bool) {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if withID, ok := msgs[i].(interface{ GetID() int }); ok {
+			if id := withID.GetID(); id > 0 {
+				return id, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // ErrStopWalk signals WalkChannelMessages to halt iteration.
@@ -95,7 +120,7 @@ func (stopWalk) Error() string { return "stop walk" }
 // message represents. Conservative: anything we can't positively
 // identify is KindUnknown (left alone by GC).
 func classifyMessage(msg *tg.Message) ChannelMessage {
-	cm := ChannelMessage{ID: msg.ID, RawCaption: msg.Message}
+	cm := ChannelMessage{ID: msg.ID, Date: msg.Date, RawCaption: msg.Message}
 	if _, ok := msg.Media.(*tg.MessageMediaDocument); !ok {
 		// Plain text or other media — not a TelFS object.
 		return cm
@@ -108,6 +133,11 @@ func classifyMessage(msg *tg.Message) ChannelMessage {
 	if cap, ok := parseSnapshotCaption(msg.Message); ok {
 		cm.Kind = KindSnapshot
 		cm.SnapCap = cap
+		return cm
+	}
+	if cap, ok := parseJournalCaption(msg.Message); ok {
+		cm.Kind = KindJournal
+		cm.JnlCap = cap
 		return cm
 	}
 	return cm

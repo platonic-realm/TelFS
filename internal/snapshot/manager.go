@@ -57,6 +57,17 @@ type Manager struct {
 	// Logger receives a one-line update per snapshot attempt; set to nil
 	// to fall back to log.Default.
 	Logger *log.Logger
+
+	// lastSnapCounter is Meta.WriteCounter() as of the last successful
+	// snapshot THIS manager took. Together with the journal-seq check
+	// it decides whether a cycle can be skipped: journal seq alone is
+	// blind to chunk_map writes (PutChunk is not journaled and lands
+	// AFTER the Flush-time SetSize), so seq-only skipping could
+	// permanently exclude a file's chunks from every future snapshot —
+	// including the final unmount one. haveSnapCounter distinguishes
+	// "no snapshot yet this process" from a zero counter.
+	lastSnapCounter int64
+	haveSnapCounter bool
 }
 
 // Run executes the periodic snapshot loop until ctx is canceled. It
@@ -99,10 +110,15 @@ func (m *Manager) Run(ctx context.Context) error {
 // older than the retention window so the channel doesn't accumulate
 // indefinitely.
 //
-// Skips the cycle entirely when the journal seq hasn't advanced
-// since the last snapshot — there's no new state to capture, so the
-// upload would be a verbatim copy of what's already on the channel.
-// First-ever snapshot (no KVCurrentJournalSeq yet) is never skipped.
+// Skips the cycle entirely when NOTHING changed since the last
+// snapshot this process took: the journal seq is unchanged AND the
+// store's write counter is unchanged. The counter matters because
+// chunk_map writes aren't journaled and land after the Flush-time
+// SetSize — a seq-only skip could exclude a file's chunks from every
+// future snapshot (including the final unmount one) even on a clean
+// shutdown. The first Once() of a process never skips, so a chunk
+// that landed just before a crash is captured by the next mount's
+// initial snapshot.
 func (m *Manager) Once(ctx context.Context) error {
 	currentSeq, err := m.Meta.LastJournalSeq(ctx)
 	if err != nil {
@@ -112,12 +128,13 @@ func (m *Manager) Once(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read prev snap journal seq: %w", err)
 	}
-	if hadPrev && currentSeq == prevSeq {
+	counterNow := m.Meta.WriteCounter()
+	if hadPrev && currentSeq == prevSeq && m.haveSnapCounter && counterNow == m.lastSnapCounter {
 		logger := m.Logger
 		if logger == nil {
 			logger = log.Default()
 		}
-		logger.Printf("[snapshot] skipped: no new journal entries since seq %d", currentSeq)
+		logger.Printf("[snapshot] skipped: no new journal entries since seq %d and no DB writes", currentSeq)
 		return nil
 	}
 	snap, err := Take(ctx, m.Meta)
@@ -152,6 +169,26 @@ func (m *Manager) Once(ctx context.Context) error {
 	if err := storeCurrentJournalSeq(ctx, m.Meta, snap.JournalSeq); err != nil {
 		return fmt.Errorf("persist new snap journal seq: %w", err)
 	}
+	// Local journal pruning: rows with seq <= this snapshot's seq that
+	// have ALSO been posted to the channel are superseded — their
+	// effects are inside the snapshot we just uploaded, and channel-
+	// side replay only ever asks for seq > snapshot seq. Without this
+	// the journal table grows forever and is re-VACUUMed, re-gzipped
+	// and re-uploaded inside every snapshot (this was the dominant
+	// driver of snapshot bloat). Unposted rows stay: an older retained
+	// snapshot restored later replays from the CHANNEL's journal
+	// messages, so those must reach the channel before deletion.
+	if pruned, err := m.Meta.DeleteJournalUpTo(ctx, snap.JournalSeq); err != nil {
+		if m.Logger != nil {
+			m.Logger.Printf("[snapshot] journal prune: %v", err)
+		}
+	} else if pruned > 0 && m.Logger != nil {
+		m.Logger.Printf("[snapshot] pruned %d superseded journal rows", pruned)
+	}
+	// Record the change-detection baseline AFTER our own bookkeeping
+	// writes so they don't count as "new changes" next cycle.
+	m.lastSnapCounter = m.Meta.WriteCounter()
+	m.haveSnapCounter = true
 	// Retention pruning: list every snapshot for this fs_uuid, keep the
 	// `retention` newest, delete the rest. Best-effort — if delete
 	// fails the orphan stays on the channel but the FS keeps working;

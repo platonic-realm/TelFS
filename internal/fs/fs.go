@@ -5,7 +5,9 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -39,6 +41,31 @@ type Backend struct {
 	// running outside the FS layer reaps aged entries. TrashIno == 0
 	// (the default) means the FS layer behaves as if trash is off.
 	TrashIno int64
+
+	// usageCache memoizes meta.Usage for Statfs. File managers poll
+	// statfs on every window repaint; without the cache each poll
+	// would scan the inodes table.
+	usageMu    sync.Mutex
+	usageAt    time.Time
+	usageBytes int64
+	usageInos  int64
+}
+
+// usage returns (fileBytes, inodeCount) from the meta store, cached
+// for a few seconds. Errors degrade to the last known values (zero on
+// a cold cache) — statfs must not fail a repaint over a busy DB.
+func (b *Backend) usage(ctx context.Context) (int64, int64) {
+	const usageTTL = 5 * time.Second
+	b.usageMu.Lock()
+	defer b.usageMu.Unlock()
+	if time.Since(b.usageAt) < usageTTL {
+		return b.usageBytes, b.usageInos
+	}
+	if u, err := b.Meta.Usage(ctx); err == nil {
+		b.usageBytes, b.usageInos = u.FileBytes, u.Inodes
+		b.usageAt = time.Now()
+	}
+	return b.usageBytes, b.usageInos
 }
 
 // Shutdown drains any uploads that were detached when their handle's
@@ -123,25 +150,37 @@ func NewRoot(b *Backend) *Node {
 
 // Statfs answers `statfs(2)` / `pathconf(_PC_NAME_MAX)` / df / etc.
 //
-// We don't know the channel's remaining capacity, so block counts
-// are large-but-fictional. Numbers are chosen so that downstream
-// tools (df, file managers, archivers) don't overflow or display
-// surprising values: 4 KiB block size (what most tools expect),
-// 1 PiB total, which fits cleanly in a uint64 product and renders
-// as "1P" in `df -h`. The earlier choice of 4 MiB blocks × 4 ZiB
-// total over-saturated some GUI file managers, which truncated
-// to ~6 GB and displayed "drive almost full".
-func (n *Node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
+// The TOTAL is fictional — a Telegram channel has no storage quota to
+// report, but statfs must return something, so we claim 128 PiB with
+// 4 KiB blocks. The value is deliberately large-but-bounded: an
+// earlier 4 MiB × 4 ZiB choice overflowed some GUI file managers,
+// which truncated to ~6 GB and displayed "drive almost full".
+//
+// USED is real: the summed logical size of every file (cached a few
+// seconds — see Backend.usage), so `df -h` shows actual consumption
+// against the fictional total instead of a permanently-empty disk.
+// Inode counts likewise report the real live count against a huge
+// fictional ceiling.
+func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	const (
-		bsize     uint32 = 4096   // 4 KiB — standard page size
-		blockCnt  uint64 = 1 << 38 // 4 KiB * 2^38 = 1 PiB total
+		bsize     uint32 = 4096    // 4 KiB — standard page size
+		blockCnt  uint64 = 1 << 45 // 4 KiB * 2^45 = 128 PiB total
 		fakeFiles uint64 = 1 << 32 // 4 G inodes — plenty
 	)
+	usedBytes, usedInos := n.backend.usage(ctx)
+	usedBlocks := (uint64(usedBytes) + uint64(bsize) - 1) / uint64(bsize)
+	if usedBlocks > blockCnt {
+		usedBlocks = blockCnt // fictional total exhausted; never underflow
+	}
+	usedFiles := uint64(usedInos)
+	if usedFiles > fakeFiles {
+		usedFiles = fakeFiles
+	}
 	out.Blocks = blockCnt
-	out.Bfree = blockCnt
-	out.Bavail = blockCnt
+	out.Bfree = blockCnt - usedBlocks
+	out.Bavail = blockCnt - usedBlocks
 	out.Files = fakeFiles
-	out.Ffree = fakeFiles
+	out.Ffree = fakeFiles - usedFiles
 	out.Bsize = bsize
 	out.Frsize = bsize
 	out.NameLen = 255
@@ -193,6 +232,9 @@ func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAt
 				log.Printf("fs.Setattr.Truncate(ino=%d, size=%d): %v", n.ino, size, err)
 				return syscall.EIO
 			}
+			// The handle's cached size/sparse hints are stale now —
+			// force subsequent Reads through the GetInode slow path.
+			h.markDirty()
 		} else if errno := n.truncate(mctx, int64(size)); errno != 0 {
 			return errno
 		}
@@ -219,6 +261,13 @@ func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
 	defer w.Close()
 	if err := w.Truncate(ctx, size); err != nil {
 		log.Printf("fs.truncate.Truncate(ino=%d, size=%d): %v", n.ino, size, err)
+		return syscall.EIO
+	}
+	// A shrink may have re-dirtied a trimmed boundary chunk; this
+	// transient writer is Closed right after, so dispatch it now or
+	// the trim never reaches the channel.
+	if err := w.Flush(ctx); err != nil {
+		log.Printf("fs.truncate.Flush(ino=%d): %v", n.ino, err)
 		return syscall.EIO
 	}
 	return 0
@@ -292,6 +341,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 			h.chunkSize = n.backend.chunkSize()
 		}
 		h.size = in.Size
+		h.sparse = in.Sparse
 	}
 	// FOPEN_KEEP_CACHE keeps the kernel's page cache valid across opens,
 	// which is correct because we invalidate the read cache on writes.
@@ -333,6 +383,11 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 		Mode: mode | uint32(syscall.S_IFREG),
 		UID:  callerUID(ctx),
 		GID:  callerGID(ctx),
+		// Seed the per-inode chunk size from the FS-configured value.
+		// Without this the inodes.chunk_size column default (4 MiB)
+		// silently overrode any custom `telfs init --chunk-size` for
+		// every file created through FUSE.
+		ChunkSize: n.backend.chunkSize(),
 	})
 	if err != nil {
 		return nil, nil, 0, logMetaErr("Create.CreateChild", n.ino, err)
@@ -606,6 +661,13 @@ func (n *Node) newChildInode(ctx context.Context, in meta.Inode) *gofuse.Inode {
 func fillAttr(a *fuse.Attr, in meta.Inode) {
 	a.Ino = uint64(in.Ino)
 	a.Size = uint64(in.Size)
+	// st_blocks is in 512-byte units regardless of Blksize. Without
+	// it, `du` reported ~0 for every file. Sparse files honestly
+	// report their logical size here too — we don't track per-chunk
+	// allocation, and overstating beats understating for a tool whose
+	// job is "how much am I storing".
+	a.Blocks = (uint64(in.Size) + 511) / 512
+	a.Blksize = 4096
 	a.Mode = in.Mode
 	a.Uid = in.UID
 	a.Gid = in.GID

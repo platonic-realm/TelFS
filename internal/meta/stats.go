@@ -6,6 +6,28 @@ import (
 	"fmt"
 )
 
+// UsageSummary is the cheap aggregate statfs needs: total logical
+// bytes across regular files and the live inode count.
+type UsageSummary struct {
+	FileBytes int64
+	Inodes    int64
+}
+
+// Usage returns the current usage aggregate in one scan of `inodes`
+// (never chunk_map — at TB scale that's the big table). Callers that
+// serve statfs should cache the result briefly; file managers poll
+// statfs aggressively.
+func (s *Store) Usage(ctx context.Context) (UsageSummary, error) {
+	var u UsageSummary
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(CASE WHEN kind='file' THEN size ELSE 0 END),0), COUNT(*) FROM inodes`).
+		Scan(&u.FileBytes, &u.Inodes)
+	if err != nil {
+		return UsageSummary{}, fmt.Errorf("usage: %w", err)
+	}
+	return u, nil
+}
+
 // Stats is a read-only summary of the local metadata DB shaped for
 // the web /state page. None of these counts are authoritative for
 // correctness — they're for human inspection only. All fields are

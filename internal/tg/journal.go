@@ -24,12 +24,12 @@ const MessageKindJournal = "j"
 // Two shapes share this struct (the JSON tags use omitempty so a
 // reader sees the right "is this a batch?" signal):
 //
-//   batch (post-2026 default):
-//     {k: "j", fs_uuid, ts, first_seq, last_seq, count}    ← in caption
-//     {ops: [{seq, op}, ...]}                               ← in body
+//	batch (post-2026 default):
+//	  {k: "j", fs_uuid, ts, first_seq, last_seq, count}    ← in caption
+//	  {ops: [{seq, op}, ...]}                               ← in body
 //
-//   single-op (legacy — kept for read compat with old channels):
-//     {k: "j", fs_uuid, ts, seq, op: <op-json>}             ← all in caption
+//	single-op (legacy — kept for read compat with old channels):
+//	  {k: "j", fs_uuid, ts, seq, op: <op-json>}             ← all in caption
 //
 // The discriminator is `count > 0` (batch) vs `len(payload) > 0`
 // (single). Either one fully identifies the shape.
@@ -37,8 +37,8 @@ type JournalCaption struct {
 	Kind     string          `json:"k"`
 	TSUnix   int64           `json:"ts"`
 	FSUUID   string          `json:"fs_uuid"`
-	Seq      int64           `json:"seq,omitempty"`        // single-op only
-	Payload  json.RawMessage `json:"op,omitempty"`         // single-op only
+	Seq      int64           `json:"seq,omitempty"`       // single-op only
+	Payload  json.RawMessage `json:"op,omitempty"`        // single-op only
 	FirstSeq int64           `json:"first_seq,omitempty"` // batch only
 	LastSeq  int64           `json:"last_seq,omitempty"`  // batch only
 	Count    int             `json:"count,omitempty"`     // batch only
@@ -139,10 +139,18 @@ func (s *Session) DownloadJournalBatchBody(ctx context.Context, msgID int) ([]Jo
 // Single-op messages (legacy format) are decoded inline.
 //
 // max caps the number of entries returned so a misbehaving caller
-// can't stream the entire channel into memory; 0 means use 10000.
+// can't stream the entire channel into memory; 0 means use 100000.
+//
+// Completeness is load-bearing: replay applies these ops on top of a
+// restored snapshot, and a missing PREFIX (the oldest ops) silently
+// corrupts the result — every op after a dropped create applies to
+// the wrong inode. So this function scans until it positively reaches
+// the sinceSeq boundary (or true channel exhaustion) and returns an
+// ERROR if any cap (max entries, page hard-cap) stops it early —
+// never a silently-truncated suffix.
 func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq int64, max int) ([]JournalMessage, error) {
 	if max <= 0 {
-		max = 10000
+		max = 100000
 	}
 	peer, _, err := s.channelPeer()
 	if err != nil {
@@ -154,8 +162,14 @@ func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq in
 	}
 	out := make([]JournalMessage, 0, 64)
 	offsetID := 0
-	const pageLimit = 100 // up to 10000 messages of scrollback
-	for page := 0; page < pageLimit && len(out) < max; page++ {
+	boundaryReached := false
+	// Hard page cap is a runaway guard, not a tuning knob: 2000 pages
+	// = 200k messages of scrollback. Journal batches pack up to 1000
+	// ops per message, so any realistic snapshot-to-crash window fits
+	// well inside this; hitting the cap means something is deeply
+	// wrong and we must not pretend the replay set is complete.
+	const pageHardCap = 2000
+	for page := 0; page < pageHardCap; page++ {
 		res, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:     peer,
 			OffsetID: offsetID,
@@ -166,9 +180,13 @@ func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq in
 		}
 		msgs := extractMessages(res)
 		if len(msgs) == 0 {
+			// True channel exhaustion — we've read all the way back to
+			// the beginning, so the set is complete even though we
+			// never saw a seq <= sinceSeq (e.g. sinceSeq == 0 on a
+			// young channel).
+			boundaryReached = true
 			break
 		}
-		stop := false
 		for _, m := range msgs {
 			msg, ok := m.(*tg.Message)
 			if !ok {
@@ -183,8 +201,9 @@ func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq in
 			}
 			if cap.IsBatch() {
 				if cap.LastSeq <= sinceSeq {
-					// Whole batch is older than what we need — stop.
-					stop = true
+					// Whole batch is older than what we need — the
+					// contiguous range down to sinceSeq is covered.
+					boundaryReached = true
 					break
 				}
 				// Download body, expand into per-seq messages.
@@ -192,9 +211,13 @@ func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq in
 				if err != nil {
 					return nil, err
 				}
+				batchCoversBoundary := cap.FirstSeq <= sinceSeq+1
 				for _, e := range entries {
 					if e.Seq <= sinceSeq {
 						continue
+					}
+					if len(out) >= max {
+						return nil, fmt.Errorf("journal scan hit the %d-op cap before reaching seq %d — refusing to return a truncated replay set", max, sinceSeq)
 					}
 					out = append(out, JournalMessage{
 						MessageID: msg.ID,
@@ -206,31 +229,35 @@ func (s *Session) ListJournalOps(ctx context.Context, fsUUID string, sinceSeq in
 							Payload: e.Op,
 						},
 					})
-					if len(out) >= max {
-						return out, nil
-					}
+				}
+				if batchCoversBoundary {
+					boundaryReached = true
+					break
 				}
 				continue
 			}
 			// Legacy single-op caption.
 			if cap.Seq <= sinceSeq {
-				stop = true
+				boundaryReached = true
 				break
 			}
-			out = append(out, JournalMessage{MessageID: msg.ID, Caption: cap})
 			if len(out) >= max {
-				return out, nil
+				return nil, fmt.Errorf("journal scan hit the %d-op cap before reaching seq %d — refusing to return a truncated replay set", max, sinceSeq)
 			}
+			out = append(out, JournalMessage{MessageID: msg.ID, Caption: cap})
 		}
-		if stop {
+		if boundaryReached {
 			break
 		}
-		last := msgs[len(msgs)-1]
-		lastMsg, ok := last.(*tg.Message)
+		next, ok := lastMessageID(msgs)
 		if !ok {
+			boundaryReached = true // page of unidentifiable entries — treat as exhausted
 			break
 		}
-		offsetID = lastMsg.ID
+		offsetID = next
+	}
+	if !boundaryReached {
+		return nil, fmt.Errorf("journal scan exhausted its page budget before reaching seq %d — the channel has more history than the scanner covered; NOT returning a truncated replay set", sinceSeq)
 	}
 	return out, nil
 }

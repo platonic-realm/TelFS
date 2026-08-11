@@ -179,7 +179,7 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 	if kv, err := mstore.MetaKVDump(ctx); err == nil {
 		d.KV = kv
 	}
-	if parts, err := mstore.ScanPartialFiles(ctx); err == nil {
+	if parts, err := mstore.ScanPartialFiles(ctx, stagedCheckerFor(d.PendingDir)); err == nil {
 		d.Partials = parts
 	}
 
@@ -225,13 +225,33 @@ func (s *Server) stateRepair(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer mstore.Close()
-		_, err = mstore.RepairPartialFilesProgress(context.Background(), s.repair.OnProgress)
+		pendingDir := filepath.Join(cfg.CachePath(), chunk.PendingDirName)
+		_, err = mstore.RepairPartialFilesProgress(context.Background(), stagedCheckerFor(pendingDir), s.repair.OnProgress)
 		if err != nil {
 			s.opts.Logger.Printf("repair: %v", err)
 		}
 		s.repair.Finish(err)
 	}()
 	http.Redirect(w, r, "/state", http.StatusSeeOther)
+}
+
+// stagedCheckerFor snapshots the pending dir into a meta.StagedChecker
+// so repair never truncates through a gap whose wire is staged on disk
+// awaiting recovery. A scan failure degrades to "nothing staged" —
+// same as before the checker existed.
+func stagedCheckerFor(pendingDir string) meta.StagedChecker {
+	entries, err := chunk.ScanPending(pendingDir)
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	set := make(map[int64]map[int32]bool, len(entries))
+	for _, e := range entries {
+		if set[e.Ino] == nil {
+			set[e.Ino] = make(map[int32]bool)
+		}
+		set[e.Ino][e.Idx] = true
+	}
+	return func(ino int64, idx int32) bool { return set[ino][idx] }
 }
 
 // stateRepairProgress returns the HTMX-pollable repair progress

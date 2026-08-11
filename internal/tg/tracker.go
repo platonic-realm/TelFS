@@ -10,6 +10,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 // Request records one MTProto RPC the daemon has issued. The Tracker
@@ -51,21 +52,36 @@ type MethodCount struct {
 // in-flight count, per-method totals). One Tracker is shared by the
 // gotd middleware chain and the web /telegram handler.
 type Tracker struct {
-	mu         sync.Mutex
-	ring       []Request
-	head       int       // next write position
-	cap        int       // ring capacity
-	seq        int64     // last issued ID
-	totalOK    int64     // count of successful Invokes since start
-	totalErr   int64     // count of errored Invokes since start
-	totalBytes int64     // sum of request+response payload bytes since start (tx+rx)
-	totalTx    int64     // upload-direction payload (encoded request bytes for upload methods)
-	totalRx    int64     // download-direction payload (response .Bytes for download methods)
-	byMethod   map[string]*MethodCount
-	inFlight   int       // currently outstanding RPCs
-	lastOK     time.Time // wall time of last successful Invoke
-	lastErr    time.Time // wall time of last errored Invoke
+	mu   sync.Mutex
+	ring []Request
+	head int   // next write position
+	cap  int   // ring capacity
+	seq  int64 // last issued ID
+	// pending tracks in-flight RPCs by ID, independent of the ring:
+	// the ring is a bounded DISPLAY of recent requests and its slots
+	// get overwritten under load, but accounting (totals, per-method,
+	// flood counts) must never lose an entry — the adaptive
+	// controller and the stall watchdog read those numbers exactly
+	// when load is highest.
+	pending     map[int64]pendingRPC
+	totalOK     int64 // count of successful Invokes since start
+	totalErr    int64 // count of errored Invokes since start
+	totalBytes  int64 // sum of request+response payload bytes since start (tx+rx)
+	totalTx     int64 // upload-direction payload (encoded request bytes for upload methods)
+	totalRx     int64 // download-direction payload (response .Bytes for download methods)
+	byMethod    map[string]*MethodCount
+	inFlight    int       // currently outstanding RPCs
+	lastOK      time.Time // wall time of last successful Invoke
+	lastErr     time.Time // wall time of last errored Invoke
+	floodUntil  time.Time // latest (now + FLOOD_WAIT duration) observed — the server-mandated quiet period
 	lastErrText string
+}
+
+// pendingRPC is the accounting-critical slice of an in-flight RPC.
+type pendingRPC struct {
+	method  string
+	started time.Time
+	tx      int
 }
 
 // NewTracker returns a tracker that retains the last `capacity`
@@ -78,6 +94,7 @@ func NewTracker(capacity int) *Tracker {
 		ring:     make([]Request, capacity),
 		cap:      capacity,
 		byMethod: make(map[string]*MethodCount),
+		pending:  make(map[int64]pendingRPC),
 	}
 }
 
@@ -97,6 +114,7 @@ func (t *Tracker) Begin(method string, txBytes int) int64 {
 		Bytes:    txBytes,
 		InFlight: true,
 	}
+	t.pending[r.ID] = pendingRPC{method: method, started: r.Started, tx: txBytes}
 	t.ring[t.head] = r
 	t.head = (t.head + 1) % t.cap
 	return r.ID
@@ -105,8 +123,14 @@ func (t *Tracker) Begin(method string, txBytes int) int64 {
 // End updates the previously-Begun request with completion info.
 // rxBytes is the response payload size for download-shaped methods
 // (zero for upload methods where the request encoder already carries
-// the payload). The linear scan is fine because the ring is small
-// (default 64).
+// the payload).
+//
+// Accounting reads the pending map, NOT the ring: under load (> cap
+// Begins while an RPC is in flight) the ring slot gets overwritten,
+// and the old ring-scan-only implementation silently dropped that
+// RPC's OK/Err/flood/bytes — degrading the adaptive controller's and
+// watchdog's inputs exactly when load peaked. The ring scan below is
+// display-only best effort.
 func (t *Tracker) End(id int64, err error, floodWait time.Duration, rxBytes int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -115,48 +139,57 @@ func (t *Tracker) End(id int64, err error, floodWait time.Duration, rxBytes int)
 		t.inFlight = 0
 	}
 	now := time.Now()
+	p, tracked := t.pending[id]
+	if !tracked {
+		return // End without Begin — nothing to account
+	}
+	delete(t.pending, id)
+
+	tx := int64(p.tx)
+	rx := int64(rxBytes)
+	mc := t.byMethod[p.method]
+	if mc == nil {
+		mc = &MethodCount{Method: p.method}
+		t.byMethod[p.method] = mc
+	}
+	// Per-method aggregate: downloads contribute rx, uploads tx —
+	// whichever side actually moved the payload.
+	payload := tx
+	if rx > 0 && rx > tx {
+		payload = rx
+	}
+	mc.Bytes += payload
+	t.totalBytes += payload
+	t.totalTx += tx
+	t.totalRx += rx
+	if err != nil {
+		t.lastErr = now
+		t.lastErrText = err.Error()
+		t.totalErr++
+		mc.Err++
+		if floodWait > 0 {
+			mc.FloodWait++
+			if until := now.Add(floodWait); until.After(t.floodUntil) {
+				t.floodUntil = until
+			}
+		}
+	} else {
+		t.lastOK = now
+		t.totalOK++
+		mc.OK++
+	}
+
+	// Display: update the ring row if it hasn't been overwritten.
 	for i := range t.ring {
 		if t.ring[i].ID == id {
-			t.ring[i].Duration = now.Sub(t.ring[i].Started)
+			t.ring[i].Duration = now.Sub(p.started)
 			t.ring[i].InFlight = false
 			t.ring[i].FloodWait = floodWait
-			method := t.ring[i].Method
-			tx := int64(t.ring[i].Bytes) // recorded as tx at Begin time
-			rx := int64(rxBytes)
-			// Per-row display: for downloads the response payload is
-			// the meaningful number, not the tiny request encoder.
-			// Pick whichever side actually moved bytes.
 			if rx > 0 && rx > tx {
 				t.ring[i].Bytes = int(rx)
 			}
-			mc := t.byMethod[method]
-			if mc == nil {
-				mc = &MethodCount{Method: method}
-				t.byMethod[method] = mc
-			}
-			// Per-method aggregate matches the display semantics:
-			// downloads contribute rx, uploads contribute tx.
-			payload := tx
-			if rx > 0 && rx > tx {
-				payload = rx
-			}
-			mc.Bytes += payload
-			t.totalBytes += payload
-			t.totalTx += tx
-			t.totalRx += rx
 			if err != nil {
 				t.ring[i].Err = err.Error()
-				t.lastErr = now
-				t.lastErrText = err.Error()
-				t.totalErr++
-				mc.Err++
-				if floodWait > 0 {
-					mc.FloodWait++
-				}
-			} else {
-				t.lastOK = now
-				t.totalOK++
-				mc.OK++
 			}
 			return
 		}
@@ -172,12 +205,17 @@ type Snapshot struct {
 	LastSuccess  time.Time
 	LastError    time.Time
 	LastErrorMsg string
+	// FloodWaitUntil is the end of the most recent server-mandated
+	// FLOOD_WAIT quiet period (zero if none observed). While now <
+	// FloodWaitUntil, an absence of successful RPCs is EXPECTED — the
+	// stall watchdog must not read it as a wedged connection.
+	FloodWaitUntil time.Time
 	// Aggregate totals since daemon start.
 	TotalOK      int64
 	TotalErr     int64
-	TotalBytes   int64 // payload-direction sum across all RPCs (tx for uploads + rx for downloads)
-	TotalBytesTx int64 // upload-direction wire bytes
-	TotalBytesRx int64 // download-direction wire bytes
+	TotalBytes   int64         // payload-direction sum across all RPCs (tx for uploads + rx for downloads)
+	TotalBytesTx int64         // upload-direction wire bytes
+	TotalBytesRx int64         // download-direction wire bytes
 	PerMethod    []MethodCount // sorted by total count desc
 }
 
@@ -208,17 +246,18 @@ func (t *Tracker) Snapshot() Snapshot {
 		}
 	}
 	return Snapshot{
-		Requests:     out,
-		InFlight:     t.inFlight,
-		LastSuccess:  t.lastOK,
-		LastError:    t.lastErr,
-		LastErrorMsg: t.lastErrText,
-		TotalOK:      t.totalOK,
-		TotalErr:     t.totalErr,
-		TotalBytes:   t.totalBytes,
-		TotalBytesTx: t.totalTx,
-		TotalBytesRx: t.totalRx,
-		PerMethod:    perMethod,
+		Requests:       out,
+		InFlight:       t.inFlight,
+		LastSuccess:    t.lastOK,
+		LastError:      t.lastErr,
+		LastErrorMsg:   t.lastErrText,
+		FloodWaitUntil: t.floodUntil,
+		TotalOK:        t.totalOK,
+		TotalErr:       t.totalErr,
+		TotalBytes:     t.totalBytes,
+		TotalBytesTx:   t.totalTx,
+		TotalBytesRx:   t.totalRx,
+		PerMethod:      perMethod,
 	}
 }
 
@@ -268,8 +307,17 @@ func responsePayloadSize(output bin.Decoder) int {
 	if output == nil {
 		return 0
 	}
-	if uf, ok := output.(*tg.UploadFile); ok {
-		return len(uf.Bytes)
+	// gotd's generated raw calls pass BOXED decoders through Invoke
+	// (*tg.UploadFileBox wrapping an UploadFileClass), never the bare
+	// *tg.UploadFile — matching only the bare type meant download rx
+	// bytes always counted as zero. Handle both shapes.
+	switch v := output.(type) {
+	case *tg.UploadFile:
+		return len(v.Bytes)
+	case *tg.UploadFileBox:
+		if uf, ok := v.File.(*tg.UploadFile); ok {
+			return len(uf.Bytes)
+		}
 	}
 	return 0
 }
@@ -301,31 +349,55 @@ func encodedSize(v bin.Encoder) int {
 	return b.Len()
 }
 
-// asFloodWait is a copy of tgerr.AsFloodWait that we can call without
-// circular imports against our FloodWaiter. Returns (duration, true)
-// if the error is a FLOOD_WAIT_X.
+// asFloodWait classifies err as a Telegram flood throttle and returns
+// the mandated sleep. The AUTHORITATIVE probe is tgerr.AsFloodWait —
+// gotd's own error type prints as "rpc error code 420: FLOOD_WAIT
+// (23)" (type and argument SEPARATED), so no substring scan for
+// "FLOOD_WAIT_N" ever matches it; the previous implementation relied
+// on exactly that scan plus a FloodWait() interface *tgerr.Error
+// doesn't have, which meant the tracker never counted a single real
+// flood error and the adaptive controller's decrease path was dead
+// code. The string scans below remain only as a fallback for wrapped
+// or foreign error strings.
 func asFloodWait(err error) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
 	}
-	if fwErr, ok := err.(interface{ FloodWait() (int, bool) }); ok {
-		if secs, ok := fwErr.FloodWait(); ok {
-			return time.Duration(secs) * time.Second, true
-		}
+	if d, ok := tgerr.AsFloodWait(err); ok {
+		return d, true
 	}
 	// Fall back to a string match for older gotd versions or wrapped errors.
+	// Match BOTH variants TG emits:
+	//   - FLOOD_WAIT_N        (classic per-account throttle)
+	//   - FLOOD_PREMIUM_WAIT_N (non-premium account hitting a tier limit)
+	// Both signal "back off, sleep N seconds." Earlier code only caught
+	// FLOOD_WAIT_, so the controller couldn't see free-account throttling
+	// and would happily raise the cap into a wall.
 	s := err.Error()
-	for i := 0; i+10 < len(s); i++ {
-		if s[i:i+11] == "FLOOD_WAIT_" {
-			n := 0
-			j := i + 11
-			for j < len(s) && s[j] >= '0' && s[j] <= '9' {
-				n = n*10 + int(s[j]-'0')
-				j++
-			}
-			if n > 0 {
-				return time.Duration(n) * time.Second, true
-			}
+	if d, ok := scanFloodMarker(s, "FLOOD_WAIT_"); ok {
+		return d, true
+	}
+	if d, ok := scanFloodMarker(s, "FLOOD_PREMIUM_WAIT_"); ok {
+		return d, true
+	}
+	return 0, false
+}
+
+// scanFloodMarker searches s for marker followed by a decimal number
+// of seconds. Returns (N seconds, true) on the first match.
+func scanFloodMarker(s, marker string) (time.Duration, bool) {
+	for i := 0; i+len(marker) < len(s); i++ {
+		if s[i:i+len(marker)] != marker {
+			continue
+		}
+		n := 0
+		j := i + len(marker)
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			n = n*10 + int(s[j]-'0')
+			j++
+		}
+		if n > 0 {
+			return time.Duration(n) * time.Second, true
 		}
 	}
 	return 0, false

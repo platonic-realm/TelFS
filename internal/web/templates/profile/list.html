@@ -19,7 +19,10 @@
       <button type="submit" class="secondary">Use</button>
     </form>
     {{end}}
-    <a href="/profiles/{{.}}/export" class="btn secondary">Export</a>
+    <form method="post" action="/profiles/{{.}}/export" style="display:inline">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <button type="submit" class="secondary">Export</button>
+    </form>
   </td>
 </tr>
 {{end}}

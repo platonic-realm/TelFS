@@ -429,11 +429,8 @@ func hasChunksFor(cfg *config.Config) bool {
 		return false
 	}
 	defer m.Close()
-	chunks, err := m.AllChunkMessageIDs(context.Background())
-	if err != nil {
-		return false
-	}
-	return len(chunks) > 0
+	has, err := m.HasAnyChunks(context.Background())
+	return err == nil && has
 }
 
 // activeMounts scans /proc/mounts for fuse.telfs entries.
@@ -715,6 +712,17 @@ func (s *Server) profilesDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such profile", http.StatusNotFound)
 		return
 	}
+	// Refuse while a daemon for this profile is mounted: RemoveAll
+	// under a live daemon leaves it writing to unlinked files, and
+	// the next mount recovers from the channel losing everything
+	// after the last snapshot.
+	for _, mp := range s.sup.List() {
+		if mp.Profile == name && mp.Status() == "running" {
+			SetFlash(w, "error", fmt.Sprintf("profile %q has a running mount — stop it first", name))
+			http.Redirect(w, r, "/profiles", http.StatusSeeOther)
+			return
+		}
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		SetFlash(w, "error", "delete: "+err.Error())
 	} else {
@@ -726,6 +734,10 @@ func (s *Server) profilesDelete(w http.ResponseWriter, r *http.Request) {
 var bundleFiles = []string{config.ConfigFile, config.SessionFile, config.DBFile}
 
 func (s *Server) profilesExport(w http.ResponseWriter, r *http.Request) {
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
 	name := r.PathValue("name")
 	dir, err := config.ProfileDir(name)
 	if err != nil {

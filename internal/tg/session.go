@@ -10,6 +10,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/telegram/downloader"
@@ -59,6 +60,9 @@ type Session struct {
 	// On FILE_REFERENCE_EXPIRED we invalidate the entry; the
 	// existing single-retry path in DownloadDocument{,Range} refetches.
 	docCache sync.Map // map[int64]*docCacheEntry, keyed by msgID
+	// docSweepAt is when the last docCache expiry sweep ran; gates
+	// maybeSweepDocCache to once per TTL window.
+	docSweepAt atomic.Pointer[time.Time]
 }
 
 type docCacheEntry struct {
@@ -299,11 +303,32 @@ func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, cap
 	if err != nil {
 		return 0, err
 	}
-	// Buffer once — the reader is typically a chunk's wire bytes (≤ 4 MiB
-	// at default chunk size + GCM overhead), so the memory cost is bounded.
+	// Buffer once — the reader is a chunk wire (≤ 64 MiB tier + GCM
+	// overhead) or a packed blob (≤ 32 MiB) or a snapshot body, so the
+	// memory cost is bounded by the largest caller.
 	body, err := io.ReadAll(r)
 	if err != nil {
 		return 0, fmt.Errorf("read upload bytes: %w", err)
+	}
+	// Telegram hard-caps documents at 2 GiB (4 GiB premium). Chunk
+	// tiers are far below this; the realistic way to reach it is a
+	// whole-DB snapshot that outgrew the cap. Fail with a diagnosis
+	// instead of letting the server reject every part-upload late —
+	// silently-failing snapshots recede the recovery anchor for weeks
+	// before anyone notices.
+	const tgDocumentCap = 2 << 30
+	if len(body) >= tgDocumentCap {
+		return 0, fmt.Errorf("upload %q is %d bytes — at/over Telegram's 2 GiB document cap; if this is a metadata snapshot, prune the journal / shrink the DB (this failure repeats every cycle until addressed)", filename, len(body))
+	}
+
+	// ONE RandomID for every attempt of this logical upload. Telegram
+	// dedups sendMedia server-side by random_id, so a retry after a
+	// lost ack (engine torn down between the server committing the
+	// message and us reading the response) resolves to the SAME
+	// message instead of posting a duplicate copy of the blob.
+	rid, err := randomID()
+	if err != nil {
+		return 0, err
 	}
 
 	var lastErr error
@@ -317,7 +342,7 @@ func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, cap
 			case <-time.After(delay):
 			}
 		}
-		msgID, err := s.tryUploadOnce(ctx, peer, bytes.NewReader(body), filename, caption)
+		msgID, err := s.tryUploadOnce(ctx, peer, bytes.NewReader(body), filename, caption, rid)
 		if err == nil {
 			return msgID, nil
 		}
@@ -329,7 +354,7 @@ func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, cap
 	return 0, fmt.Errorf("upload failed after %d attempts: %w", uploadMaxAttempts, lastErr)
 }
 
-func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, r io.Reader, filename, caption string) (int, error) {
+func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, r io.Reader, filename, caption string, rid int64) (int, error) {
 	api, err := s.currentAPI()
 	if err != nil {
 		return 0, err
@@ -353,10 +378,6 @@ func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, 
 			&tg.DocumentAttributeFilename{FileName: filename},
 		},
 	}
-	rid, err := randomID()
-	if err != nil {
-		return 0, err
-	}
 	upd, err := api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
 		Peer:     peer,
 		Media:    media,
@@ -378,6 +399,14 @@ func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, 
 func isRetriableUploadErr(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
+	}
+	// A reconnect window (stall-watchdog swap, network blip) surfaces
+	// as ErrNotConnected while the manager builds the next session.
+	// That's the MOST retriable condition there is — failing fast here
+	// used to burn the entire retry ladder inside one 5-10s reconnect
+	// and lose the chunk when the writer had already been Released.
+	if errors.Is(err, ErrNotConnected) {
+		return true
 	}
 	s := err.Error()
 	for _, marker := range []string{
@@ -771,7 +800,34 @@ func (s *Session) refreshDocument(ctx context.Context, msgID int) (*tg.Document,
 		return nil, fmt.Errorf("message %d document is %T (expected *tg.Document)", msgID, media.Document)
 	}
 	s.docCache.Store(int64(msgID), &docCacheEntry{doc: doc, fetchedAt: time.Now()})
+	// Amortized expiry sweep: entries were TTL-checked on read but
+	// never removed, so a long-lived daemon reading millions of
+	// distinct chunks accumulated one dead *tg.Document per message
+	// forever. Sweep at most once per TTL window.
+	s.maybeSweepDocCache()
 	return doc, nil
+}
+
+// maybeSweepDocCache drops expired docCache entries, at most once per
+// docCacheTTL. Cheap enough to run inline on a cache store: the sweep
+// itself is O(live entries), and the once-per-TTL gate makes the
+// amortized cost per store negligible.
+func (s *Session) maybeSweepDocCache() {
+	now := time.Now()
+	last := s.docSweepAt.Load()
+	if last != nil && now.Sub(*last) < docCacheTTL {
+		return
+	}
+	stamp := now
+	if !s.docSweepAt.CompareAndSwap(last, &stamp) {
+		return // another goroutine took the sweep
+	}
+	s.docCache.Range(func(k, v any) bool {
+		if e, ok := v.(*docCacheEntry); ok && now.Sub(e.fetchedAt) >= docCacheTTL {
+			s.docCache.Delete(k)
+		}
+		return true
+	})
 }
 
 // invalidateDocument drops a cached entry for msgID. Called by the

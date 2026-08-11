@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -248,8 +249,9 @@ func cmdChannelList(ctx context.Context, cfg *config.Config) error {
 func cmdChannelSet(ctx context.Context, cfg *config.Config, args []string) error {
 	fs := flag.NewFlagSet("channel set", flag.ContinueOnError)
 	accessHash := fs.Int64("access-hash", 0, "channel access_hash (REQUIRED in bot mode — bots cannot enumerate dialogs to discover it)")
+	force := fs.Bool("force", false, "rebind even though this profile already has data on its current channel (DANGEROUS: reads break, writes/snapshots split across channels, and gc against the wrong channel deletes other data)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: telfs channel set [--access-hash N] <channel-id>")
+		fmt.Fprintln(os.Stderr, "usage: telfs channel set [--access-hash N] [--force] <channel-id>")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -262,6 +264,22 @@ func cmdChannelSet(ctx context.Context, cfg *config.Config, args []string) error
 	id, err := strconv.ParseInt(fs.Arg(0), 10, 64)
 	if err != nil {
 		return fmt.Errorf("channel set: invalid id %q: %w", fs.Arg(0), err)
+	}
+	// Rebind guard: once chunk_map references messages, they live in
+	// the CURRENT channel — every tg_message_id resolves against
+	// whatever channel is bound. Rebinding makes all reads dangle,
+	// splits new writes/snapshots across channels, and turns `gc`
+	// into a weapon against whatever the new channel holds.
+	if !*force && cfg.Channel.ID != 0 && cfg.Channel.ID != id {
+		if _, statErr := os.Stat(cfg.DBPath()); statErr == nil {
+			if mstore, merr := meta.Open(cfg.DBPath()); merr == nil {
+				has, rerr := mstore.HasAnyChunks(ctx)
+				mstore.Close()
+				if rerr == nil && has {
+					return fmt.Errorf("channel set: this profile has data in the currently-bound channel (id=%d) — rebinding would orphan all of it.\nIf you really mean it, re-run with --force. To use a new channel cleanly, create a new profile instead", cfg.Channel.ID)
+				}
+			}
+		}
 	}
 	if cfg.EffectiveAuthMode() == config.AuthModeBot && *accessHash == 0 {
 		return errors.New("channel set: --access-hash is required in bot mode (bots can't auto-discover it; copy it from a user-account profile or from another tool)")
@@ -348,7 +366,7 @@ func cmdInit(ctx context.Context, args []string) error {
 	}
 	defer metaStore.Close()
 
-	refs, err := metaStore.AllChunkMessageIDs(ctx)
+	hasChunks, err := metaStore.HasAnyChunks(ctx)
 	if err != nil {
 		return err
 	}
@@ -358,10 +376,10 @@ func cmdInit(ctx context.Context, args []string) error {
 		return err
 	}
 	if current != *chunkSize {
-		if len(refs) > 0 {
-			return fmt.Errorf("init: refuses to change chunk_size from %d to %d while %d chunk(s) exist; "+
+		if hasChunks {
+			return fmt.Errorf("init: refuses to change chunk_size from %d to %d while chunks exist; "+
 				"start a fresh TelFS instance with a new channel to use a different chunk size",
-				current, *chunkSize, len(refs))
+				current, *chunkSize)
 		}
 		if err := metaStore.SetChunkSize(ctx, *chunkSize); err != nil {
 			return err
@@ -382,10 +400,10 @@ func cmdInit(ctx context.Context, args []string) error {
 		if currentCodec == *compression {
 			fmt.Printf("compression already set to %q. No change.\n", currentCodec)
 		} else {
-			if len(refs) > 0 {
-				return fmt.Errorf("init: refuses to change compression from %q to %q while %d chunk(s) exist; "+
+			if hasChunks {
+				return fmt.Errorf("init: refuses to change compression from %q to %q while chunks exist; "+
 					"start a fresh TelFS instance with a new channel to use a different codec",
-					currentCodec, *compression, len(refs))
+					currentCodec, *compression)
 			}
 			if err := metaStore.SetCompressionCodec(ctx, *compression); err != nil {
 				return err
@@ -477,7 +495,23 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// has gaps. Truncate each such inode to its largest contiguous
 	// prefix BEFORE the FUSE server starts so user-visible reads
 	// don't EIO on the gap. Idempotent; cheap on a clean FS.
-	if repaired, err := metaStore.RepairPartialFiles(signalCtx); err != nil {
+	//
+	// Crucially, repair must know about wires still staged in the
+	// pending dir: recoverPending (later in startup) re-submits them
+	// and their chunk_map rows land shortly after mount. Repairing
+	// through such a gap would truncate away fully-recoverable data —
+	// which is exactly what the crash left behind.
+	stagedSet := make(map[int64]map[int32]bool)
+	if entries, err := chunk.ScanPending(filepath.Join(cfg.CachePath(), chunk.PendingDirName)); err == nil {
+		for _, e := range entries {
+			if stagedSet[e.Ino] == nil {
+				stagedSet[e.Ino] = make(map[int32]bool)
+			}
+			stagedSet[e.Ino][e.Idx] = true
+		}
+	}
+	stagedChecker := func(ino int64, idx int32) bool { return stagedSet[ino][idx] }
+	if repaired, err := metaStore.RepairPartialFiles(signalCtx, stagedChecker); err != nil {
 		fmt.Fprintln(os.Stderr, "[repair] warning:", err)
 	} else if len(repaired) > 0 {
 		fmt.Printf("Repaired %d partial file(s) from a prior crash:\n", len(repaired))
@@ -706,6 +740,14 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			TrashIno:  trashIno,
 		}
 
+		// Adaptive rate-limit controller. Created BEFORE the metrics
+		// HTTP server so the /telegram handler can include its
+		// snapshot in the JSON. The controller's Run goroutine is
+		// started later (after meta_kv pin values are loaded), so
+		// `adaptive.Snapshot()` returns zero-valued state until the
+		// poller calls SetPinned* the first time.
+		adaptive := tg.NewAdaptiveController(client.RateLimiter(), client.Tracker())
+
 		// Metrics endpoint (opt-in). Gauges are registered AFTER the
 		// pool & cache exist so they read the live values, not the
 		// nil pre-construction state. Counters are registered in
@@ -725,7 +767,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// upload isn't progressing — was Telegram acking? are
 			// we stuck in FLOOD_WAIT? did we get FILE_PART_MISSING?
 			// JSON only for now; rendering is the web's problem.
-			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore))
+			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore, adaptive))
 			// /cache reports the LRU disk cache's live size + cap +
 			// hit/miss counts so the /state web page can render the
 			// cache panel without having to know about the metrics
@@ -772,31 +814,63 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			close(journalDone)
 		}()
 
+		// Adaptive rate-limit controller. AIMD on the upload lane:
+		// halve on FLOOD_WAIT, additive-increase during quiet windows
+		// with active traffic. When the operator pins an explicit cap
+		// via the CLI/web, the controller respects the pin and resumes
+		// adaptive control when the pin is cleared. The poller below
+		// converts meta_kv values into pin updates rather than calling
+		// SetXPerMinute directly, so we have a single owner of the
+		// limiter's settings.
+		// (Constructed above at the metrics block so /telegram can
+		// see it; start the Run loop here.)
+		adaptiveCtx, stopAdaptive := context.WithCancel(signalCtx)
+		adaptiveDone := make(chan struct{})
+		go func() {
+			defer close(adaptiveDone)
+			adaptive.Run(adaptiveCtx)
+		}()
+
 		// Rate-limit poller: reads meta_kv every few seconds and
-		// applies the value to the gotd middleware so CLI/web edits
-		// propagate without a remount. Starts by applying whatever
-		// value is in meta_kv now — if zero/missing, the limiter
-		// stays unlimited (historical default).
+		// pushes the operator's pin state into the adaptive
+		// controller. n > 0 pins the lane; n == 0 (or missing)
+		// surrenders the lane to adaptive control. The poller
+		// runs at 5 s; the controller's AIMD ticks at 30 s — both
+		// see fresh state when the operator edits via CLI or web.
+		var lastPinUp, lastPinDown int = -1, -1
+		lastMode := ""
 		applyRateLimit := func() {
-			rl := client.RateLimiter()
+			// Mode first, so a pin update below lands under the right
+			// semantics (manual: 0 = unlimited; adaptive: 0 = AIMD).
+			if mode, err := metaStore.TGRateLimitMode(signalCtx); err == nil && mode != lastMode {
+				adaptive.SetManualMode(mode == "manual")
+				fmt.Fprintf(os.Stderr, "[ratelimit] mode: %s\n", mode)
+				lastMode = mode
+				lastPinUp = -1 // force re-apply of the pin under the new mode
+			}
 			if n, err := metaStore.TGRateLimitPerMin(signalCtx); err == nil {
-				if n != rl.UploadPerMinute() {
-					rl.SetUploadPerMinute(n)
-					if n == 0 {
-						fmt.Fprintln(os.Stderr, "[ratelimit] upload cleared (unlimited)")
-					} else {
-						fmt.Fprintf(os.Stderr, "[ratelimit] upload set to %d requests/min\n", n)
+				if n != lastPinUp {
+					adaptive.SetPinnedUpload(n)
+					switch {
+					case n > 0:
+						fmt.Fprintf(os.Stderr, "[ratelimit] upload pinned to %d req/min\n", n)
+					case lastMode == "manual":
+						fmt.Fprintln(os.Stderr, "[ratelimit] upload unlimited (manual mode)")
+					default:
+						fmt.Fprintln(os.Stderr, "[ratelimit] upload pin cleared — adaptive control resumed")
 					}
+					lastPinUp = n
 				}
 			}
 			if n, err := metaStore.TGDownloadRateLimitPerMin(signalCtx); err == nil {
-				if n != rl.DownloadPerMinute() {
-					rl.SetDownloadPerMinute(n)
+				if n != lastPinDown {
+					adaptive.SetPinnedDownload(n)
 					if n == 0 {
 						fmt.Fprintln(os.Stderr, "[ratelimit] download cleared (unlimited)")
 					} else {
-						fmt.Fprintf(os.Stderr, "[ratelimit] download set to %d requests/min\n", n)
+						fmt.Fprintf(os.Stderr, "[ratelimit] download pinned to %d req/min\n", n)
 					}
+					lastPinDown = n
 				}
 			}
 		}
@@ -863,11 +937,11 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		go recoverPending(signalCtx, pendingDir, packer, metaStore, pendingIndex)
 
 		// Stall watchdog: if there's chunk work pending but no
-		// upload completion has registered in metrics for a while,
-		// fire the SessionManager's Reconnect signal so a wedged
-		// MTProto connection auto-recovers without manual restart.
-		// Also logs the event so it's visible in stderr + /telegram.
-		go stallWatchdog(signalCtx, pool, mgr)
+		// successful RPC has registered for a while (and no server-
+		// mandated FLOOD_WAIT window is in effect), fire the
+		// SessionManager's Reconnect signal so a wedged MTProto
+		// connection auto-recovers without manual restart.
+		go stallWatchdog(signalCtx, pool, mgr, client.Tracker())
 
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		<-signalCtx.Done()
@@ -895,6 +969,8 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			<-snapDone
 			stopRateLimit()
 			<-rateLimitDone
+			stopAdaptive()
+			<-adaptiveDone
 			// Unmount + drain BEFORE the final snapshot. Two-step:
 			//   1. Unmount severs the kernel-to-userspace channel so
 			//      no new FUSE writes can fire; server.Wait drains
@@ -939,7 +1015,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// Orderly shutdown complete.
 		case <-time.After(30 * time.Second):
 			fmt.Fprintln(os.Stderr, "telfs: orderly shutdown timed out — forcing lazy unmount + exit")
-			_ = exec.Command("fusermount", "-uz", mountpoint).Run()
+			_ = exec.Command(fusermountBin(), "-uz", mountpoint).Run()
 			os.Exit(1)
 		}
 		return nil
@@ -956,27 +1032,34 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	return err
 }
 
-// stallWatchdog periodically samples chunks_uploaded + pending and
-// triggers a session reconnect when there's pending work but no
-// upload completion in the last stallThreshold. 90 seconds is the
-// threshold — short enough that a real stall is surfaced before
-// the user notices, long enough that a slow but progressing upload
-// doesn't trigger false alarms.
+// stallWatchdog periodically samples RPC-level progress and triggers a
+// session reconnect when there's pending chunk work but not a single
+// successful RPC in the last stallThreshold.
+//
+// Progress is measured at the RPC level (tracker.TotalOK), NOT at
+// whole-chunk completions: a 64 MiB tier chunk is ~128 rate-limited
+// SaveBigFilePart calls, so its first chunk completion can be minutes
+// away even on a healthy connection. The old chunk-level probe
+// declared that a stall, reconnected, threw away every uploaded part,
+// and looped — big files could never finish.
+//
+// A server-mandated FLOOD_WAIT quiet period (tracker.FloodWaitUntil)
+// also suppresses the watchdog: no RPC succeeds during the sleep by
+// design, and reconnecting doesn't shorten the server-side window —
+// it just burns quota re-uploading parts.
 //
 // On stall: logs to stderr (visible in daemon log) + calls
 // mgr.Reconnect (tears down the gotd session, re-establishes via
-// the SessionManager's run loop). Both pool.Pending count and
-// last_uploaded reset naturally as the new session lands the
-// retried wires. Cooldown between reconnects prevents a thrash
-// loop if the underlying network is genuinely down.
-func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionManager) {
+// the SessionManager's run loop). Cooldown between reconnects
+// prevents a thrash loop if the underlying network is genuinely down.
+func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionManager, tr *tg.Tracker) {
 	const sampleInterval = 30 * time.Second
 	const stallThreshold = 90 * time.Second
 	const reconnectCooldown = 2 * time.Minute
 	var (
-		lastUploaded   int64
-		stalledSince   time.Time
-		lastReconnect  time.Time
+		lastOK        int64
+		stalledSince  time.Time
+		lastReconnect time.Time
 	)
 	tick := time.NewTicker(sampleInterval)
 	defer tick.Stop()
@@ -986,14 +1069,19 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionM
 			return
 		case <-tick.C:
 			pending := pool.Pending.Total()
-			uploaded := metrics.ChunksUploaded.Load()
-			if pending == 0 || uploaded != lastUploaded {
-				// Idle (nothing pending) OR making progress.
+			snap := tr.Snapshot()
+			if pending == 0 || snap.TotalOK != lastOK {
+				// Idle (nothing pending) OR RPCs are landing.
 				stalledSince = time.Time{}
-				lastUploaded = uploaded
+				lastOK = snap.TotalOK
 				continue
 			}
-			// pending > 0, uploaded didn't move.
+			if time.Now().Before(snap.FloodWaitUntil) {
+				// Server-mandated quiet period — silence is expected.
+				stalledSince = time.Time{}
+				continue
+			}
+			// pending > 0, no successful RPC since last sample.
 			if stalledSince.IsZero() {
 				stalledSince = time.Now()
 				continue
@@ -1006,7 +1094,7 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionM
 				continue // already kicked the session recently
 			}
 			fmt.Fprintf(os.Stderr,
-				"[watchdog] STALL: %d chunks pending, no upload progress for %v. "+
+				"[watchdog] STALL: %d chunks pending, no successful RPC for %v. "+
 					"Forcing MTProto reconnect.\n",
 				pending, elapsed.Round(time.Second))
 			mgr.Reconnect()
@@ -1054,7 +1142,7 @@ func cacheJSONHandler(cache *chunk.Cache) http.HandlerFunc {
 // many journal entries are unposted. All of those are cheap to read
 // (one mutex grab + one ReadDir + one SELECT COUNT) on a request that
 // fires every 2 s.
-func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packer, pool *chunk.UploadPool, pendingDir string, mstore *meta.Store) http.HandlerFunc {
+func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packer, pool *chunk.UploadPool, pendingDir string, mstore *meta.Store, adaptive *tg.AdaptiveController) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snap := tr.Snapshot()
@@ -1124,6 +1212,25 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 		fmt.Fprintf(w, "    \"pool_cap\": %d,\n", poolCap)
 		fmt.Fprintf(w, "    \"journal_unposted\": %d\n", journalUnposted)
 		fmt.Fprintln(w, "  },")
+		// Adaptive rate-limiter state — pin status + current
+		// effective cap + last-adjustment metadata. Cheap to read
+		// (one mutex grab). Surfaced so the web tab can show
+		// "auto, 240 req/min, raised 2 min ago" instead of just a
+		// bare integer.
+		if adaptive != nil {
+			a := adaptive.Snapshot()
+			fmt.Fprintln(w, "  \"adaptive\": {")
+			fmt.Fprintf(w, "    \"manual\": %t,\n", a.Manual)
+			fmt.Fprintf(w, "    \"upload_pinned\": %t,\n", a.UploadPinned)
+			fmt.Fprintf(w, "    \"upload_effective\": %d,\n", a.UploadEffective)
+			fmt.Fprintf(w, "    \"upload_adaptive_level\": %d,\n", a.UploadAdaptiveLevel)
+			fmt.Fprintf(w, "    \"download_pinned\": %t,\n", a.DownloadPinned)
+			fmt.Fprintf(w, "    \"download_effective\": %d,\n", a.DownloadEffective)
+			fmt.Fprintf(w, "    \"last_flood_ago_sec\": %d,\n", a.LastFloodAgoSec)
+			fmt.Fprintf(w, "    \"last_adjust_ago_sec\": %d,\n", a.LastAdjustAgoSec)
+			fmt.Fprintf(w, "    \"last_action\": %q\n", a.LastAction)
+			fmt.Fprintln(w, "  },")
+		}
 		if !snap.LastSuccess.IsZero() {
 			fmt.Fprintf(w, "  \"last_success_unix\": %d,\n", snap.LastSuccess.Unix())
 			fmt.Fprintf(w, "  \"last_success_age_seconds\": %d,\n", int64(time.Since(snap.LastSuccess).Seconds()))
@@ -1168,6 +1275,21 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 // a clear remediation hint and continue — root-only setups can still
 // mount + unmount via direct syscalls, so this is a warning rather
 // than a hard failure.
+// fusermountBin resolves the FUSE unmount helper: fusermount3 (fuse3)
+// first, then legacy fusermount. Every emergency-unmount path must use
+// this — hardcoding "fusermount" made the shutdown watchdog and
+// force-exit paths silent no-ops on fuse3-only systems (fusermount3
+// ships without a fusermount symlink on e.g. Arch), leaving orphaned
+// kernel mounts exactly when the escape hatch mattered.
+func fusermountBin() string {
+	for _, name := range []string{"fusermount3", "fusermount"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return "fusermount" // last resort; Run() will surface the error
+}
+
 func checkFusermount() {
 	for _, name := range []string{"fusermount3", "fusermount"} {
 		if p, err := exec.LookPath(name); err == nil {
@@ -1200,6 +1322,44 @@ func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstor
 	}
 	if len(entries) == 0 {
 		return
+	}
+	// Duplicate-generation guard: a crash between staging a retry wire
+	// and deleting its predecessor can leave TWO files for one
+	// (ino, idx) slot (the filename embeds the plaintext size, which
+	// may differ between generations). Submitting both would race
+	// their chunk_map upserts in arbitrary order — keep only the
+	// newest by mtime.
+	type slot struct {
+		ino int64
+		idx int32
+	}
+	bySlot := make(map[slot]chunk.PendingEntry)
+	mtime := func(p string) int64 {
+		if info, err := os.Stat(p); err == nil {
+			return info.ModTime().UnixNano()
+		}
+		return 0
+	}
+	for _, e := range entries {
+		k := slot{e.Ino, e.Idx}
+		prev, dup := bySlot[k]
+		if !dup {
+			bySlot[k] = e
+			continue
+		}
+		if mtime(e.Path) >= mtime(prev.Path) {
+			_ = chunk.DeletePending(prev.Path)
+			bySlot[k] = e
+		} else {
+			_ = chunk.DeletePending(e.Path)
+		}
+	}
+	if len(bySlot) < len(entries) {
+		fmt.Printf("Dropped %d superseded pending wire generation(s)\n", len(entries)-len(bySlot))
+		entries = entries[:0]
+		for _, e := range bySlot {
+			entries = append(entries, e)
+		}
 	}
 	// First pass: drop entries whose inode no longer exists. Those
 	// are orphan wires from a chunk whose file was unlinked between
@@ -1267,10 +1427,15 @@ func armForceExit(mountpoint string) {
 	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-ch // first one is the orderly-shutdown trigger (already in flight)
-		<-ch // second one means "I mean it"
+		// armForceExit is installed AFTER signal.NotifyContext already
+		// consumed the FIRST signal (we're called post <-ctx.Done()),
+		// so the next delivery on this channel IS the user's second
+		// signal. An earlier version received twice here, which made
+		// the promised "second ^C forces exit" actually require a
+		// third.
+		<-ch
 		fmt.Fprintln(os.Stderr, "telfs: second signal — forcing lazy unmount + exit")
-		_ = exec.Command("fusermount", "-uz", mountpoint).Run()
+		_ = exec.Command(fusermountBin(), "-uz", mountpoint).Run()
 		os.Exit(130)
 	}()
 }
@@ -1287,12 +1452,29 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 	}
 	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
 		fmt.Println("Local DB missing — scanning channel for snapshot…")
-		latest, err := sess.FindLatestSnapshot(ctx, "", 50)
+		latest, err := sess.FindLatestSnapshot(ctx, "", 200)
 		if err != nil {
 			return err
 		}
 		if latest == nil {
-			fmt.Println("No snapshot in channel; starting with an empty DB.")
+			// "No snapshot found" must NOT silently become "start
+			// empty" when the channel plainly holds TelFS data: the
+			// mount would immediately post an empty-DB snapshot as
+			// the NEWEST snapshot, poisoning every future recovery,
+			// and a later `gc --yes` (empty chunk_map) would delete
+			// every chunk in the channel. Probe one page — any
+			// document there means data exists beyond our scan.
+			hasMessages := false
+			_ = sess.WalkChannelMessages(ctx, 1, func(cm tg.ChannelMessage) error {
+				hasMessages = true
+				return tg.ErrStopWalk
+			})
+			if hasMessages {
+				return fmt.Errorf("no snapshot found within the scan window, but the channel is NOT empty — refusing to start with an empty DB (that would poison recovery and make gc destructive).\n" +
+					"If the channel genuinely holds no TelFS state you want, pass --no-recover to force an empty start.\n" +
+					"Otherwise inspect the channel (telfs snapshot list) — the newest snapshot may be buried more than 20000 messages deep")
+			}
+			fmt.Println("Channel is empty; starting with an empty DB.")
 			return nil
 		}
 		fmt.Printf("Found snapshot msg=%d (ts %s, fs_uuid=%s)\n",
@@ -1321,7 +1503,19 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 		// recovered DB matches the pre-crash state to within the
 		// poster's interval (~5s) rather than the snapshot's (~5min).
 		if err := replayJournalSince(ctx, sess, cfg, latest.Caption.Seq, latest.Caption.FSUUID); err != nil {
-			fmt.Fprintf(os.Stderr, "[journal] replay failed: %v — proceeding with snapshot-only state\n", err)
+			// A failed replay is NOT safe to shrug off: silently
+			// proceeding with snapshot-only state hides the loss of
+			// every mutation since the snapshot. Remove the restored
+			// DB so the next attempt re-enters recovery cleanly, and
+			// tell the operator how to accept the degraded state on
+			// purpose if they want it.
+			_ = os.Remove(cfg.DBPath())
+			for _, sidecar := range []string{cfg.DBPath() + "-wal", cfg.DBPath() + "-shm"} {
+				_ = os.Remove(sidecar)
+			}
+			return fmt.Errorf("journal replay failed: %w\n"+
+				"The snapshot itself restored fine, but mutations made after it could not be replayed.\n"+
+				"Retry when the network is stable, or run `telfs snapshot restore` explicitly to accept snapshot-only state", err)
 		}
 		return nil
 	})
@@ -1330,8 +1524,15 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 // replayJournalSince loads journal-op messages from the channel whose
 // seq is strictly greater than sinceSeq (the snapshot's high-water
 // mark) and applies them in ascending order to the just-restored
-// local DB. Failures on individual ops are logged and skipped — the
-// snapshot is still authoritative, the journal just refines it.
+// local DB.
+//
+// A failed op ABORTS the replay (error out, caller discards the DB):
+// ops after a skipped one can apply to the wrong state — most
+// dangerously, a skipped `create` used to shift every subsequently
+// auto-assigned inode number, silently attaching sizes and hardlinks
+// to the wrong files. ReplayOp itself tolerates the benign idempotent
+// cases (already-created, already-deleted), so an error here is a
+// genuine inconsistency, not replay-over-existing-state noise.
 func replayJournalSince(ctx context.Context, sess *tg.Session, cfg *config.Config, sinceSeq int64, fsUUID string) error {
 	msgs, err := sess.ListJournalOps(ctx, fsUUID, sinceSeq, 0)
 	if err != nil {
@@ -1350,20 +1551,16 @@ func replayJournalSince(ctx context.Context, sess *tg.Session, cfg *config.Confi
 	}
 	defer mstore.Close()
 	fmt.Printf("Replaying %d journal op(s) since snapshot seq=%d…\n", len(msgs), sinceSeq)
-	applied := 0
 	for _, m := range msgs {
 		op, err := meta.DecodeOp(m.Caption.Payload)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[journal] decode op seq=%d: %v\n", m.Caption.Seq, err)
-			continue
+			return fmt.Errorf("decode journal op seq=%d: %w", m.Caption.Seq, err)
 		}
 		if err := mstore.ReplayOp(ctx, op); err != nil {
-			fmt.Fprintf(os.Stderr, "[journal] apply op seq=%d (%s): %v\n", m.Caption.Seq, op.Op, err)
-			continue
+			return fmt.Errorf("apply journal op seq=%d (%s): %w", m.Caption.Seq, op.Op, err)
 		}
-		applied++
 	}
-	fmt.Printf("Replayed %d/%d journal ops.\n", applied, len(msgs))
+	fmt.Printf("Replayed %d journal ops.\n", len(msgs))
 	return nil
 }
 
@@ -1453,6 +1650,7 @@ func cmdGC(ctx context.Context, args []string) error {
 	gcfs := flag.NewFlagSet("gc", flag.ContinueOnError)
 	doDelete := gcfs.Bool("yes", false, "actually delete the orphans (default is dry-run)")
 	pages := gcfs.Int("pages", 50, "max history pages to scan (each page = 100 messages)")
+	minAge := gcfs.Duration("min-age", time.Hour, "never touch messages younger than this — protects chunks whose chunk_map row hasn't landed yet")
 	if err := gcfs.Parse(args); err != nil {
 		return err
 	}
@@ -1464,6 +1662,15 @@ func cmdGC(ctx context.Context, args []string) error {
 	if err := cfg.RequireChannel(); err != nil {
 		return err
 	}
+	// HARD guard: gc against a live mount is a data-destruction race.
+	// The referenced-set below is a point-in-time read of chunk_map; a
+	// daemon actively uploading has a multi-minute window (packer
+	// batching, FLOOD_WAIT backoff) where a chunk's message exists on
+	// the channel but its chunk_map row doesn't. gc would classify it
+	// as an orphan and delete freshly-written data.
+	if isProfileMounted(cfg) {
+		return fmt.Errorf("gc: the profile's mount daemon is running — unmount first (gc scans chunk_map at a point in time and would delete chunks whose rows haven't landed yet)")
+	}
 	metaStore, err := meta.Open(cfg.DBPath())
 	if err != nil {
 		return err
@@ -1473,6 +1680,10 @@ func cmdGC(ctx context.Context, args []string) error {
 	referenced, err := metaStore.AllChunkMessageIDs(ctx)
 	if err != nil {
 		return err
+	}
+	localUUID, err := metaStore.FSUUID(ctx)
+	if err != nil {
+		return fmt.Errorf("gc: read fs_uuid: %w", err)
 	}
 	var currentSnap int
 	if v, err := metaStore.GetKV(ctx, snapshot.KVCurrentMsgID); err == nil {
@@ -1487,43 +1698,157 @@ func cmdGC(ctx context.Context, args []string) error {
 	}
 	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
 		var orphanChunks, staleSnaps []int
-		var totalChunks, totalSnaps int
+		var totalChunks, totalSnaps, tooYoung, foreignSnaps, keptRetention int
+		// Journal-message pruning state: a journal batch is garbage
+		// once EVERY retained snapshot already includes its ops (its
+		// last seq <= the oldest retained snapshot's seq) — no restore
+		// from any snapshot we keep could ever need to replay it.
+		type jnlMsg struct {
+			id      int
+			lastSeq int64
+			date    int
+		}
+		var journalMsgs []jnlMsg
+		minRetainedSeq := int64(-1) // min Seq across our retained snapshots
+		ageCutoff := time.Now().Add(-*minAge).Unix()
 		fmt.Printf("Scanning channel (up to %d pages of 100 messages)…\n", *pages)
 		if err := sess.WalkChannelMessages(ctx, *pages, func(cm tg.ChannelMessage) error {
 			switch cm.Kind {
+			case tg.KindJournal:
+				if cm.JnlCap.FSUUID != localUUID {
+					return nil
+				}
+				eff := cm.JnlCap.LastSeq
+				if eff == 0 {
+					eff = cm.JnlCap.Seq // legacy single-op caption
+				}
+				journalMsgs = append(journalMsgs, jnlMsg{id: cm.ID, lastSeq: eff, date: cm.Date})
 			case tg.KindChunk:
 				totalChunks++
-				if _, ref := referenced[int64(cm.ID)]; !ref {
-					orphanChunks = append(orphanChunks, cm.ID)
+				if _, ref := referenced[int64(cm.ID)]; ref {
+					return nil
 				}
+				// Age gate: a chunk message younger than --min-age may
+				// belong to an upload whose chunk_map row is still in
+				// flight (or a mount we failed to detect). Skip it —
+				// the next gc run reaps it once it's provably stale.
+				if cm.Date > 0 && int64(cm.Date) > ageCutoff {
+					tooYoung++
+					return nil
+				}
+				orphanChunks = append(orphanChunks, cm.ID)
 			case tg.KindSnapshot:
-				totalSnaps++
-				if cm.ID != currentSnap {
-					staleSnaps = append(staleSnaps, cm.ID)
+				// NEVER touch another TelFS instance's snapshots. A
+				// channel that hosts (or hosted) a second instance —
+				// e.g. after a channel rebind — is exactly when blind
+				// snapshot deletion destroys someone's recovery anchor.
+				if cm.SnapCap.FSUUID != "" && cm.SnapCap.FSUUID != localUUID {
+					foreignSnaps++
+					return nil
 				}
+				totalSnaps++
+				keepSnap := func(seq int64) {
+					if minRetainedSeq < 0 || seq < minRetainedSeq {
+						minRetainedSeq = seq
+					}
+				}
+				if cm.ID == currentSnap {
+					keepSnap(cm.SnapCap.Seq)
+					return nil
+				}
+				// Keep the retention window the snapshot manager
+				// maintains (newest-first walk ⇒ the first N we see
+				// are the newest N). Only snapshots beyond it are
+				// stale. The age gate applies here too.
+				if totalSnaps <= snapshot.DefaultRetention {
+					keptRetention++
+					keepSnap(cm.SnapCap.Seq)
+					return nil
+				}
+				if cm.Date > 0 && int64(cm.Date) > ageCutoff {
+					tooYoung++
+					keepSnap(cm.SnapCap.Seq)
+					return nil
+				}
+				staleSnaps = append(staleSnaps, cm.ID)
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
 
-		fmt.Printf("\nChunks  in channel: %d   referenced in chunk_map: %d   orphan: %d\n",
-			totalChunks, len(referenced), len(orphanChunks))
-		fmt.Printf("Snapshots in channel: %d   current msg_id: %d   stale: %d\n",
-			totalSnaps, currentSnap, len(staleSnaps))
-		if len(orphanChunks)+len(staleSnaps) == 0 {
+		// Journal batches wholly covered by EVERY retained snapshot are
+		// garbage: no restore from a snapshot we keep could ever need
+		// to replay them. If the scan saw no retained snapshot of ours,
+		// prune nothing — those messages may be the only recovery
+		// record there is.
+		var staleJournal []int
+		if minRetainedSeq >= 0 {
+			for _, jm := range journalMsgs {
+				if jm.lastSeq <= 0 || jm.lastSeq > minRetainedSeq {
+					continue
+				}
+				if jm.date > 0 && int64(jm.date) > ageCutoff {
+					tooYoung++
+					continue
+				}
+				staleJournal = append(staleJournal, jm.id)
+			}
+		}
+
+		// fs_uuid sanity: if the channel shows snapshots from a foreign
+		// instance and NONE from us, this profile is almost certainly
+		// pointed at the wrong channel (rebind mistake). Deleting
+		// "orphan" chunks here would destroy the other instance's data
+		// — every one of its chunks is unreferenced by OUR chunk_map.
+		if foreignSnaps > 0 && totalSnaps == 0 {
+			return fmt.Errorf("gc: channel contains snapshots from a different TelFS instance (fs_uuid mismatch, %d seen) and none from this one — refusing to delete anything; check the channel binding", foreignSnaps)
+		}
+
+		fmt.Printf("\nChunks  in channel: %d   referenced in chunk_map: %d   orphan: %d   (skipped %d younger than %s)\n",
+			totalChunks, len(referenced), len(orphanChunks), tooYoung, *minAge)
+		fmt.Printf("Snapshots in channel (ours): %d   current msg_id: %d   kept for retention: %d   stale: %d\n",
+			totalSnaps, currentSnap, keptRetention, len(staleSnaps))
+		fmt.Printf("Journal messages (ours): %d   superseded by retained snapshots: %d\n",
+			len(journalMsgs), len(staleJournal))
+		if foreignSnaps > 0 {
+			fmt.Printf("Snapshots from other TelFS instances (left untouched): %d\n", foreignSnaps)
+		}
+		if len(orphanChunks)+len(staleSnaps)+len(staleJournal) == 0 {
 			fmt.Println("\nNothing to do.")
 			return nil
 		}
 
-		toDelete := append([]int{}, orphanChunks...)
-		toDelete = append(toDelete, staleSnaps...)
 		fmt.Printf("\nOrphan chunk msg_ids:   %v\n", orphanChunks)
 		fmt.Printf("Stale snapshot msg_ids: %v\n", staleSnaps)
+		fmt.Printf("Stale journal msg_ids:  %v\n", staleJournal)
 
 		if !*doDelete {
 			fmt.Println("\nDry-run. Re-run with --yes to delete.")
 			return nil
+		}
+
+		// Re-check chunk_map immediately before deleting: the channel
+		// scan above can take minutes, and even with the mount guard
+		// (best-effort /proc/mounts) something may have committed rows
+		// in the meantime. One extra SELECT is cheap insurance.
+		refreshed, err := metaStore.AllChunkMessageIDs(ctx)
+		if err != nil {
+			return fmt.Errorf("gc: refresh referenced set: %w", err)
+		}
+		toDelete := make([]int, 0, len(orphanChunks)+len(staleSnaps)+len(staleJournal))
+		rescued := 0
+		for _, id := range orphanChunks {
+			if _, ref := refreshed[int64(id)]; ref {
+				rescued++
+				continue
+			}
+			toDelete = append(toDelete, id)
+		}
+		toDelete = append(toDelete, staleSnaps...)
+		toDelete = append(toDelete, staleJournal...)
+		if rescued > 0 {
+			fmt.Printf("Rescued %d chunk(s) that became referenced during the scan.\n", rescued)
 		}
 
 		// channels.deleteMessages accepts a batch; chunk into 100s.

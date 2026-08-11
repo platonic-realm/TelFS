@@ -186,11 +186,19 @@ func cmdTrashList(ctx context.Context, args []string) error {
 		if err != nil {
 			continue
 		}
+		// AGE is time-in-trash (from the name's trashed-at stamp — the
+		// value the TTL GC keys on), not the content's mtime. Entries
+		// without a stamp were hand-moved into /.trash; show their
+		// content mtime as a fallback since we can't know better.
+		trashedAt := time.Unix(inn.Mtime, 0)
+		if ts, ok := trash.TrashedAt(e.Name); ok {
+			trashedAt = ts
+		}
 		rows = append(rows, row{
 			Name:  e.Name,
 			Kind:  inn.Kind,
 			Size:  inn.Size,
-			Mtime: time.Unix(inn.Mtime, 0),
+			Mtime: trashedAt,
 		})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Mtime.Before(rows[j].Mtime) })

@@ -117,9 +117,22 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// middleware composes auth + recover + request logging.
+// middleware composes Host validation + auth + recover + request
+// logging.
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// DNS-rebinding defense: a malicious page can point its own
+		// hostname at 127.0.0.1 and become same-origin with this UI
+		// in the victim's browser — full read access plus a harvested
+		// CSRF token for destructive POSTs (delete tree, export
+		// session.json). Browsers always send the Host header of the
+		// URL they *think* they're talking to, so rejecting foreign
+		// hosts closes the hole. Non-browser clients (curl) send the
+		// dial address, which passes.
+		if !s.hostAllowed(r.Host) {
+			http.Error(w, "forbidden: unrecognized Host header (DNS rebinding?)", http.StatusForbidden)
+			return
+		}
 		// auth: Bearer token, when configured
 		if s.opts.Token != "" {
 			h := r.Header.Get("Authorization")
@@ -144,6 +157,35 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		next.ServeHTTP(ww, r)
 		s.opts.Logger.Printf("%s %s %d %s", r.Method, r.URL.Path, ww.status, time.Since(start))
 	})
+}
+
+// hostAllowed reports whether the request's Host header names an
+// address this server plausibly serves: loopback names/IPs, the
+// configured listen host, or (any-host binds like 0.0.0.0) any
+// literal IP — hostNAMES other than localhost are what rebinding
+// attacks use, so those stay rejected unless they match the listen
+// host exactly.
+func (s *Server) hostAllowed(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+		return true
+	}
+	if listenHost, _, err := net.SplitHostPort(s.opts.Listen); err == nil {
+		if strings.EqualFold(host, listenHost) {
+			return true
+		}
+	}
+	// A literal IP in Host means the client typed the address (or a
+	// reverse proxy passed it through) — an attacker-controlled DNS
+	// name can't produce it.
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return true
+	}
+	return false
 }
 
 type statusRecorder struct {

@@ -120,6 +120,17 @@ func Restore(ctx context.Context, gzipped []byte, dbPath string) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("restore: %w", err)
 	}
+	// Remove any stale WAL/SHM sidecars from the PREVIOUS database
+	// before the rename. This matters most in exactly the scenario
+	// restores happen — after a crash/SIGKILL, when a (possibly 100+
+	// MiB) -wal file is still sitting next to dbPath. If we leave it,
+	// the next sqlite Open "recovers" the OLD database's WAL frames
+	// into the freshly-restored file and silently corrupts it.
+	for _, sidecar := range []string{dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("restore: remove stale %s: %w", sidecar, err)
+		}
+	}
 	return os.Rename(tmpPath, dbPath)
 }
 

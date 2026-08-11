@@ -33,7 +33,14 @@ func (s *Store) AppendJournal(ctx context.Context, opJSON []byte) (int64, error)
 // Used by mutation methods so the journal row and the mutation it
 // describes commit atomically — if the tx rolls back, the journal row
 // disappears too. Returns the assigned seq.
-func appendJournalTx(ctx context.Context, tx *sql.Tx, op JournalOp) (int64, error) {
+//
+// During replay (ReplayOp) journaling is suppressed: recovery applies
+// ops that ALREADY live on the channel, and re-journaling them would
+// re-post every replayed op as fresh journal messages.
+func (s *Store) appendJournalTx(ctx context.Context, tx *sql.Tx, op JournalOp) (int64, error) {
+	if s.replaying.Load() {
+		return 0, nil
+	}
 	payload, err := json.Marshal(op)
 	if err != nil {
 		return 0, fmt.Errorf("marshal journal op: %w", err)

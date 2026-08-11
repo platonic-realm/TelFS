@@ -110,9 +110,14 @@ func TestGCOnceDropsExpired(t *testing.T) {
 	trashIno, _ := EnsureRootDir(ctx, s)
 
 	now := time.Now()
-	// Two entries directly placed under /.trash: one ancient, one fresh.
-	addFile(t, s, trashIno, "old.txt", 10, now.Add(-30*24*time.Hour).Unix())
-	addFile(t, s, trashIno, "new.txt", 10, now.Unix())
+	// Two properly-trashed entries (timestamped names, as MoveToTrash
+	// writes them): one trashed a month ago, one trashed just now. The
+	// CONTENT mtime of the fresh one is deliberately ancient — expiry
+	// must key on the trashed-at prefix, not the inode mtime.
+	oldName := uniqueName(now.Add(-30*24*time.Hour), "old.txt")
+	newName := uniqueName(now, "new.txt")
+	addFile(t, s, trashIno, oldName, 10, now.Unix())
+	addFile(t, s, trashIno, newName, 10, now.Add(-365*24*time.Hour).Unix())
 
 	removed, err := GCOnce(ctx, s, trashIno, 7*24*time.Hour)
 	if err != nil {
@@ -122,8 +127,8 @@ func TestGCOnceDropsExpired(t *testing.T) {
 		t.Errorf("GCOnce removed %d, want 1", removed)
 	}
 	ents, _ := s.Readdir(ctx, trashIno)
-	if len(ents) != 1 || ents[0].Name != "new.txt" {
-		t.Errorf("after GC: expected just new.txt, got %+v", ents)
+	if len(ents) != 1 || ents[0].Name != newName {
+		t.Errorf("after GC: expected just %q, got %+v", newName, ents)
 	}
 }
 
@@ -132,8 +137,8 @@ func TestGCOnceKeepsAllWhenTTLLong(t *testing.T) {
 	ctx := context.Background()
 	trashIno, _ := EnsureRootDir(ctx, s)
 
-	addFile(t, s, trashIno, "a.txt", 1, time.Now().Unix())
-	addFile(t, s, trashIno, "b.txt", 1, time.Now().Unix())
+	addFile(t, s, trashIno, uniqueName(time.Now(), "a.txt"), 1, time.Now().Unix())
+	addFile(t, s, trashIno, uniqueName(time.Now(), "b.txt"), 1, time.Now().Unix())
 
 	removed, err := GCOnce(ctx, s, trashIno, 365*24*time.Hour)
 	if err != nil {
@@ -141,6 +146,41 @@ func TestGCOnceKeepsAllWhenTTLLong(t *testing.T) {
 	}
 	if removed != 0 {
 		t.Errorf("expected 0 removed under long ttl, got %d", removed)
+	}
+}
+
+// TestGCOnceNeverDeletesUnstampedEntries: a file `mv`'d into /.trash by
+// hand has no trashed-at prefix — the GC must leave it alone no matter
+// how old its content mtime is.
+func TestGCOnceNeverDeletesUnstampedEntries(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	trashIno, _ := EnsureRootDir(ctx, s)
+
+	ancient := time.Now().Add(-10 * 365 * 24 * time.Hour).Unix()
+	addFile(t, s, trashIno, "manual.txt", 10, ancient)
+	addFile(t, s, trashIno, "2024-report.txt", 10, ancient) // numeric-ish prefix, still not a timestamp
+
+	removed, err := GCOnce(ctx, s, trashIno, time.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 {
+		t.Errorf("GC deleted %d hand-moved entries; want 0", removed)
+	}
+}
+
+func TestTrashedAt(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	name := uniqueName(now, "file.txt")
+	got, ok := TrashedAt(name)
+	if !ok || !got.Equal(now) {
+		t.Errorf("TrashedAt(%q) = %v, %v; want %v, true", name, got, ok, now)
+	}
+	for _, bad := range []string{"file.txt", "2024-report.txt", "-x", "", "99999999999999999999999999-x"} {
+		if _, ok := TrashedAt(bad); ok {
+			t.Errorf("TrashedAt(%q) unexpectedly parsed", bad)
+		}
 	}
 }
 

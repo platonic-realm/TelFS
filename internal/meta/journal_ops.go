@@ -18,7 +18,7 @@ package meta
 //   - create: CreateChild — creates an inode + dirent in one tx
 //   - link:   Link        — adds a hardlink dirent, bumps nlink
 //   - unlink: Unlink      — removes a dirent (and the inode if
-//                            nlink hits 0; chunks/xattrs cascade)
+//     nlink hits 0; chunks/xattrs cascade)
 //   - rename: Rename      — moves a dirent
 //   - setsize: SetSize    — explicit truncate (size change)
 //
@@ -44,6 +44,14 @@ type JournalOp struct {
 	Size          int64  `json:"size,omitempty"`
 	Mtime         int64  `json:"mtime,omitempty"`
 	SymlinkTarget string `json:"symlink_target,omitempty"`
+	// ChunkSize travels with `create` so a replayed inode keeps its
+	// tier — without it, recovery recreated every post-snapshot file
+	// at the 4 MiB default and the (ino, idx) → offset arithmetic of
+	// any tier-promoted file silently broke.
+	ChunkSize int64 `json:"chunk_size,omitempty"`
+	// Sparse travels with `create` and `setsparse` so replayed sparse
+	// files keep hole-reads-as-zeros semantics instead of EIO.
+	Sparse bool `json:"sparse,omitempty"`
 }
 
 // Journal op type tags. Kept short to minimize per-op payload size on
@@ -54,4 +62,5 @@ const (
 	OpUnlink      = "unlink"
 	OpRename      = "rename"
 	OpSetSize     = "setsize"
+	OpSetSparse   = "setsparse"
 )

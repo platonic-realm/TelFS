@@ -137,7 +137,10 @@
         {{else}}<span class="ok">ok</span>{{end}}
       </td>
       <td>{{if .InFlight}}—{{else}}{{formatDuration .DurationMS}}{{end}}</td>
-      <td>{{humanBytes .Bytes}}</td>
+      {{/* An in-flight download only knows its ~80 B request encoding;
+           the payload size arrives with the response. Show — until
+           then instead of a misleading tiny number. */}}
+      <td>{{if .InFlight}}—{{else}}{{humanBytes .Bytes}}{{end}}</td>
       <td>{{if gt .FloodWaitSeconds 0}}{{.FloodWaitSeconds}}s{{else}}—{{end}}</td>
     </tr>
   {{else}}

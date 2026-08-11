@@ -174,11 +174,21 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("decrypt snapshot: %w", err)
 		}
-		// Backup the existing DB before overwriting.
+		// Backup the existing DB before overwriting. Move the WAL/SHM
+		// sidecars along with the main file — a WAL left behind would
+		// (a) make the backup incomplete (its newest frames live in
+		// the WAL) and (b) get replayed by sqlite into the RESTORED
+		// database on next open, silently corrupting it. Restore()
+		// also defensively deletes leftover sidecars.
 		if _, err := os.Stat(cfg.DBPath()); err == nil {
 			backup := fmt.Sprintf("%s.pre-restore-%d", cfg.DBPath(), time.Now().Unix())
 			if err := os.Rename(cfg.DBPath(), backup); err != nil {
 				return fmt.Errorf("backup %s → %s: %w", cfg.DBPath(), backup, err)
+			}
+			for _, suffix := range []string{"-wal", "-shm"} {
+				if err := os.Rename(cfg.DBPath()+suffix, backup+suffix); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("backup sidecar %s: %w", cfg.DBPath()+suffix, err)
+				}
 			}
 			fmt.Printf("Saved current DB to %s\n", backup)
 		}

@@ -44,13 +44,20 @@ func createInode(ctx context.Context, e execQuerier, in Inode) (int64, error) {
 		chunkSize = nil
 	}
 	res, err := e.ExecContext(ctx,
-		`INSERT INTO inodes(kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target, chunk_size)
-		 VALUES (?,?,?,?,?,?,?,?,?,COALESCE(?,4194304))`,
-		string(in.Kind), in.Mode, in.UID, in.GID, in.Size, in.Nlink, in.Mtime, in.Ctime, st, chunkSize)
+		`INSERT INTO inodes(kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target, chunk_size, sparse)
+		 VALUES (?,?,?,?,?,?,?,?,?,COALESCE(?,4194304),?)`,
+		string(in.Kind), in.Mode, in.UID, in.GID, in.Size, in.Nlink, in.Mtime, in.Ctime, st, chunkSize, boolToInt(in.Sparse))
 	if err != nil {
 		return 0, fmt.Errorf("insert inode: %w", err)
 	}
 	return res.LastInsertId()
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // GetInode returns the inode row for ino, or ErrNotFound.
@@ -62,10 +69,11 @@ func getInode(ctx context.Context, e execQuerier, ino int64) (Inode, error) {
 	var in Inode
 	var kind string
 	var target sql.NullString
+	var sparse int
 	err := e.QueryRowContext(ctx,
-		`SELECT ino, kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target, chunk_size
+		`SELECT ino, kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target, chunk_size, sparse
 		   FROM inodes WHERE ino = ?`, ino).
-		Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target, &in.ChunkSize)
+		Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target, &in.ChunkSize, &sparse)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Inode{}, ErrNotFound
 	}
@@ -74,7 +82,33 @@ func getInode(ctx context.Context, e execQuerier, ino int64) (Inode, error) {
 	}
 	in.Kind = Kind(kind)
 	in.SymlinkTarget = target.String
+	in.Sparse = sparse != 0
 	return in, nil
+}
+
+// SetInodeSparse marks ino as containing holes. One-way: nothing ever
+// clears the flag (a file that once had holes keeps zero-fill read
+// semantics for its missing chunks; that's always safe, it just
+// forgoes data-lost detection for that file). Journaled so recovery
+// preserves hole semantics for files that went sparse after the last
+// snapshot.
+func (s *Store) SetInodeSparse(ctx context.Context, ino int64) error {
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE inodes SET sparse = 1 WHERE ino = ?`, ino)
+		if err != nil {
+			return fmt.Errorf("set sparse %d: %w", ino, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		_, err = s.appendJournalTx(ctx, tx, JournalOp{Op: OpSetSparse, Ino: ino, Sparse: true})
+		return err
+	})
 }
 
 // SetInodeChunkSize updates the per-inode chunk size. Called by the
@@ -159,7 +193,7 @@ func (s *Store) SetSize(ctx context.Context, ino int64, size int64) error {
 		return err
 	}
 	return s.WithTx(ctx, func(tx *sql.Tx) error {
-		_, err := appendJournalTx(ctx, tx, JournalOp{
+		_, err := s.appendJournalTx(ctx, tx, JournalOp{
 			Op: OpSetSize, Ino: ino, Size: size, Mtime: now,
 		})
 		return err

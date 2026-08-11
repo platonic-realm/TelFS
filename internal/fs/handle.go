@@ -43,20 +43,25 @@ type fileHandle struct {
 	writer *chunk.Writer
 
 	// metaCached holds the inode's invariant-during-read fields:
-	// chunkSize (per-inode tier, set at first dispatch) and size
-	// (file length at Open time). Reader.ReadAt fetches both per
-	// call by default; populating them on the handle skips that
-	// SQL row when we can guarantee they're current.
+	// chunkSize (per-inode tier, set at first dispatch), size (file
+	// length at Open time), and the sparse flag. Reader.ReadAt
+	// fetches these per call by default; populating them on the
+	// handle skips that SQL row when we can guarantee they're
+	// current.
 	//
-	// dirty trips on the first Write through this handle. While
-	// dirty, the cached size is potentially stale (the writer may
-	// have extended the file), so Read falls back to the
-	// GetInode-per-call path. Pure-read workloads (cp, md5sum,
-	// ffmpeg streaming, gcc reads) leave dirty=false and get the
-	// SQL row eliminated.
+	// dirty trips on the first Write (or truncate) through this
+	// handle. While dirty, the cached values are potentially stale
+	// (the writer may have extended the file or marked it sparse),
+	// so Read falls back to the GetInode-per-call path. Pure-read
+	// workloads (cp, md5sum, ffmpeg streaming, gcc reads) leave
+	// dirty=false and get the SQL row eliminated.
+	//
+	// dirty is atomic because Read intentionally does NOT take h.mu
+	// (reads must parallelize), while Write/Setattr set it under mu.
 	chunkSize int64
 	size      int64
-	dirty     bool
+	sparse    bool
+	dirty     atomic.Bool
 
 	// lastReadEnd is the byte offset immediately past the previous
 	// Read's range, atomically updated. The next Read compares its
@@ -108,21 +113,22 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 		n   int
 		err error
 	)
+	clean := h.chunkSize > 0 && !h.dirty.Load()
 	switch {
-	case seek && h.chunkSize > 0 && !h.dirty:
+	case seek && clean:
 		// Seek path: cancel the stale prefetches from the old
 		// position and fire a LARGER prefetch burst at the new
 		// position. Critical for video players — mpv after a seek
 		// reads 5-15 chunks looking for the next keyframe + filling
 		// its buffer; without a wide prefetch each one pays the
 		// full per-RPC latency serially.
-		n, err = h.node.backend.Reader.ReadAtKnownSeek(ctx, h.node.ino, dest, off, h.chunkSize, h.size)
+		n, err = h.node.backend.Reader.ReadAtKnownSeek(ctx, h.node.ino, dest, off, h.chunkSize, h.size, h.sparse)
 	case seek:
 		// Dirty / cold handle on a seek: same idea but no chunkSize
 		// hint to pass — Reader does its own GetInode.
-		n, err = h.node.backend.Reader.ReadAtKnownSeek(ctx, h.node.ino, dest, off, 0, 0)
-	case h.chunkSize > 0 && !h.dirty:
-		n, err = h.node.backend.Reader.ReadAtKnown(ctx, h.node.ino, dest, off, h.chunkSize, h.size)
+		n, err = h.node.backend.Reader.ReadAtKnownSeek(ctx, h.node.ino, dest, off, 0, 0, false)
+	case clean:
+		n, err = h.node.backend.Reader.ReadAtKnown(ctx, h.node.ino, dest, off, h.chunkSize, h.size, h.sparse)
 	default:
 		n, err = h.node.backend.Reader.ReadAt(ctx, h.node.ino, dest, off)
 	}
@@ -150,8 +156,15 @@ func (h *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32,
 	// Trip the dirty flag so subsequent Reads on this handle fall
 	// back to the GetInode-per-call path (the cached size is
 	// potentially stale after a write extended the file).
-	h.dirty = true
+	h.dirty.Store(true)
 	return uint32(n), 0
+}
+
+// markDirty invalidates the handle's cached inode hints (size,
+// chunkSize, sparse) — subsequent Reads re-fetch the inode. Called by
+// Setattr after a truncate through this handle.
+func (h *fileHandle) markDirty() {
+	h.dirty.Store(true)
 }
 
 // Flush uploads all dirty chunks and updates chunk_map. FUSE invokes

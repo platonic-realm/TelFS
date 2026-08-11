@@ -80,6 +80,43 @@ func uniqueName(now time.Time, original string) string {
 	return fmt.Sprintf("%d-%s", now.UnixNano(), original)
 }
 
+// TrashedAt recovers the trashed-at time from an entry name written by
+// uniqueName. Returns (zero, false) when the name doesn't carry a
+// plausible <unix-nano>- prefix — i.e. the entry was `mv`'d into
+// /.trash by hand rather than routed through the unlink intercept.
+//
+// The TTL GC keys off THIS value, not the inode's mtime: mtime is the
+// content's modification time, and expiring on it would delete any
+// old-but-just-trashed file on the first GC tick — the opposite of a
+// safety net.
+func TrashedAt(name string) (time.Time, bool) {
+	dash := -1
+	for i := 0; i < len(name); i++ {
+		if name[i] == '-' {
+			dash = i
+			break
+		}
+		if name[i] < '0' || name[i] > '9' {
+			return time.Time{}, false
+		}
+	}
+	if dash <= 0 {
+		return time.Time{}, false
+	}
+	var nanos int64
+	if _, err := fmt.Sscanf(name[:dash], "%d", &nanos); err != nil {
+		return time.Time{}, false
+	}
+	ts := time.Unix(0, nanos)
+	// Plausibility window: rejects short numeric prefixes that are part
+	// of a real filename (e.g. "2024-report.txt" parses as 2024ns —
+	// year 1970) and absurd future values.
+	if ts.Year() < 2020 || ts.After(time.Now().Add(24*time.Hour)) {
+		return time.Time{}, false
+	}
+	return ts, true
+}
+
 // MoveToTrash relocates the dirent (parentIno, name) under /.trash
 // with a uniquified name. The inode itself is not touched — only the
 // dirent is moved — so file content and chunks are untouched and
@@ -91,8 +128,14 @@ func MoveToTrash(ctx context.Context, mstore *meta.Store, trashIno, parentIno in
 	return mstore.Rename(ctx, parentIno, name, trashIno, uniqueName(time.Now(), name))
 }
 
-// GCOnce walks /.trash and unlinks entries whose mtime is more than
-// `ttl` in the past. Returns the count of entries removed.
+// GCOnce walks /.trash and unlinks entries that were TRASHED more than
+// `ttl` ago (per the <unix-nano>- prefix MoveToTrash stamps into the
+// entry name). Returns the count of entries removed.
+//
+// Entries without a parseable trashed-at prefix (someone `mv`'d a file
+// into /.trash by hand) are never auto-deleted — we have no idea when
+// they arrived, and guessing from content mtime deletes archival files
+// instantly. `telfs trash empty` remains the explicit way out.
 //
 // Behaviour for entry kinds:
 //   - regular files: Meta.Unlink decrements nlink; chunks delete
@@ -108,14 +151,15 @@ func GCOnce(ctx context.Context, mstore *meta.Store, trashIno int64, ttl time.Du
 	if err != nil {
 		return 0, fmt.Errorf("readdir /.trash: %w", err)
 	}
-	cutoff := time.Now().Add(-ttl).Unix()
+	cutoff := time.Now().Add(-ttl)
 	removed := 0
 	for _, ent := range entries {
-		in, err := mstore.GetInode(ctx, ent.ChildIno)
-		if err != nil {
+		trashedAt, ok := TrashedAt(ent.Name)
+		if !ok || trashedAt.After(cutoff) {
 			continue
 		}
-		if in.Mtime > cutoff {
+		in, err := mstore.GetInode(ctx, ent.ChildIno)
+		if err != nil {
 			continue
 		}
 		if in.Kind == meta.KindDir {

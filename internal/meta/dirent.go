@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrExists is returned when a dirent already exists at the target name.
@@ -33,12 +34,13 @@ func lookup(ctx context.Context, e execQuerier, parent int64, name string) (Inod
 	var in Inode
 	var kind string
 	var target sql.NullString
+	var sparse int
 	err := e.QueryRowContext(ctx,
-		`SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.nlink, i.mtime, i.ctime, i.symlink_target, i.chunk_size
+		`SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.nlink, i.mtime, i.ctime, i.symlink_target, i.chunk_size, i.sparse
 		   FROM dirents d JOIN inodes i ON i.ino = d.child_ino
 		  WHERE d.parent_ino = ? AND d.name = ?`,
 		parent, name,
-	).Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target, &in.ChunkSize)
+	).Scan(&in.Ino, &kind, &in.Mode, &in.UID, &in.GID, &in.Size, &in.Nlink, &in.Mtime, &in.Ctime, &target, &in.ChunkSize, &sparse)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Inode{}, ErrNotFound
 	}
@@ -47,6 +49,7 @@ func lookup(ctx context.Context, e execQuerier, parent int64, name string) (Inod
 	}
 	in.Kind = Kind(kind)
 	in.SymlinkTarget = target.String
+	in.Sparse = sparse != 0
 	return in, nil
 }
 
@@ -112,6 +115,20 @@ func (s *Store) ReaddirInfo(ctx context.Context, parent int64) ([]DirentInfo, er
 // with ErrExists if the name is already taken; ErrNotFound if parent is
 // missing. The new inode starts at nlink=1.
 func (s *Store) CreateChild(ctx context.Context, parent int64, name string, child Inode) (int64, error) {
+	// Normalize defaults HERE (not just inside createInode) so the
+	// journal op below records the effective values — a replayed
+	// create must reproduce this inode exactly (mtime, chunk tier,
+	// sparse flag), not re-derive defaults at replay time.
+	now := time.Now().Unix()
+	if child.Mtime == 0 {
+		child.Mtime = now
+	}
+	if child.Ctime == 0 {
+		child.Ctime = now
+	}
+	if child.ChunkSize <= 0 {
+		child.ChunkSize = DefaultChunkSize
+	}
 	var newIno int64
 	err := s.WithTx(ctx, func(tx *sql.Tx) error {
 		// Verify parent exists and is a directory.
@@ -137,10 +154,11 @@ func (s *Store) CreateChild(ctx context.Context, parent int64, name string, chil
 			parent, name, ino); err != nil {
 			return fmt.Errorf("insert dirent: %w", err)
 		}
-		if _, err := appendJournalTx(ctx, tx, JournalOp{
+		if _, err := s.appendJournalTx(ctx, tx, JournalOp{
 			Op: OpCreateChild, Parent: parent, Name: name, Ino: ino,
 			Kind: child.Kind, Mode: child.Mode, UID: child.UID, GID: child.GID,
 			Mtime: child.Mtime, SymlinkTarget: child.SymlinkTarget,
+			ChunkSize: child.ChunkSize, Sparse: child.Sparse,
 		}); err != nil {
 			return err
 		}
@@ -148,6 +166,60 @@ func (s *Store) CreateChild(ctx context.Context, parent int64, name string, chil
 		return nil
 	})
 	return newIno, err
+}
+
+// createChildAt is the replay-only variant of CreateChild: it inserts
+// the inode with an EXPLICIT ino instead of letting AUTOINCREMENT
+// assign one. Replay determinism depends on this — if a create is
+// applied with a different ino than the journal recorded, every later
+// op that references inodes by number (setsize, link, setsparse)
+// lands on the wrong file. Returns ErrExists when either the dirent
+// name or the ino is already taken (idempotent-replay signal).
+func (s *Store) createChildAt(ctx context.Context, parent int64, name string, child Inode, ino int64) error {
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		pin, err := getInode(ctx, tx, parent)
+		if err != nil {
+			return err
+		}
+		if pin.Kind != KindDir {
+			return ErrNotDir
+		}
+		if _, err := lookup(ctx, tx, parent, name); err == nil {
+			return ErrExists
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		if _, err := getInode(ctx, tx, ino); err == nil {
+			return ErrExists
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		var st any
+		if child.SymlinkTarget != "" {
+			st = child.SymlinkTarget
+		}
+		cs := child.ChunkSize
+		if cs <= 0 {
+			cs = DefaultChunkSize
+		}
+		nlink := child.Nlink
+		if nlink == 0 {
+			nlink = 1
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO inodes(ino, kind, mode, uid, gid, size, nlink, mtime, ctime, symlink_target, chunk_size, sparse)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			ino, string(child.Kind), child.Mode, child.UID, child.GID, child.Size, nlink,
+			child.Mtime, child.Ctime, st, cs, boolToInt(child.Sparse)); err != nil {
+			return fmt.Errorf("insert inode at %d: %w", ino, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO dirents(parent_ino, name, child_ino) VALUES (?,?,?)`,
+			parent, name, ino); err != nil {
+			return fmt.Errorf("insert dirent: %w", err)
+		}
+		return nil
+	})
 }
 
 // Link adds a new dirent (parent, name) → target and increments target's
@@ -184,7 +256,7 @@ func (s *Store) Link(ctx context.Context, parent int64, name string, target int6
 			`UPDATE inodes SET nlink = nlink + 1 WHERE ino = ?`, target); err != nil {
 			return fmt.Errorf("bump nlink: %w", err)
 		}
-		if _, err := appendJournalTx(ctx, tx, JournalOp{
+		if _, err := s.appendJournalTx(ctx, tx, JournalOp{
 			Op: OpLink, Parent: parent, Name: name, Target: target,
 		}); err != nil {
 			return err
@@ -209,7 +281,7 @@ func (s *Store) Unlink(ctx context.Context, parent int64, name string) error {
 		if deleted {
 			deletedIno = ino
 		}
-		_, err = appendJournalTx(ctx, tx, JournalOp{
+		_, err = s.appendJournalTx(ctx, tx, JournalOp{
 			Op: OpUnlink, Parent: parent, Name: name,
 		})
 		return err
@@ -344,7 +416,7 @@ func (s *Store) Rename(ctx context.Context, oldParent int64, oldName string, new
 			newParent, newName, oldParent, oldName); err != nil {
 			return fmt.Errorf("move dirent: %w", err)
 		}
-		if _, err := appendJournalTx(ctx, tx, JournalOp{
+		if _, err := s.appendJournalTx(ctx, tx, JournalOp{
 			Op: OpRename, Parent: oldParent, Name: oldName,
 			NewParent: newParent, NewName: newName,
 		}); err != nil {

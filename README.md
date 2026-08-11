@@ -12,8 +12,7 @@ with the right credentials and passphrase can mount and read every
 byte. Pure-Go, single static binary, optional Alpine container.
 
 ```sh
-telfs profile create main
-telfs profile use main
+telfs profile create main && telfs profile use main
 telfs login                                  # phone + code + 2FA
 telfs channel set <id>
 telfs encrypt init                           # optional: AES-256-GCM
@@ -27,133 +26,97 @@ End-to-end verified on a real Telegram account + private channel:
 
 | Capability | Status |
 |---|---|
-| Login — phone + code + 2FA (user account) | ✓ |
-| Login — bot token via `auth.ImportBotAuthorization` | ✓ |
-| Read/write mount (POSIX surface incl. hardlinks, symlinks, xattrs) | ✓ |
-| Multi-chunk files — no fixed per-file ceiling (chunk count × chunk size) | ✓ |
-| Cross-chunk-boundary reads/writes | ✓ verified by integration test |
-| Cold-mount recovery from channel snapshot | ✓ |
-| Read-only mode (`--readonly`) | ✓ |
-| FLOOD_WAIT rate-limit handling | ✓ (gotd middleware) |
-| Orphan chunk + stale snapshot GC | ✓ (`telfs gc`) |
-| Channel-side integrity check | ✓ (`telfs fsck`) |
-| One-screen profile / FS / channel status | ✓ (`telfs status`) |
-| Local invariant lint (config perms, KV, dedup ratio, orphan cache) | ✓ (`telfs doctor`) |
-| AES-256-GCM chunk encryption, Argon2id KDF | ✓ |
-| AES-256-GCM snapshot envelope (metadata-at-rest) | ✓ |
-| Persistent LRU chunk cache across daemon restarts | ✓ |
+| Login — phone + code + 2FA (user) or bot token (MTProto, not the HTTP Bot API) | ✓ |
+| Read/write mount with full POSIX: files, dirs, hardlinks, symlinks, xattrs | ✓ |
+| Multi-chunk files (no per-file ceiling), cross-chunk-boundary read/write | ✓ |
+| Cold-mount recovery from channel snapshot, journal replay (≤5 s loss) | ✓ |
+| `--readonly` mount, FLOOD_WAIT handling, persistent LRU chunk cache | ✓ |
+| `telfs gc` — orphan chunks + stale snapshots | ✓ |
+| `telfs fsck` — channel-side integrity check | ✓ |
+| `telfs status` / `telfs doctor` — one-screen state / local invariant lint | ✓ |
+| AES-256-GCM chunks **and** snapshot metadata (TFSE envelope), Argon2id KDF | ✓ |
+| Passphrase rotation (KEK-wrapped DEK), opt-in convergent mode for encrypted dedup | ✓ |
 | Profiles + portable tar.gz export/import bundles | ✓ |
-| Web management UI (dashboard, login, mount, browser) | ✓ (`telfs web`) |
-| Trash safety-net — `rm` reroutes to `/.trash`, TTL GC | ✓ (`telfs trash`) |
-| Snapshot history + point-in-time restore (last 12 by default) | ✓ (`telfs snapshot`) |
-| Content-addressed chunk dedup (plaintext + convergent-encrypted FSes) | ✓ (SHA-256 index; `--convergent` opt-in for encrypted) |
+| Web management UI: dashboard, login wizard, mount supervisor, file browser | ✓ (`telfs web`) |
+| `telfs trash` — `rm` reroutes to `/.trash`, TTL GC | ✓ |
+| Snapshot history + point-in-time restore (last 12 by default) | ✓ |
+| Content-addressed chunk dedup (plaintext + convergent-encrypted FSes) | ✓ |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
 ## Bot vs user auth
 
-TelFS supports both, and the data plane is identical: every chunk goes
-over MTProto via gotd, capped at 2 GB per upload, regardless of which
-identity you authenticate as. The HTTP Bot API is never used (so its
-~50 MB per-file ceiling never applies). What changes between modes is
-only the dialog/listing surface:
+Both go over MTProto via gotd (2 GB per upload either way; the HTTP
+Bot API and its ~50 MB ceiling are never used). The data plane is
+identical; only the dialog/listing surface differs:
 
-| Mode | Setup | Behavioral differences |
-|---|---|---|
-| **User** (default) | `telfs login` → phone + code + 2FA | Full dialog access — `channel list` enumerates your channels and `channel set <id>` auto-discovers the access_hash. |
-| **Bot** | `telfs login --bot <token>` (token from @BotFather) | Bots cannot enumerate dialogs, so `channel set` requires `--access-hash` explicitly. The bot must be added to the target channel as an administrator before it can post. |
+- **User** — `telfs login` (phone + code + 2FA). `channel list`
+  enumerates your channels and `channel set <id>` auto-discovers the
+  access_hash.
+- **Bot** — `telfs login --bot <token>` (from @BotFather; add the bot
+  as an admin to the target channel). Bots cannot enumerate dialogs,
+  so `channel set` requires `--access-hash` explicitly.
 
-Bot-mode setup:
+Bot-mode setup (after a user-account TelFS has printed the channel's
+`access_hash` via `telfs channel info`):
 
 ```sh
-# 1. Get the channel access_hash from a user-account TelFS first
-#    (or any tool you prefer):
-TELFS_PROFILE=user-acct telfs channel info       # prints access_hash
-
-# 2. Create a bot via @BotFather → get a token; add the bot to your
-#    private channel as an ADMIN.
-
-# 3. New profile + bot login + manual channel binding:
 telfs profile create my-bot
 TELFS_PROFILE=my-bot telfs login --bot 123456:ABCDEF…
 TELFS_PROFILE=my-bot telfs channel set --access-hash <H> <channel-id>
 TELFS_PROFILE=my-bot telfs mount ~/External
 ```
 
-Everything past auth — chunker, encryption, snapshots, GC, trash — is
-mode-agnostic.
-
 ## Install
 
-Three options:
-
 ```sh
-# 1. Pre-built static binary from a GitHub Release (no toolchain needed):
+# Pre-built static binary (no toolchain):
 curl -L https://github.com/platonic-realm/TelFS/releases/latest/download/telfs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m).tar.gz | tar xz
 sudo install telfs-*/telfs /usr/local/bin/telfs
 
-# 2. Build from source (requires Go 1.22+):
-git clone https://github.com/platonic-realm/TelFS.git && cd TelFS
-make build                                       # → bin/telfs
+# Build from source (Go 1.22+):
+git clone https://github.com/platonic-realm/TelFS.git && cd TelFS && make build
 
-# 3. Alpine container (headless / NAS — see Deployment below):
+# Container (headless / NAS — see Deployment):
 docker pull ghcr.io/platonic-realm/telfs:latest
 ```
 
-All three carry the same static `telfs` binary and need `fusermount`
-(`fuse3`/`fuse2` packages) in `$PATH` at unmount time. Get a Telegram
-API ID + hash from <https://my.telegram.org/apps>.
+All paths produce the same static binary; `fusermount` (`fuse3` or
+`fuse2`) must be in `$PATH` for unmount. Get a Telegram API ID + hash
+at <https://my.telegram.org/apps>.
 
 ## Quick start
 
 ```sh
-# (Optional) pick a non-default chunk size before first mount.
-# Default is 4 MiB; valid range is 64 KiB..1.5 GiB, power of two.
-# Once any chunk lands the choice is immutable.
-telfs init --chunk-size $((16*1024*1024))        # e.g. 16 MiB
+# Optional: pick a non-default chunk size BEFORE first mount.
+# 4 MiB default; 64 KiB..1.5 GiB, power of two; immutable once any chunk lands.
+telfs init --chunk-size $((16*1024*1024))
 
-# Pick a profile to live under. Profiles are isolated FS instances at
-# ~/.config/telfs/profiles/<name>/ holding config + session + DB + cache.
-telfs profile create main
-telfs profile use main                           # sticky default
+# Profile = isolated FS instance at ~/.config/telfs/profiles/<name>/.
+telfs profile create main && telfs profile use main
 
-# Configure credentials (one-time). Either edit the profile's config.toml
-# directly OR set them in the environment:
-export TELFS_API_ID=12345678
-export TELFS_API_HASH=...
+# Credentials — either edit config.toml or use env.
+export TELFS_API_ID=12345678 TELFS_API_HASH=...
 
-# Log in (interactive — type the SMS / Telegram code that arrives, and
-# your 2FA password if set).
-telfs login
-
-# Pick a channel to use as the backend. Create a *private* channel in
-# Telegram first; then:
-telfs channel list
+telfs login                                  # interactive
+telfs channel list                           # find the channel id
 telfs channel set <id>
-telfs channel ping                               # smoke test: post + read back
+telfs channel ping                           # smoke test
 
-# Mount.
-mkdir mnt
-telfs mount ./mnt                                # foreground; ^C to unmount
+mkdir mnt && telfs mount ./mnt               # foreground; ^C to unmount
 ```
 
-Then in another shell:
+Then in another shell — write, hardlink, symlink, xattr all work:
 
 ```sh
-echo hi > mnt/hello.txt
-cat mnt/hello.txt
-mkdir mnt/notes
-mv mnt/hello.txt mnt/notes/
-ln mnt/notes/hello.txt mnt/notes/alias           # hardlink
-ln -s notes/hello.txt mnt/link                   # symlink
+echo hi > mnt/hello.txt && cat mnt/hello.txt
+mkdir mnt/notes && mv mnt/hello.txt mnt/notes/
+ln mnt/notes/hello.txt mnt/notes/alias       # hardlink
+ln -s notes/hello.txt mnt/link               # symlink
 setfattr -n user.tag -v important mnt/notes/hello.txt
 ```
 
-Press `^C` on the daemon to unmount. The unmount sequence:
-
-1. Snapshot the meta DB → upload to channel as a new snapshot message.
-2. `fusermount -u` the kernel mount.
-3. Wait for in-flight FUSE requests to drain.
-4. Tear down the MTProto session.
+On `^C` the daemon snapshots the meta DB to the channel, `fusermount
+-u`s, drains in-flight requests, and tears down the MTProto session.
 
 ## Mount options
 
@@ -161,336 +124,230 @@ Press `^C` on the daemon to unmount. The unmount sequence:
 telfs mount [--readonly] [--allow-other] [--debug] <mountpoint>
 ```
 
-- `--readonly` — all mutating ops fail with EROFS. Useful for verifying
-  recovered state without risk.
-- `--allow-other` — allow other users to access the mount. Needs
-  `user_allow_other` in `/etc/fuse.conf`.
-- `--debug` — log every FUSE op (very chatty).
+`--allow-other` needs `user_allow_other` in `/etc/fuse.conf`.
+`--debug` logs every FUSE op (very chatty).
 
 ## Recovery
 
-If you lose the profile's `db.sqlite`, the next `telfs mount`
-automatically scans the channel for the most-recent snapshot and
-restores from it. At worst you lose whatever was written between the
-last snapshot cycle (cadence: every 5 minutes plus on clean unmount).
+Lose the local DB? The next `telfs mount` scans the channel for the
+most-recent snapshot and restores it. At worst you lose what was
+written between the last snapshot/journal cycle (snapshot cadence: 5
+min; journal poster: 5 s).
 
 ```sh
 PROFDIR=~/.config/telfs/profiles/main
 rm -rf $PROFDIR/db.sqlite $PROFDIR/cache
 telfs mount ./mnt
 # Local DB missing — scanning channel for snapshot…
-# Found snapshot msg=29 (ts 2026-05-28T18:03:00Z, fs_uuid=…)
+# Found snapshot msg=29 (ts 2026-05-28T18:03:00Z)
 # Restored 1489 gzipped bytes → db.sqlite (TFSE envelope decrypted)
-# Mounted at ./mnt. Press ^C to unmount.
+# Mounted at ./mnt.
 ```
 
-If the channel has no snapshot (first-ever use), recovery is a no-op
-and TelFS starts with an empty filesystem.
+No snapshot on the channel → fresh empty FS.
 
 ### Time travel: rolling back to a historical snapshot
 
-Snapshots are retained on the channel for a configurable window (the
-last 12 by default, so ~1h at the 5-minute cadence). Older ones are
-auto-pruned. `telfs snapshot` lets you inspect and roll back:
+Snapshots are retained on the channel (last 12 by default, ~1h at 5
+min cadence). Older ones are auto-pruned.
 
 ```sh
-telfs snapshot list
-# MSG-ID  AGE   TS (UTC)             JOURNAL-SEQ
-# 3004    5m    2026-05-29 14:22:29  17832
-# 2987    10m   2026-05-29 14:17:30  17801
-# 2970    15m   2026-05-29 14:12:30  17784
-# ...
-
-# "I deleted a file 30 minutes ago; undo":
-fusermount -u ~/External                  # stop the live mount
-telfs snapshot restore 2890               # 30-min-ago snapshot
-# This will replace ~/.config/telfs/profiles/main/db.sqlite
-#   with the contents of snapshot msg=2890.
-# The current DB will be saved as db.sqlite.pre-restore-<ts>.
-# Proceed? [y/N] y
-# Saved current DB to .../db.sqlite.pre-restore-1748534400
-# Restored snapshot msg=2890 → .../db.sqlite
-telfs mount ~/External                    # files now reflect that state
+telfs snapshot list                 # MSG-ID | AGE | TS | JOURNAL-SEQ
+fusermount -u ~/External            # restore refuses while mounted
+telfs snapshot restore 2890         # 30-min-ago snapshot
+# Saves current DB as db.sqlite.pre-restore-<unix-ts>, then replaces.
+telfs mount ~/External              # files now reflect that state
 ```
 
-Restore is **destructive** to the current DB (the snapshot's state
-replaces it). The pre-restore DB is kept beside it as
-`db.sqlite.pre-restore-<unix-ts>` so you can roll forward again with a
-manual swap. Restore refuses to run while any TelFS mount is live;
-unmount first.
+Restore is destructive to the current DB; the pre-restore copy beside
+it lets you manually roll forward again.
 
 ## Encryption
 
-TelFS supports AES-256-GCM encryption for both chunk contents AND the
-metadata snapshot envelope. With encryption enabled:
+AES-256-GCM protects chunk contents AND the metadata snapshot envelope:
 
-- Every chunk's bytes are AES-GCM ciphertext, AAD-bound to `(ino, idx)`.
-- Every snapshot posted to the channel is wrapped in a **TFSE envelope**
-  — `["TFSE"][ver][hdr_len][hdr_json][ciphertext]` — so the SQLite
-  metadata (filenames, directory tree, sizes, timestamps) lands as
-  ciphertext too, not plaintext.
+- Every chunk is AES-GCM ciphertext, AAD-bound to `(ino, idx)`.
+- Every snapshot is a TFSE envelope —
+  `["TFSE"][ver][hdr_len][hdr_json][ciphertext]` — so SQLite metadata
+  (filenames, tree, sizes, times) lands as ciphertext too.
 
-What an attacker with channel access still learns: the number of chunks,
-their approximate sizes (4 MiB rounded), the cadence of mutations, and
-the snapshot rhythm. Sizes can leak file lengths to within one chunk.
+The channel still leaks: chunk count, approximate chunk sizes (4 MiB
+buckets), mutation cadence, snapshot rhythm.
 
-Enable encryption on a **fresh** filesystem (it refuses if any chunk
-already exists; the migration path is `cp -r` from an old TelFS to a
-new encrypted one):
+Enable on a **fresh** FS (refuses if any chunk exists; migrate via
+`cp -r` to a new encrypted instance):
 
 ```sh
-telfs encrypt init                    # interactive passphrase
-# or for unattended setup:
-TELFS_PASSPHRASE='your secret' telfs encrypt init
+telfs encrypt init                            # interactive
+TELFS_PASSPHRASE='secret' telfs encrypt init  # unattended
 telfs encrypt status
+TELFS_PASSPHRASE='secret' telfs mount ./mnt   # skip the prompt
 ```
 
-Once enabled, every mount requires the passphrase. Set
-`TELFS_PASSPHRASE` to skip the prompt:
-
-```sh
-TELFS_PASSPHRASE='your secret' telfs mount ./mnt
-```
-
-Wrong passphrase fails fast — a canary in `meta_kv` is decrypted
-before any user data flows, so a typo surfaces immediately instead
-of as cryptic EIOs.
+A canary in `meta_kv` is decrypted at mount time so a wrong passphrase
+fails fast (no cryptic EIOs).
 
 ### Passphrase rotation
 
-Filesystems initialized on v0.14 or later use the `aes-gcm-v2` layout:
-the passphrase derives a key-encryption-key (KEK) that wraps a
-per-filesystem data-encryption-key (DEK). Chunks and snapshots are
-encrypted with the DEK; the wrapped DEK lives in `meta_kv` (and is
-mirrored into every snapshot envelope on the channel for cold
-recovery). Rotating the passphrase only re-wraps the DEK — chunks
-already on the channel are untouched.
+FSes initialized on v0.14+ use `aes-gcm-v2`: passphrase → KEK wraps a
+per-FS DEK; chunks and snapshots use the DEK; the wrapped DEK lives
+in `meta_kv` and inside every snapshot envelope. Rotation rewraps the
+DEK only — chunks are untouched:
 
 ```sh
-telfs encrypt rotate                  # interactive: old passphrase, then new
+telfs encrypt rotate                          # old passphrase, then new
 ```
 
 Notes:
 
-- Existing snapshots on the channel still decrypt with the *old*
-  passphrase. They age out of retention naturally; if you need to
-  invalidate them immediately, run `telfs gc --yes` to delete
-  out-of-window snapshots, then trigger a fresh one (e.g. by
-  remounting briefly).
-- Pre-v0.14 filesystems use `aes-gcm-v1` (the passphrase directly
-  encrypts everything) and `telfs encrypt rotate` will refuse — there
-  is no path to rotate those in place. `telfs encrypt status` shows
-  which mode your filesystem is on.
+- Old snapshots still need the *old* passphrase; they age out of
+  retention. To invalidate now: `telfs gc --yes` + trigger a fresh
+  snapshot (remount briefly).
+- `aes-gcm-v1` (pre-v0.14) has no rotation path; `telfs encrypt
+  status` shows your mode.
 
 ### What encryption protects against
 
 | Threat | Protected? |
 |---|---|
-| Telegram operator reading file contents | ✓ (chunks are ciphertext) |
-| Telegram operator reading file *names* and tree structure | ✓ (snapshot blob is TFSE-wrapped ciphertext) |
-| Channel members reading file contents or metadata | ✓ |
-| Someone with channel-WRITE access substituting an old ciphertext for the same `(ino, idx)` slot | ✗ (per-chunk replay; single-mounter assumption — you're the only legitimate poster) |
-| Someone splicing ciphertexts between files | ✓ (AAD binds ciphertext to `(ino, idx)`) |
+| Telegram operator reading file contents | ✓ |
+| Telegram operator reading file *names* / tree structure | ✓ (TFSE envelope) |
+| Channel members reading contents or metadata | ✓ |
+| Splicing ciphertexts between files | ✓ (AAD binds to `(ino, idx)`) |
 | Tampering with chunk bytes | ✓ (GCM tag fails) |
-| Local-disk theft on a machine where you mount unattended via `TELFS_PASSPHRASE` env | partial (passphrase is in the shell env; key never persists to disk) |
+| Channel-WRITE attacker replaying an old ciphertext on the same `(ino, idx)` | ✗ (single-mounter assumption) |
+| Local-disk theft on a host mounting unattended via `TELFS_PASSPHRASE` env | partial (key never persists; passphrase lives in env) |
 
 ### Crypto parameters
 
-- Cipher: AES-256-GCM, 12-byte random nonce per chunk, 16-byte tag
-- AAD: `(ino, idx)` packed big-endian (12 bytes)
-- KDF: Argon2id (time=3, memory=64 MiB, threads=4)
-- Salt: 16 random bytes per filesystem, stored in `meta_kv`
+- Cipher: AES-256-GCM; 12-byte random nonce per chunk (v1/v2) or
+  `HMAC-SHA256(DEK, label‖plaintext)[:12]` (v3); 16-byte tag
+- AAD: `(ino, idx)` big-endian for v1/v2; nil for v3
+- KDF: Argon2id (time=3, memory=64 MiB, threads=4), 16-byte per-FS salt
 - Canary: encrypted `"telfs-canary-v1"` in `meta_kv`, verified at mount
-- Key hierarchy (`aes-gcm-v2`): passphrase + salt → Argon2id → KEK;
-  random 32-byte DEK wrapped under KEK in `meta_kv['crypto_wrapped_dek']`
-  and inside every snapshot envelope; chunks and snapshot bodies use
-  the DEK. Rotation rewraps the DEK only.
+- v2 key hierarchy: passphrase + salt → Argon2id → KEK; random 32-byte
+  DEK wrapped under KEK in `meta_kv['crypto_wrapped_dek']` and inside
+  every snapshot envelope. Rotation rewraps the DEK only.
 
-The KDF parameters are stored in `meta_kv['crypto_argon_params']`,
-so a future TelFS with stronger defaults can still mount older
-filesystems.
+Argon2id parameters live in `meta_kv['crypto_argon_params']`, so a
+future TelFS with stronger defaults can still mount older FSes.
 
 ## Content-addressed chunk dedup
 
-On plaintext filesystems (no `encrypt init` performed) AND on encrypted
-filesystems initialized with `--convergent`, TelFS hashes every chunk's
-contents with SHA-256 and consults a `chunk_blob` table before
-uploading. If the same content is already on the channel, the new
-`chunk_map` row points at the existing message — no upload, no extra
-channel storage. Identical content across `cp file copy.bin`,
-duplicated regions inside the same file, and re-uploads of the same
-archive all collapse to a single channel message.
+On plaintext FSes (and on convergent-encrypted FSes — see below), TelFS
+hashes every chunk's contents with SHA-256 and consults a `chunk_blob`
+forward index (`hash → tg_message_id, size`) before uploading. A hit
+points the new `chunk_map` row at the existing message — no upload, no
+extra channel storage. `cp file copy.bin`, intra-file duplication, and
+re-uploaded archives all collapse to one channel message.
 
-The index is just a forward map (`hash → tg_message_id, size`); GC's
-liveness derivation still uses `chunk_map` as the single source of
-truth. Two consequences:
+The index is a cache only; GC liveness derives from `chunk_map` alone:
 
-- Sharing is safe under partial deletion. Unlinking one of N files
-  that reference a shared chunk leaves the other N-1 references
-  intact, so GC keeps the message alive. Only when no `chunk_map` row
-  references the message does `telfs gc` delete it.
-- Reuse is verified at runtime. Before pointing a new row at an
+- **Partial unlink is safe.** Removing one of N files referencing a
+  shared chunk leaves the other N-1 rows; `gc` only deletes a message
+  when no row references it.
+- **Reuse is verified at runtime.** Before pointing a new row at an
   indexed message, the writer checks (in the same transaction) that
-  some `chunk_map` row still references it. A stale index entry —
-  e.g. its message was reaped by GC before the index was pruned —
-  falls through to a fresh upload.
+  some `chunk_map` row still references it. Stale entries (target
+  reaped by an earlier `gc`) fall through to a fresh upload.
 
-`telfs status` reports the number of distinct blobs indexed. `telfs
-gc` prunes any stale index entries after each channel-side cleanup.
+`telfs status` reports the distinct-blob count. `telfs gc` prunes
+stale index entries after each channel cleanup.
 
-**Encryption interaction.** Dedup is **disabled** on default-encrypted
-filesystems (`aes-gcm-v1` / `aes-gcm-v2`). They use a random per-chunk
-nonce and bind ciphertext to `(ino, idx)` via AAD, so the same
-plaintext yields a different ciphertext for every slot. To enable
-dedup on an encrypted FS, opt in to **convergent mode** at init time:
+**Encryption interaction.** Default-encrypted FSes (`aes-gcm-v1` /
+`v2`) use a random per-chunk nonce + `(ino, idx)` AAD, so identical
+plaintext produces different ciphertext per slot — dedup can't apply.
+Opt into **convergent mode** at init time:
 
 ```sh
-telfs encrypt init --convergent
+telfs encrypt init --convergent               # aes-gcm-v3
 ```
 
-This selects `aes-gcm-v3`: the chunk nonce is
-`HMAC-SHA256(DEK, label || plaintext)[:12]` (deterministic, keyed on
-the per-FS DEK), and the AAD is nil. Identical plaintext under the
-same DEK yields byte-identical ciphertext, which is what makes dedup
-work. Trade-offs vs `aes-gcm-v2`:
+v3 derives the chunk nonce as `HMAC-SHA256(DEK, label‖plaintext)[:12]`
+and uses nil AAD, so identical plaintext under the same DEK produces
+byte-identical ciphertext (which is what makes dedup work).
 
 | Property | `aes-gcm-v2` (default) | `aes-gcm-v3` (`--convergent`) |
 |---|---|---|
 | Dedup on encrypted chunks | no | yes |
-| Channel observer can see *duplicate-chunk count* | no (every chunk is a unique blob) | yes |
-| Channel observer can verify they have a candidate file | no (needs DEK) | **no** (still needs DEK — confirmation-of-file does **not** apply here) |
-| Tampering / replay detection | yes (GCM tag) | yes (GCM tag) |
-| Passphrase rotation | yes (rewrap DEK) | yes (rewrap DEK) |
+| Channel observer sees duplicate-chunk count | no | yes |
+| Confirmation-of-file by observer without DEK | no | **no** (still needs DEK) |
+| Tampering / replay detection (GCM tag) | yes | yes |
+| Passphrase rotation | yes | yes |
 
-Confirmation-of-file is the well-known weakness of classic convergent
-encryption schemes where the key is derived from the content (anyone
-can encrypt a guess and check). Here the nonce derivation is keyed on
-the per-FS DEK; an observer without the DEK cannot compute the
-ciphertext for a candidate plaintext, so possession cannot be tested.
-The residual leak is strictly equality detection (chunk-level
-identity, additive on top of the existing chunk-count metadata leak).
-
-The standards-track equivalent is **AES-GCM-SIV** (RFC 8452); the
-implementation here is a hand-rolled thinner variant. The invariant
-that keeps it safe: the HMAC input is the FULL chunk plaintext, never
-a prefix or a sample — anything else would collapse distinct
-plaintexts onto the same nonce, which is catastrophic for AES-GCM.
+Why convergent dedup is still safe: classic convergent encryption is
+attackable because the key *is* `H(content)`. Here the nonce
+derivation is keyed on the per-FS DEK; an observer without the DEK
+cannot synthesize the ciphertext for a candidate plaintext, so
+possession is not testable. The residual leak is strictly equality
+detection. The standards-track equivalent is **AES-GCM-SIV** (RFC
+8452); v3 is a hand-rolled thinner variant whose safety invariant is
+that the HMAC input is the *full* chunk plaintext (a prefix/sample
+would collapse distinct plaintexts onto the same nonce, catastrophic
+for AES-GCM).
 
 ## Maintenance
 
-### `telfs gc` — reclaim channel storage
-
 ```sh
-telfs gc                                    # dry-run report
-telfs gc --yes                              # actually delete orphans
+telfs gc                         # dry-run: orphan chunks + stale snapshots
+telfs gc --yes                   # actually delete
+telfs fsck                       # check every chunk_map row against the channel
+telfs fsck --fix                 # drop unreadable rows (file becomes short)
+telfs status                     # profile / channel / FS / encryption / mount
+telfs doctor                     # local invariant lint (see below)
+telfs trash enable --ttl 7d      # rm safety-net (see below)
 ```
 
-Walks the channel and identifies:
-
-- **Orphan chunks** — document messages whose msg_id isn't in
-  `chunk_map` (created by file overwrites/unlinks, which intentionally
-  don't delete inline — see "Design choices" below).
-- **Stale snapshots** — snapshot-caption messages other than the
-  current one recorded in `meta_kv`.
-
-The default is dry-run; pass `--yes` to delete.
-
-### `telfs fsck` — channel-side integrity check
-
-```sh
-telfs fsck                                  # check every chunk_map row
-telfs fsck --fix                            # also drop unreadable rows
-```
-
-Walks `chunk_map` and confirms each referenced message still exists
-on the channel and is reachable. Reports broken references; with
-`--fix`, drops them from the local DB (the corresponding file becomes
-short — see the report for which files).
+`gc` finds **orphan chunks** (msg_ids not in `chunk_map` — left behind
+by overwrites/unlinks; see Design choices) and **stale snapshots**
+(any snapshot caption other than the current `meta_kv` recorded one).
+Default is dry-run.
 
 ### `telfs trash` — rm safety-net
 
 ```sh
-telfs trash enable --ttl 7d                 # turn on, retain 7 days
-telfs trash status                          # enabled / ttl / count
-telfs trash list                            # oldest first
-telfs trash empty                           # purge everything now
-telfs trash disable                         # back to immediate-delete
+telfs trash enable --ttl 7d      # turn on, retain 7 days
+telfs trash status               # state, ttl, count
+telfs trash list                 # oldest first
+telfs trash empty                # purge now
+telfs trash disable
 ```
 
-When enabled, every kernel-issued `unlink`/`rmdir` from FUSE reroutes
-into a top-level `/.trash/` directory instead of really deleting; a
-background GC unlinks entries older than the TTL. Standard tools
-restore via `mv /.trash/<unix-nano>-orig /restored`.
-
-Semantics:
-
-- The trashed dirent points at the same inode as the original — file
-  contents and chunks are untouched, so a `mv` back out is a true
-  restore.
-- Unlinks *inside* `/.trash` actually delete, so the GC and
-  `trash empty` work.
-- `rm /.trash` itself returns `EPERM` — can't be removed via FUSE.
-- `rm -rf foo/` flattens: the kernel issues per-file unlinks first,
-  then `rmdir`. Each file lands in `/.trash` with a unique prefix;
-  the empty `foo/` ends up there as a sibling. Restorable but not
-  a preserved tree (v1 limitation).
-- The TTL change takes effect on the next GC tick (~5 min) without
-  a remount.
-
-### `telfs status` — one-screen overview
-
-```sh
-telfs status
-```
-
-Active profile, channel binding, fs_uuid, chunk size, encryption
-state, last snapshot, FUSE mount table, on-disk file sizes — all on
-one screen. Useful first stop when something looks off.
+Every kernel-issued `unlink`/`rmdir` reroutes into `/.trash/`; a
+background GC actually deletes entries older than the TTL. Restore is
+just `mv /.trash/<unix-nano>-orig /restored` — the trashed dirent
+points at the same inode, so file content is untouched. Notes: unlinks
+*inside* `/.trash` actually delete; `rm /.trash` itself returns EPERM;
+`rm -rf foo/bar/` flattens — each file lands as a sibling in
+`/.trash`, restorable individually but not as a preserved tree.
 
 ### `telfs doctor` — local invariant lint
 
 ```sh
-telfs doctor
+telfs doctor                     # exit 0 on clean / warnings, 1 on errors
 ```
 
-Read-only consistency check on the active profile. Complements
-`status` (describes state) and `fsck` (channel-side integrity) by
-validating the things that *have to be true* about local state:
-
-- `config.toml` / `session.json` permissions (warns above 0600 since
-  they hold API hash + MTProto auth key).
-- `meta_kv` invariants: `fs_uuid` is a valid UUID, `chunk_size` is a
-  power of two within the supported range, encryption keys are
-  present and well-formed for the declared mode (v1 vs v2).
-- `chunk_map` health: no rows with non-positive size or message id;
-  reports distinct message count vs row count (dedup ratio).
-- Cache vs `chunk_map`: orphan cache files whose `(ino, idx)` tuple
-  no longer appears in the DB are surfaced as warnings so the user
-  can decide whether to reclaim disk space.
-- Snapshot + journal high-water markers.
-
-Exit code is 0 on clean / warning-only output, 1 if any error-level
-finding surfaces — usable as a periodic health probe.
-
-| Severity | Meaning |
-|---|---|
-| `ok`   | invariant verified |
-| `info` | descriptive only (e.g., "encryption disabled — plaintext FS") |
-| `warn` | suboptimal but functional (e.g., orphan cache file) |
-| `err`  | invariant violated, likely cause of misbehavior |
+Read-only complement to `status` (state) and `fsck` (channel side).
+Checks `config.toml` / `session.json` permissions (warns above 0600),
+`meta_kv` invariants (valid UUID, chunk_size power-of-two, crypto KV
+consistent), `chunk_map` health (positive sizes/msg_ids, dedup ratio),
+cache vs `chunk_map` (orphan cache files), snapshot + journal
+high-water markers. Findings are graded `ok` / `info` / `warn` / `err`
+and the exit code reflects any `err`, so it's usable as a periodic
+health probe.
 
 ## Configuration
 
-The active profile's `config.toml` (created at `~/.config/telfs/profiles/<name>/config.toml`,
-mode 0600 — never commit it):
+Active profile's `config.toml` at `~/.config/telfs/profiles/<name>/`,
+mode 0600 (don't commit it):
 
 ```toml
 api_id = 12345678
 api_hash = "..."
 auth_mode = "user"            # or "bot"
-bot_token = ""                # set when auth_mode = "bot"
+bot_token = ""                # only when auth_mode = "bot"
 phone = "+15551234567"        # optional — prompted if missing
-dc = 1                        # optional — starting datacenter; default 2
+dc = 1                        # starting datacenter; default 2
 
 [channel]
 id = 1234567890
@@ -502,209 +359,147 @@ Environment overrides:
 
 | Var | Effect |
 |---|---|
-| `TELFS_PROFILE` | profile to load (beats `~/.config/telfs/active`) |
-| `TELFS_API_ID` | overrides config |
-| `TELFS_API_HASH` | overrides config |
-| `TELFS_PHONE` | skip the phone prompt at login |
+| `TELFS_PROFILE` | active profile (beats `~/.config/telfs/active`) |
+| `TELFS_API_ID` / `TELFS_API_HASH` | override config |
+| `TELFS_PHONE` | skip phone prompt at login |
 | `TELFS_DC` | override starting datacenter |
-| `TELFS_PASSPHRASE` | FS encryption passphrase (skip prompt at mount) |
+| `TELFS_PASSPHRASE` | encryption passphrase (skip mount prompt) |
 
 ## Design choices
 
 | What | Choice | Why |
 |---|---|---|
-| Language | Go | `hanwen/go-fuse` + `gotd/td` + `modernc.org/sqlite` (pure-Go SQLite). No cgo → fully-static release binary. |
-| Telegram API | MTProto via `gotd/td` for both user *and* bot auth | One code path for the data plane; 2 GB per upload either way. The HTTP Bot API (with its ~50 MB per-file ceiling) is not used. |
-| Metadata | local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence |
-| Chunk size | 4 MiB default, **per-FS configurable** | Sequential read/write throughput vs `chunk_map` row count. Set via `telfs init --chunk-size <N>` BEFORE first mount; immutable thereafter. Power of two, [64 KiB, 1.5 GiB]. |
-| POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough to host typical workloads |
-| Encryption | AES-256-GCM, Argon2id KDF, opt-in via `telfs encrypt init` | Chunk bytes AND snapshot metadata (TFSE envelope); per-chunk AAD binds to `(ino, idx)` |
-| Inline TG deletes | none for chunks; snapshots delete the prior one | Never destroys user data inline; orphans cleaned by `telfs gc`. Trash safety-net layers on top for human-scale `rm` mistakes. |
-| Snapshot cadence | every 5 min + on clean unmount | Bounded recovery window without burning network bandwidth |
+| Language | Go (`hanwen/go-fuse` + `gotd/td` + `modernc.org/sqlite`) | Pure-Go SQLite — no cgo, fully-static binary. |
+| Telegram API | MTProto via `gotd/td` (user *and* bot) | One data-plane path; 2 GB per upload. HTTP Bot API never used. |
+| Metadata | Local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence. |
+| Chunk size | 4 MiB default, per-FS configurable via `telfs init --chunk-size`; immutable after first chunk; power of two ∈ [64 KiB, 1.5 GiB] | Throughput vs `chunk_map` row count. |
+| POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough for typical workloads. |
+| Encryption | AES-256-GCM (v1/v2/v3); Argon2id KDF; opt-in `telfs encrypt init` | Chunks AND snapshot metadata; AAD binds to `(ino, idx)` for v1/v2. |
+| Inline TG deletes | None for chunks; snapshot delete supersedes prior | Never destroys data inline; `gc` reclaims; trash layers on top. |
+| Snapshot / journal cadence | Snapshot every 5 min + clean unmount; journal poster every 5 s | Bounded recovery window without burning bandwidth. |
 
 ## Profiles + portable bundles
 
-A profile is a named directory under `~/.config/telfs/profiles/<name>/`
-holding one filesystem's full local state — config, MTProto session,
-SQLite metadata, and cache. Multiple profiles coexist independently
-(each can bind to its own account and channel).
+A profile is a named dir under `~/.config/telfs/profiles/<name>/`
+holding one FS's full local state (config + session + db + cache).
+Multiple profiles coexist independently.
 
 ```sh
 telfs profile create work
-TELFS_PROFILE=work telfs login            # interactive setup
+TELFS_PROFILE=work telfs login
 TELFS_PROFILE=work telfs channel set <id>
-telfs profile use work                    # sticky default
+telfs profile use work                      # sticky default
+telfs profile list                          # shows active marker
 
-telfs profile list                        # shows the active marker
-telfs profile export bundle.tar.gz        # tar.gz of config+session+db
-telfs profile import --profile work2 bundle.tar.gz   # restore elsewhere
+telfs profile export bundle.tar.gz          # session + config + db
+telfs profile import --profile work2 bundle.tar.gz
 ```
 
-A bundle contains your MTProto session credentials and (if encryption
-is enabled) the salt + canary needed to derive the data key from
-your passphrase. Treat it like an SSH private key.
+A bundle holds MTProto session credentials + (if encryption is
+enabled) the salt and canary needed to derive the data key from your
+passphrase. Treat it like an SSH private key.
 
-- **Same-machine roundtrip is verified.** Exporting and re-importing
-  into a sibling profile on the same host works end to end.
-- **Cross-device use is the design intent, but is unverified.**
-  Telegram may flag or invalidate a `session.json` reused from a
-  different device/IP. If that happens you'll see auth errors at
-  mount time on the destination; the workaround is to redo
-  `telfs login` on that machine. `config.toml` and `db.sqlite`
-  from the bundle still apply — just the session bits may not.
+- **Same-machine roundtrip is verified.**
+- **Cross-device use is the design intent but unverified.** Telegram
+  may flag/invalidate a `session.json` reused from a different
+  device/IP; the workaround on auth failure at the destination is to
+  redo `telfs login` there. The bundle's `config.toml` and `db.sqlite`
+  still apply.
 
 ## Web management UI
 
-`telfs web` boots a self-contained HTTP UI that covers the entire CLI
-surface — dashboard, profile CRUD + tar.gz export/import, multi-step
-phone login + bot-token login, channel binding, encryption
-initialization, mount supervisor with HTMX-polled live log tail, and a
-file browser that reads/writes through a chosen FUSE mountpoint.
+`telfs web` boots a self-contained HTTP UI covering the entire CLI:
+dashboard, profile CRUD + export/import, multi-step phone login,
+bot-token login, channel binding, encryption init, mount supervisor
+with HTMX-polled log tail, and a file browser through a chosen
+mountpoint.
 
-First-time users get a guided onboarding flow at `/setup`. The wizard
-tracks five conceptual steps (API credentials → login → channel →
-optional encryption → first mount), surfaces only the current step in
-detail, and explains what each step accomplishes and what success
-looks like. State is derived from the filesystem on every page load —
-there's no separate "wizard progress" to keep in sync.
+First-time users land on a guided `/setup` wizard: API creds → login →
+channel → optional encryption → first mount. State is derived from the
+filesystem on every page load — there's no separate wizard progress
+file to drift.
 
 ```sh
-telfs web                                  # 127.0.0.1:8080, no auth
+telfs web                                       # 127.0.0.1:8080, no auth
 telfs web --listen 0.0.0.0:8080 --token $(openssl rand -hex 32)
 ```
 
-Defaults: loopback bind, no auth — the security perimeter is "can
-reach loopback on this host." Non-loopback bind **requires** `--token`;
-the server refuses to start otherwise. Token comparison uses
-`crypto/subtle.ConstantTimeCompare`. Every POST form carries a
-per-session CSRF token (random, in cookie + hidden field).
-
-For HTTPS, terminate TLS in a reverse proxy in front of localhost.
-The `--tls-cert` / `--tls-key` flags exist for in-process termination
-but aren't the recommended path.
+Loopback bind requires no auth (perimeter = "can reach loopback").
+Non-loopback bind **requires** `--token`; the server refuses to start
+otherwise. Token check via `crypto/subtle.ConstantTimeCompare`; every
+POST form carries a per-session CSRF token. For HTTPS, terminate TLS
+in a reverse proxy in front of localhost (`--tls-cert` / `--tls-key`
+exist but aren't the recommended path).
 
 ## Deployment
 
-### Static binary (recommended for desktop / laptop)
+**Static binary** (desktop/laptop): `make release` →
+`dist/telfs-vX.Y.Z-linux-amd64.tar.gz`. Built with `CGO_ENABLED=0
+-trimpath -ldflags '-s -w'`; copies to any Linux host (needs only
+kernel FUSE + `fusermount`).
+
+**Alpine container** (headless/NAS/server, ~20 MB compressed; ships
+`telfs` + `fuse3` + `ca-certificates` + `tini`):
 
 ```sh
-make release                                     # → dist/telfs-vX.Y.Z-linux-amd64.tar.gz
+docker pull ghcr.io/platonic-realm/telfs:latest      # multi-arch
+make docker                                          # build locally
 ```
 
-The release target uses `CGO_ENABLED=0 -trimpath -ldflags '-s -w'` so
-the resulting binary is fully static — copies straight to any Linux
-host without runtime dependencies (except the kernel FUSE module and
-`fusermount` in `$PATH` for unmount).
-
-### Alpine container (recommended for headless / NAS / server)
-
-The container ships only the static `telfs` binary plus `fuse3`,
-`ca-certificates`, and `tini` (~20 MB compressed). It runs every
-TelFS subcommand — `mount`, `web`, `login`, `status`, `gc`, `fsck`,
-`trash`, etc. — just like the static binary.
-
-#### Pull or build
-
-```sh
-# Published image, multi-arch (amd64 + arm64):
-docker pull ghcr.io/platonic-realm/telfs:latest
-# Or pin a specific release:
-docker pull ghcr.io/platonic-realm/telfs:v0.5
-
-# Build locally:
-make docker                                       # → telfs:<git-describe>
-```
-
-#### Required runtime flags (FUSE)
-
-Three things are non-negotiable for FUSE inside a container:
+### FUSE in a container — non-negotiable runtime flags
 
 | Flag | Why |
 |---|---|
-| `--cap-add SYS_ADMIN` | FUSE mounts need this capability. |
-| `--device /dev/fuse` | The kernel character device must be passed through. |
-| `--security-opt apparmor:unconfined` | On distros with strict AppArmor profiles (Ubuntu, Debian), the default profile blocks FUSE. Drop it for the TelFS container. |
+| `--cap-add SYS_ADMIN` | FUSE mounts need it. |
+| `--device /dev/fuse` | Kernel character device passthrough. |
+| `--security-opt apparmor:unconfined` | Default profile on Ubuntu/Debian blocks FUSE. |
 
-#### Required bind mounts
+### Bind mounts
 
 | Container path | Host path | Purpose |
 |---|---|---|
-| `/root/.config/telfs` | `~/.config/telfs` | Profiles directory: session, db.sqlite, cache, config.toml. Read-write. |
-| `/mnt/telfs` | wherever you want the FS to appear | Mountpoint. **Must use `bind-propagation=rshared`** so the FUSE mount inside the container is visible to host processes. |
+| `/root/.config/telfs` | `~/.config/telfs` | Profiles (session + db + cache + config). RW. |
+| `/mnt/telfs` | wherever the FS appears | Mountpoint. **Must use `bind-propagation=rshared`** so the in-container FUSE mount is visible host-side. |
 
-#### First-time setup (inside the container)
+### First-time setup (interactive shell inside the container)
 
 ```sh
-# Spawn an interactive shell to walk through profile/login/channel.
-# The same bind mounts as above — anything we write to /root/.config
-# lands on the host's ~/.config/telfs.
 docker run --rm -it \
   --cap-add SYS_ADMIN --device /dev/fuse \
   --security-opt apparmor:unconfined \
   -v $HOME/.config/telfs:/root/.config/telfs \
-  --entrypoint sh \
-  ghcr.io/platonic-realm/telfs:latest
+  --entrypoint sh ghcr.io/platonic-realm/telfs:latest
 
-# Inside the container:
-telfs profile create main
-telfs profile use main
-telfs login                                       # interactive phone+code+2FA
+# Inside:
+telfs profile create main && telfs profile use main
+telfs login
 telfs channel set <id>
-telfs encrypt init                                # optional
-telfs trash enable --ttl 7d                       # optional
+telfs encrypt init                                   # optional
 exit
 ```
 
-After that, the profile exists on the host; subsequent `mount` / `web`
-runs reuse it.
-
-#### Mount
+### Mount + web
 
 ```sh
+# Mount as a long-running container (clean shutdown via tini on docker stop):
 mkdir -p /srv/external
-docker run -d --name telfs-main \
-  --restart unless-stopped \
+docker run -d --name telfs-main --restart unless-stopped \
   --cap-add SYS_ADMIN --device /dev/fuse \
   --security-opt apparmor:unconfined \
   -v $HOME/.config/telfs:/root/.config/telfs \
   --mount type=bind,source=/srv/external,target=/mnt/telfs,bind-propagation=rshared \
-  -e TELFS_PROFILE=main \
-  -e TELFS_PASSPHRASE=secret \
+  -e TELFS_PROFILE=main -e TELFS_PASSPHRASE=secret \
   ghcr.io/platonic-realm/telfs:latest mount /mnt/telfs
-```
 
-- `/srv/external` on the host is where files appear (your `ls /srv/external` from the host shows the channel contents).
-- `-e TELFS_PASSPHRASE` is only needed for encrypted FSes. Omit otherwise.
-- `tini` is the container PID 1; SIGTERM (`docker stop telfs-main`)
-  triggers the in-mount watchdog and a clean final snapshot.
-
-#### Web management UI
-
-```sh
-docker run -d --name telfs-web \
-  -p 127.0.0.1:8080:8080 \
+# Web UI (no FUSE caps needed unless this container itself runs `mount`):
+docker run -d --name telfs-web -p 127.0.0.1:8080:8080 \
   -v $HOME/.config/telfs:/root/.config/telfs \
-  ghcr.io/platonic-realm/telfs:latest \
-  web --listen 0.0.0.0:8080
+  ghcr.io/platonic-realm/telfs:latest web --listen 0.0.0.0:8080
 ```
 
-Or, with token auth for non-loopback exposure:
+`-e TELFS_PASSPHRASE` is only needed for encrypted FSes.
 
-```sh
-docker run -d --name telfs-web \
-  -p 8080:8080 \
-  -v $HOME/.config/telfs:/root/.config/telfs \
-  ghcr.io/platonic-realm/telfs:latest \
-  web --listen 0.0.0.0:8080 --token $(openssl rand -hex 32)
-```
-
-The web container does **not** need the FUSE capability/device — those
-are only required if it itself runs a `mount` subcommand. To control
-mounts from the web UI inside a container, give the same FUSE flags as
-above; otherwise use the web container for setup/inspection and run
-`mount` in a sibling container.
-
-#### Docker Compose
+### Docker Compose
 
 ```yaml
 services:
@@ -723,8 +518,7 @@ services:
       - type: bind
         source: /srv/external
         target: /mnt/telfs
-        bind:
-          propagation: rshared
+        bind: { propagation: rshared }
 
   telfs-web:
     image: ghcr.io/platonic-realm/telfs:latest
@@ -735,39 +529,31 @@ services:
       - ${HOME}/.config/telfs:/root/.config/telfs
 ```
 
-#### Troubleshooting
+### Container troubleshooting
 
-- **`fuse: device not found, try 'modprobe fuse'`** — the kernel FUSE
-  module isn't loaded on the host. `sudo modprobe fuse`. Persist via
-  `/etc/modules-load.d/`.
-- **`fusermount: mount failed: Operation not permitted`** — missing
-  `--cap-add SYS_ADMIN` or AppArmor is blocking. Add `--security-opt
-  apparmor:unconfined`.
-- **The mount works inside the container but `ls /srv/external` on
-  the host shows nothing** — your bind mount didn't use `rshared`.
-  Re-run with the propagation flag.
-- **`failed to drop capability cap_sys_admin`** — Docker daemon
-  configured with `--no-new-privileges` globally. Lift it for this
-  container.
+- `fuse: device not found, try 'modprobe fuse'` → `sudo modprobe fuse`
+  on the host (persist via `/etc/modules-load.d/`).
+- `fusermount: mount failed: Operation not permitted` → missing
+  `--cap-add SYS_ADMIN` or AppArmor is blocking (add
+  `--security-opt apparmor:unconfined`).
+- Mount works inside the container but `ls` on the host shows nothing →
+  bind mount didn't use `rshared`.
+- `failed to drop capability cap_sys_admin` → Docker daemon ran with
+  `--no-new-privileges` globally; lift for this container.
 
-Why both deployment paths? Static binary wins on a desktop where the
-mount and the UI live alongside other native tools. Container wins on
-headless servers / NAS appliances where the FUSE module is shared but
-the userland is locked or distro-mismatched.
+Static binary wins on desktops where mount + UI live next to other
+native tools; container wins on headless servers where FUSE is shared
+but userland is locked.
 
 ## Running unattended
 
-The mount command is a foreground daemon. Backgrounding it with
-`&` in an interactive shell is fine for testing, but if that shell
-exits with `huponexit` on (or anything else terminates the daemon
-abruptly), the kernel mount stays in `/proc/mounts` but `~/External`
-silently reverts to writing through to the *local* filesystem
-underneath. Files dropped in during that window land on disk
-locally, not in the channel — and become invisible the moment
-TelFS remounts.
+`telfs mount` is a foreground daemon. Backgrounding with `&` in a
+shell is fine for testing — but if that shell exits abruptly, the
+kernel mount may stay in `/proc/mounts` while writes silently fall
+through to the *local* filesystem underneath. Files dropped during
+that window land on disk locally, not in the channel.
 
-For production use, run it under a supervisor that owns the
-process lifecycle:
+For production, run under a supervisor:
 
 ```ini
 # ~/.config/systemd/user/telfs@.service
@@ -792,56 +578,51 @@ chmod 600 ~/.config/telfs/profiles/work/passphrase.env
 systemctl --user enable --now telfs@work.service
 ```
 
-For interactive use, at minimum: `nohup telfs mount ~/External &`
-and verify the daemon survives a shell exit before trusting it
-with data.
+For interactive use, at minimum: `nohup telfs mount ~/External &` —
+and verify the daemon survives a shell exit before trusting it with
+data.
 
 ## Known limits
 
-- **Single mounter per channel.** Two concurrent mounts will race; no
-  locking. The schema reserves `meta_kv[lock_ts]` for a future
-  coordination mechanism.
-- **Up-to-~5-second recovery window** (v0.13). A background journal
-  poster drains the local `journal` table every 5 s and posts each
-  pending op as a journal-op message on the channel; recovery
-  restores the latest snapshot then replays any journal ops with seq
-  > snapshot.seq. Crash window = poster interval, not snapshot
-  interval. Currently journaled: CreateChild, Link, Unlink, Rename,
-  SetSize (truncate). Setattr/xattr/chunk-map mutations aren't
-  journaled yet — chunks themselves are independently recoverable
-  from the channel.
-- **Encryption metadata leakage is bounded but not zero.** Snapshots
-  are TFSE-wrapped ciphertext; the channel still exposes the count
-  and size of chunk messages and the cadence of snapshots. File size
-  to ~4 MiB resolution can be inferred from the chunk count.
+- **Single mounter per channel.** Two concurrent mounts race; no
+  locking. `meta_kv[lock_ts]` is reserved for future coordination.
+- **≤5 s recovery window.** A background journal poster (v0.13) drains
+  the local `journal` table every 5 s and posts each pending op to the
+  channel; recovery restores the latest snapshot then replays journal
+  ops with seq > snapshot.seq. Currently journaled: `CreateChild`,
+  `Link`, `Unlink`, `Rename`, `SetSize`. Setattr/xattr/chunk-map
+  mutations aren't journaled yet (chunks themselves are independently
+  recoverable).
+- **Encryption metadata leakage is bounded, not zero.** Snapshots are
+  TFSE ciphertext, but chunk count, chunk size to ~chunk-size
+  resolution, and snapshot cadence remain visible.
 - **One channel = one TelFS.** `fs_uuid` is stored in `meta_kv` and
   baked into every snapshot caption; recovery filters by it, so
-  reusing a channel for a fresh TelFS instance will leave old
-  snapshots as garbage until `telfs gc` reaps them.
+  reusing a channel for a fresh instance leaves old snapshots as
+  garbage until `telfs gc` reaps them.
 - **gotd default DC 2 may be firewalled.** If `telfs login` hangs at
-  the handshake, try `dc = 1` in `config.toml` (or `TELFS_DC=1`).
-- **Trash is flat, not a preserved tree.** `rm -rf foo/bar/` lands as
-  N separate entries under `/.trash`, restorable individually but not
-  as a tree. Acceptable for the safety-net use case (typo undos);
-  for archival, snapshot the FS instead.
+  handshake, try `dc = 1` in `config.toml` (or `TELFS_DC=1`).
+- **Trash is flat.** `rm -rf foo/bar/` lands as N siblings under
+  `/.trash`, restorable individually but not as a preserved tree —
+  fine for typo-undo, use snapshots for archival.
+
 ## Roadmap
 
-No named items currently outstanding. Open improvement directions:
+No named items outstanding. Open directions:
 
-- A reproducible benchmark harness (`telfs bench`) for read/write
-  throughput regressions across the chunker, cache, and upload
-  pipeline.
+- Reproducible `telfs bench` for chunker/cache/upload regression
+  detection.
 - Better error UX in the web UI on failed login / network errors.
 - Multi-mounter coordination (currently TelFS assumes one writer per
   channel).
 
-See the [issues](https://github.com/platonic-realm/TelFS/issues) tab
-for the current state.
+See [issues](https://github.com/platonic-realm/TelFS/issues) for
+current state.
 
 ## Architecture
 
-See [`docs/architecture.md`](docs/architecture.md) for the module
-layout, SQLite schema, channel message format, and recovery model.
+See [`docs/architecture.md`](docs/architecture.md) for module layout,
+SQLite schema, channel message format, and the recovery model.
 
 ## License
 

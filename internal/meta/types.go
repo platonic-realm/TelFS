@@ -30,6 +30,14 @@ type Inode struct {
 	// sees that the in-flight write is large enough to warrant
 	// fewer, bigger chunks. Always non-zero.
 	ChunkSize int64
+	// Sparse marks a file that legitimately contains holes — chunk
+	// slots inside [0, size) with no chunk_map row. Set by the writer
+	// when a write skips past unwritten space and by truncate-grow.
+	// The reader returns zeros for missing chunks of a sparse file;
+	// for non-sparse files a missing chunk keeps meaning "data lost"
+	// (EIO), preserving corruption detection. Repair likewise leaves
+	// sparse files' gaps alone.
+	Sparse bool
 }
 
 // Dirent is a row in the `dirents` table — a (parent, name) → child link.

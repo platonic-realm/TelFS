@@ -3,10 +3,13 @@ package chunk
 import (
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
@@ -71,11 +74,11 @@ type entry struct {
 // decompresses (in that order — compression happens before encryption
 // on the write side) before persisting, so cache hits skip both costs.
 type Cache struct {
-	dir       string
-	capBytes  int64
-	fetcher   Fetcher
-	cipher    crypto.Cipher    // never nil; defaults to NoopCipher
-	codec     compress.Codec   // never nil; defaults to compress.None
+	dir      string
+	capBytes int64
+	fetcher  Fetcher
+	cipher   crypto.Cipher  // never nil; defaults to NoopCipher
+	codec    compress.Codec // never nil; defaults to compress.None
 
 	mu        sync.Mutex
 	entries   map[Key]*entry
@@ -221,52 +224,109 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset 
 		metrics.MemCacheHits.Inc()
 		return data, nil
 	}
-	// Hit path: bump LRU under lock; then read off disk outside lock.
-	c.mu.Lock()
-	if e, ok := c.entries[key]; ok {
-		c.order.MoveToFront(e.el)
-		c.mu.Unlock()
-		metrics.CacheHits.Inc()
-		data, err := os.ReadFile(filepath.Join(c.dir, key.fileName()))
-		if err == nil {
-			// Promote into the mem tier so the next access is a map
-			// lookup, not a syscall. The mem cache evicts itself once
-			// it crosses its own cap.
-			c.mem.Put(key, data)
-		}
-		return data, err
-	}
-	c.mu.Unlock()
-	metrics.CacheMisses.Inc()
-
-	// Miss path. Funnel through singleflight so two callers asking
-	// for the same key share one fetch + decrypt + decompress + disk
-	// write. singleflight keys are strings; the chunk Key has a fixed
-	// integer shape, so a short binary-ish encoding is fine.
-	sfKey := fmt.Sprintf("%d/%d", key.Ino, key.Idx)
-	v, err, shared := c.misses.Do(sfKey, func() (any, error) {
-		// Recheck the cache once we've serialized: a parallel miss may
-		// have populated it while we were queued.
+	// The retry loop covers two races, both of which used to surface
+	// as spurious EIO to userspace:
+	//   1. Hit-path ENOENT: the LRU said hit but the file vanished
+	//      between the bump and the ReadFile (Invalidate or eviction
+	//      racing us) — fall through to the miss path and refetch.
+	//   2. Singleflight cancellation poisoning: our Do call can
+	//      piggyback on a fetch started by a PREFETCH goroutine whose
+	//      per-inode context a seek then cancels. The shared result is
+	//      "context canceled" even though OUR ctx is alive — retry
+	//      with our own ctx driving a fresh fetch.
+	for attempt := 0; ; attempt++ {
+		// Hit path: bump LRU under lock; then read off disk outside lock.
 		c.mu.Lock()
 		if e, ok := c.entries[key]; ok {
 			c.order.MoveToFront(e.el)
 			c.mu.Unlock()
-			return os.ReadFile(filepath.Join(c.dir, key.fileName()))
+			data, err := os.ReadFile(filepath.Join(c.dir, key.fileName()))
+			if err == nil {
+				metrics.CacheHits.Inc()
+				// Promote into the mem tier so the next access is a map
+				// lookup, not a syscall. The mem cache evicts itself once
+				// it crosses its own cap.
+				c.mem.Put(key, data)
+				return data, nil
+			}
+			if !os.IsNotExist(err) {
+				return nil, err
+			}
+			// Stale LRU entry — drop it and treat as a miss.
+			c.mu.Lock()
+			if e2, ok := c.entries[key]; ok {
+				c.order.Remove(e2.el)
+				delete(c.entries, key)
+				c.totalSize -= e2.size
+			}
+			c.mu.Unlock()
+		} else {
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
-		return c.fetchAndStore(ctx, key, tgMessageID, packOffset, packSize)
-	})
-	if err != nil {
-		return nil, err
+		metrics.CacheMisses.Inc()
+
+		// Miss path. Funnel through singleflight so two callers asking
+		// for the same key share one fetch + decrypt + decompress + disk
+		// write. singleflight keys are strings; the chunk Key has a fixed
+		// integer shape, so a short binary-ish encoding is fine.
+		sfKey := fmt.Sprintf("%d/%d", key.Ino, key.Idx)
+		v, err, shared := c.misses.Do(sfKey, func() (any, error) {
+			// Recheck the cache once we've serialized: a parallel miss may
+			// have populated it while we were queued.
+			c.mu.Lock()
+			if e, ok := c.entries[key]; ok {
+				c.order.MoveToFront(e.el)
+				c.mu.Unlock()
+				data, rerr := os.ReadFile(filepath.Join(c.dir, key.fileName()))
+				if rerr == nil {
+					return data, nil
+				}
+				if !os.IsNotExist(rerr) {
+					return nil, rerr
+				}
+				// Stale entry here too — fall through to a real fetch.
+				c.mu.Lock()
+				if e2, ok := c.entries[key]; ok {
+					c.order.Remove(e2.el)
+					delete(c.entries, key)
+					c.totalSize -= e2.size
+				}
+				c.mu.Unlock()
+				return c.fetchAndStore(ctx, key, tgMessageID, packOffset, packSize)
+			}
+			c.mu.Unlock()
+			return c.fetchAndStore(ctx, key, tgMessageID, packOffset, packSize)
+		})
+		if err != nil {
+			if errors.Is(err, context.Canceled) && ctx.Err() == nil && attempt < 3 {
+				continue // foreign cancellation — retry with our live ctx
+			}
+			// A dying MTProto engine fails every in-flight download at
+			// once ("connection dead" / "engine was closed") and then
+			// reconnects within a few seconds. Absorb it: pause briefly
+			// so the reconnect can land, then refetch. Without this,
+			// each transport blip during a sustained cold-read pass
+			// surfaced as EIO for whichever file was mid-fetch —
+			// observed twice in 20 min during the 6 GB verify run.
+			if isTransientConnErr(err) && ctx.Err() == nil && attempt < 3 {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+			return nil, err
+		}
+		if shared {
+			metrics.CacheMergedMisses.Inc()
+		}
+		data, ok := v.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("cache.Get singleflight returned %T, want []byte", v)
+		}
+		return data, nil
 	}
-	if shared {
-		metrics.CacheMergedMisses.Inc()
-	}
-	data, ok := v.([]byte)
-	if !ok {
-		return nil, fmt.Errorf("cache.Get singleflight returned %T, want []byte", v)
-	}
-	return data, nil
 }
 
 // fetchAndStore is the actual miss path: download (range or whole),
@@ -350,6 +410,29 @@ func (c *Cache) fetchAndStore(ctx context.Context, key Key, tgMessageID int64, p
 	// the immediate next read for this key is a one-lookup hit.
 	c.mem.Put(key, data)
 	return data, nil
+}
+
+// isTransientConnErr recognizes fetch failures caused by an MTProto
+// engine death / reconnect window — conditions that heal within
+// seconds and deserve one in-place retry instead of an EIO to the
+// reading application. String-matched because the errors arrive
+// wrapped through gotd's layers without stable sentinel types.
+func isTransientConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{
+		"connection dead",
+		"engine was closed",
+		"engine forcibly closed",
+		"session not connected",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // Has reports whether a chunk is already present in the LRU.

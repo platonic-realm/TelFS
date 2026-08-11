@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	neturl "net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +38,21 @@ type tgState struct {
 	PerMethod             []tgMethod  `json:"per_method"`
 	Requests              []tgRequest `json:"requests"`
 	Queue                 tgQueue     `json:"queue"`
+	Adaptive              *tgAdaptive `json:"adaptive,omitempty"`
+}
+
+// tgAdaptive mirrors the daemon's AdaptiveSnapshot — drives the
+// "auto N req/min, raised 2 min ago" rendering on the Telegram tab.
+type tgAdaptive struct {
+	Manual              bool   `json:"manual"`
+	UploadPinned        bool   `json:"upload_pinned"`
+	UploadEffective     int    `json:"upload_effective"`
+	UploadAdaptiveLevel int    `json:"upload_adaptive_level"`
+	DownloadPinned      bool   `json:"download_pinned"`
+	DownloadEffective   int    `json:"download_effective"`
+	LastFloodAgoSec     int64  `json:"last_flood_ago_sec"`
+	LastAdjustAgoSec    int64  `json:"last_adjust_ago_sec"`
+	LastAction          string `json:"last_action"`
 }
 
 // tgQueue is the upload-side backlog the daemon surfaces. There's no
@@ -72,14 +90,19 @@ type tgMethod struct {
 }
 
 type tgRequest struct {
-	ID               int64  `json:"id"`
-	Method           string `json:"method"`
-	StartedUnix      int64  `json:"started_unix"`
-	DurationMS       int64  `json:"duration_ms"`
-	Bytes            int    `json:"bytes"`
+	ID          int64  `json:"id"`
+	Method      string `json:"method"`
+	StartedUnix int64  `json:"started_unix"`
+	DurationMS  int64  `json:"duration_ms"`
+	// Bytes is int64 (not int) so the {{humanBytes .Bytes}} template
+	// call compiles — Go's html/template enforces the function-arg
+	// type strictly, and a mismatch crashes the template mid-row.
+	// We previously shipped this as int, which caused the /telegram
+	// page to be cut off before the rate-limit form was rendered.
+	Bytes            int64  `json:"bytes"`
 	InFlight         bool   `json:"in_flight"`
 	Err              string `json:"err"`
-	FloodWaitSeconds int    `json:"flood_wait_seconds"`
+	FloodWaitSeconds int64  `json:"flood_wait_seconds"`
 }
 
 type tgPageData struct {
@@ -95,7 +118,7 @@ type tgPageData struct {
 	// fresh from meta_kv on every request so CLI edits show up
 	// immediately. Zero means unlimited. -1 signals "couldn't
 	// read meta_kv" so the template can flag that.
-	RateLimitPerMin         int
+	RateLimitPerMin int
 	// DownloadRateLimitPerMin mirrors the upload cap above but for
 	// upload.getFile RPCs only. -1 on read failure, 0 = unlimited,
 	// >0 = explicit cap.
@@ -134,7 +157,7 @@ func (s *Server) telegramPartial(w http.ResponseWriter, r *http.Request) {
 // template doesn't reference any pageBase fields anyway.
 func (s *Server) fetchTelegramStatePartial(r *http.Request) tgPageData {
 	url := "http://127.0.0.1:9090/telegram"
-	if v := r.URL.Query().Get("source"); v != "" {
+	if v, ok := sanitizeSourceURL(r.URL.Query().Get("source")); ok {
 		url = v
 	}
 	data := tgPageData{
@@ -145,11 +168,35 @@ func (s *Server) fetchTelegramStatePartial(r *http.Request) tgPageData {
 	return data
 }
 
+// sanitizeSourceURL validates the user-supplied metrics source
+// override. Only plain-http URLs on a LOOPBACK host are accepted —
+// the override exists so an operator can point the page at a daemon
+// on a non-default local port, not to make the web server fetch
+// arbitrary URLs (classic SSRF: internal services, cloud metadata
+// endpoints) on behalf of whoever crafts a link.
+func sanitizeSourceURL(v string) (string, bool) {
+	if v == "" {
+		return "", false
+	}
+	u, err := neturl.Parse(v)
+	if err != nil || u.Scheme != "http" {
+		return "", false
+	}
+	host := u.Hostname()
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return "", false
+		}
+	}
+	return u.String(), true
+}
+
 // fetchTelegramState pulls + parses the daemon's /telegram JSON for
 // the full-page render (CSRF + flash needed for the form).
 func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPageData {
 	url := "http://127.0.0.1:9090/telegram"
-	if v := r.URL.Query().Get("source"); v != "" {
+	if v, ok := sanitizeSourceURL(r.URL.Query().Get("source")); ok {
 		url = v
 	}
 	data := tgPageData{
@@ -209,17 +256,30 @@ func populateTGState(data *tgPageData, url string) {
 // itself is wedged and the user needs to know.
 var httpClient = &http.Client{Timeout: 2 * time.Second}
 
+// openMetaExisting opens the active profile's meta DB ONLY if the
+// file already exists. meta.Open bootstraps schema + a fresh fs_uuid
+// on a missing file, and a read-only page doing that forecloses
+// cold-mount recovery: cmdMount sees a db.sqlite and skips
+// tryRecover, then mounts an empty FS and posts an empty snapshot.
+// Every web-side read path must go through this.
+func openMetaExisting() (*meta.Store, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(cfg.DBPath()); err != nil {
+		return nil, fmt.Errorf("metadata DB not found at %s", cfg.DBPath())
+	}
+	return meta.Open(cfg.DBPath())
+}
+
 // readRateLimitFromMeta opens the active profile's meta DB and
 // returns the current TG UPLOAD rate-limit value. Returns -1 if the
 // meta DB can't be read (no active profile, DB missing, schema not
 // yet initialized) so the template can flag the "unknown" case
 // distinctly from "explicitly unlimited" (0).
 func readRateLimitFromMeta(ctx context.Context) int {
-	cfg, err := config.Load()
-	if err != nil {
-		return -1
-	}
-	mstore, err := meta.Open(cfg.DBPath())
+	mstore, err := openMetaExisting()
 	if err != nil {
 		return -1
 	}
@@ -234,11 +294,7 @@ func readRateLimitFromMeta(ctx context.Context) int {
 // readDownloadRateLimitFromMeta mirrors readRateLimitFromMeta but
 // for the download-direction lane.
 func readDownloadRateLimitFromMeta(ctx context.Context) int {
-	cfg, err := config.Load()
-	if err != nil {
-		return -1
-	}
-	mstore, err := meta.Open(cfg.DBPath())
+	mstore, err := openMetaExisting()
 	if err != nil {
 		return -1
 	}
@@ -291,15 +347,9 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
 		return
 	}
-	cfg, err := config.Load()
+	mstore, err := openMetaExisting()
 	if err != nil {
-		SetFlash(w, "error", "config: "+err.Error())
-		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
-		return
-	}
-	mstore, err := meta.Open(cfg.DBPath())
-	if err != nil {
-		SetFlash(w, "error", "meta.Open: "+err.Error())
+		SetFlash(w, "error", "meta: "+err.Error())
 		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
 		return
 	}

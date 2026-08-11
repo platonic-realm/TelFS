@@ -10,20 +10,37 @@
     isn't a download (SaveFilePart, SaveBigFilePart, SendMedia, journal
     posts, snapshot uploads, channel scans). <strong>Download</strong>
     covers <code>upload.getFile</code> only (cache misses + range reads).
-    The split keeps a heavy upload session from starving reads. The
-    running daemon polls these settings every 5 s — changes take effect
-    without a remount, whether you set them here or via
-    <code>telfs ratelimit set</code>.
+    The split keeps a heavy upload session from starving reads.
+    <br>
+    The upload lane is <strong>adaptive by default</strong> — when no
+    explicit cap is set, the daemon halves the cap on every observed
+    FLOOD_WAIT and slowly raises it during quiet windows. Setting a
+    cap below pins that lane (suspends adaptive); clearing it (0)
+    resumes auto.
   </small></p>
   <dl>
     <dt>Upload</dt>
     <dd>
-      {{if lt .RateLimitPerMin 0}}
+      {{if .State.Adaptive}}
+        {{if .State.Adaptive.UploadPinned}}
+          <strong>{{.State.Adaptive.UploadEffective}}</strong> requests/min
+          <span class="pill muted">pinned</span>
+        {{else}}
+          <strong>{{.State.Adaptive.UploadEffective}}</strong> requests/min
+          <span class="pill ok">auto</span>
+        {{end}}
+        {{if .State.Adaptive.LastAction}}
+          <br><small>{{.State.Adaptive.LastAction}}</small>
+        {{end}}
+        {{if ge .State.Adaptive.LastFloodAgoSec 0}}
+          <br><small>last FLOOD_WAIT: {{.State.Adaptive.LastFloodAgoSec}}s ago</small>
+        {{end}}
+      {{else if lt .RateLimitPerMin 0}}
         <span class="pill muted">unknown</span> <small>— couldn't read meta DB</small>
       {{else if eq .RateLimitPerMin 0}}
-        <span class="pill muted">unlimited</span> <small>— no cap on outgoing upload requests</small>
+        <span class="pill muted">unlimited</span> <small>— daemon not reporting adaptive state</small>
       {{else}}
-        <strong>{{.RateLimitPerMin}}</strong> requests/min
+        <strong>{{.RateLimitPerMin}}</strong> requests/min <span class="pill muted">pinned</span>
       {{end}}
     </dd>
     <dt>Download</dt>
@@ -33,7 +50,7 @@
       {{else if eq .DownloadRateLimitPerMin 0}}
         <span class="pill muted">unlimited</span> <small>— recommended default; TG rarely FLOOD_WAITs downloads</small>
       {{else}}
-        <strong>{{.DownloadRateLimitPerMin}}</strong> requests/min
+        <strong>{{.DownloadRateLimitPerMin}}</strong> requests/min <span class="pill muted">pinned</span>
       {{end}}
     </dd>
   </dl>

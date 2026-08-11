@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -43,6 +44,17 @@ func IsFKViolation(err error) bool {
 // multiple goroutines; SQLite handles serialization internally.
 type Store struct {
 	db *sql.DB
+
+	// writeCounter increments on every successful write through this
+	// Store (single-statement exec or committed transaction). The
+	// snapshot manager uses it to detect "the DB changed since the
+	// last snapshot" for mutations the journal doesn't cover —
+	// chunk_map writes chiefly. In-memory only; resets each process.
+	writeCounter atomic.Int64
+
+	// replaying suppresses journal appends while ReplayOp applies
+	// channel-recovered ops (which already exist on the channel).
+	replaying atomic.Bool
 
 	// onInodeDeleted, if non-nil, is invoked after a committed
 	// transaction has removed an inodes row (whether via Unlink that
@@ -155,6 +167,12 @@ func (s *Store) CheckpointWAL(ctx context.Context) (busy, log, checkpointed int,
 // dump). Most code should use the typed methods on Store and Tx.
 func (s *Store) DB() *sql.DB { return s.db }
 
+// WriteCounter returns the number of successful writes this Store has
+// performed since it was opened. It is a change-detection token, not a
+// persistent statistic: equal values ⇒ no writes in between; the
+// absolute number is meaningless across restarts.
+func (s *Store) WriteCounter() int64 { return s.writeCounter.Load() }
+
 // schemaSQL is the v1 schema. All tables are created idempotently; this is
 // the single migration TelFS ships in M2. Foreign keys cascade from
 // inodes(ino) so a single DELETE on inodes cleans up chunks/xattrs/dirents.
@@ -174,7 +192,12 @@ CREATE TABLE IF NOT EXISTS inodes (
   -- FS default (meta_kv:chunk_size) and possibly promoted by the
   -- writer at first dispatch when the workload warrants bigger
   -- chunks (multi-tier). Always non-zero for files.
-  chunk_size     INTEGER NOT NULL DEFAULT 4194304
+  chunk_size     INTEGER NOT NULL DEFAULT 4194304,
+  -- sparse: 1 when the file legitimately contains holes (see
+  -- meta.Inode.Sparse). Missing chunks of sparse files read as
+  -- zeros, of non-sparse files as data-lost EIO. NOTE: keep this
+  -- comment free of semicolons -- splitStmts splits on them.
+  sparse         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS dirents (
@@ -213,6 +236,8 @@ CREATE TABLE IF NOT EXISTS journal (
   op_json   BLOB    NOT NULL,
   posted_at INTEGER
 );
+
+CREATE INDEX IF NOT EXISTS idx_journal_unposted ON journal(seq) WHERE posted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS meta_kv (
   key   TEXT PRIMARY KEY,
@@ -284,6 +309,14 @@ const KVTGRateLimitPerMin = "tg_rate_limit_per_min"
 // real-world failure mode visible during the kernel-untar incident.
 const KVTGDownloadRateLimitPerMin = "tg_download_rate_limit_per_min"
 
+// KVTGRateLimitMode selects how the upload lane's cap is governed:
+// "adaptive" (default, also when the key is missing) lets the AIMD
+// controller manage it, with a non-zero KVTGRateLimitPerMin acting as
+// an operator pin; "manual" disables adaptive control entirely, so
+// KVTGRateLimitPerMin applies raw and 0 means unlimited (the
+// historical semantics — the escape hatch for fat links).
+const KVTGRateLimitMode = "tg_rate_limit_mode"
+
 // Trash safety-net KV keys. When KVTrashEnabled is set to "1", every
 // kernel-issued unlink/rmdir from FUSE is rerouted to a top-level
 // `.trash/` directory; a TTL GC unlinks them for real after
@@ -314,6 +347,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 		`ALTER TABLE chunk_map ADD COLUMN pack_offset INTEGER`,
 		`ALTER TABLE chunk_map ADD COLUMN pack_size INTEGER`,
 		`ALTER TABLE inodes ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 4194304`,
+		`ALTER TABLE inodes ADD COLUMN sparse INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.ExecContext(ctx, alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("migrate schema: %w", err)
@@ -454,6 +488,39 @@ func (s *Store) SetTGRateLimitPerMin(ctx context.Context, n int) error {
 		return nil
 	}
 	return s.PutKV(ctx, KVTGRateLimitPerMin, []byte(strconv.Itoa(n)))
+}
+
+// TGRateLimitMode returns "adaptive" or "manual" (missing key ⇒
+// "adaptive").
+func (s *Store) TGRateLimitMode(ctx context.Context) (string, error) {
+	v, err := s.GetKV(ctx, KVTGRateLimitMode)
+	if errors.Is(err, ErrNotFound) {
+		return "adaptive", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	mode := strings.TrimSpace(string(v))
+	if mode != "adaptive" && mode != "manual" {
+		return "adaptive", nil // tolerate garbage — safe default
+	}
+	return mode, nil
+}
+
+// SetTGRateLimitMode stores the governance mode. Only "adaptive" and
+// "manual" are accepted; "adaptive" deletes the key (clean default).
+func (s *Store) SetTGRateLimitMode(ctx context.Context, mode string) error {
+	switch mode {
+	case "adaptive":
+		if err := s.DeleteKV(ctx, KVTGRateLimitMode); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		return nil
+	case "manual":
+		return s.PutKV(ctx, KVTGRateLimitMode, []byte(mode))
+	default:
+		return fmt.Errorf("meta: rate limit mode %q (want adaptive or manual)", mode)
+	}
 }
 
 // TGDownloadRateLimitPerMin returns the download-side cap (0 ==
@@ -610,6 +677,7 @@ func (s *Store) WithTx(ctx context.Context, fn func(*sql.Tx) error) (err error) 
 	for attempt := 1; ; attempt++ {
 		err = s.withTxOnce(ctx, fn)
 		if err == nil {
+			s.writeCounter.Add(1)
 			return nil
 		}
 		if !isBusyErr(err) || attempt >= txMaxAttempts {
@@ -682,6 +750,7 @@ func (s *Store) execWithRetry(ctx context.Context, query string, args ...any) (s
 	for attempt := 1; ; attempt++ {
 		res, err := s.db.ExecContext(ctx, query, args...)
 		if err == nil {
+			s.writeCounter.Add(1)
 			return res, nil
 		}
 		if !isBusyErr(err) || attempt >= maxAttempts {

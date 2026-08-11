@@ -87,6 +87,12 @@ type Writer struct {
 	dirtyOrder []int32 // FIFO insertion order — eager-dispatch victims pop from front
 	size       int64
 	closed     bool
+	// sparse mirrors inodes.sparse: the file contains holes (chunk
+	// slots with no data that read as zeros). Set when a write skips
+	// past unwritten space across a chunk boundary, or by truncate-
+	// grow. Once set it's persisted via meta.SetInodeSparse and never
+	// cleared.
+	sparse bool
 	// hasDispatched is true once at least one chunk has been
 	// dispatched (or the inode already had chunks at NewWriter
 	// time). Once set, chunkSz is locked — promoting would
@@ -175,9 +181,24 @@ func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher 
 		ino:           ino,
 		dirty:         make(map[int32]*dirtyChunk),
 		size:          in.Size,
+		sparse:        in.Sparse,
 		uploading:     make(map[int32]chan struct{}),
 		hasDispatched: hasDispatched,
 	}, nil
+}
+
+// markSparseLocked persists the sparse flag (once) and records it on
+// the writer. Caller holds w.mu. From this point missing chunks of
+// this inode read as zeros instead of data-lost EIO.
+func (w *Writer) markSparseLocked(ctx context.Context) error {
+	if w.sparse {
+		return nil
+	}
+	if err := w.meta.SetInodeSparse(ctx, w.ino); err != nil {
+		return fmt.Errorf("mark sparse %d: %w", w.ino, err)
+	}
+	w.sparse = true
+	return nil
 }
 
 // Size returns the current logical file size including unflushed writes.
@@ -211,11 +232,27 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 	// recordLost, so Flush/Sync surface them at the durability
 	// checkpoint where it actually matters.
 
-	// Materialize any sparse region between size and off as zeros. This
-	// is wasteful for true sparse files but correct (POSIX reads of holes
-	// return zero). M6 may add real sparse handling.
+	// Writing past EOF. Two shapes:
+	//
+	//   - The gap stays inside the chunk that currently ends the file:
+	//     zero-fill it in the dirty buffer (bounded by one chunk).
+	//
+	//   - The gap crosses a chunk boundary: DO NOT materialize the
+	//     intermediate chunks. The old behavior allocated and uploaded
+	//     every zero chunk in the gap — a `dd seek=100G` materialized
+	//     ~100 GB in RAM (OOM-killing the daemon) and then would have
+	//     shipped it all to Telegram. Instead, mark the inode sparse:
+	//     the reader zero-fills missing chunks and zero-pads short
+	//     ones for sparse files, so POSIX hole semantics hold with no
+	//     RAM, no upload, and no chunk_map rows.
 	if off > w.size {
-		if err := w.materializeZeros(ctx, w.size, off); err != nil {
+		holeStartIdx := w.size / w.chunkSz
+		targetIdx := off / w.chunkSz
+		if holeStartIdx == targetIdx {
+			if err := w.materializeZeros(ctx, w.size, off); err != nil {
+				return 0, err
+			}
+		} else if err := w.markSparseLocked(ctx); err != nil {
 			return 0, err
 		}
 	}
@@ -364,6 +401,14 @@ func (w *Writer) maybePromoteLocked(ctx context.Context) error {
 	if w.hasDispatched {
 		return nil
 	}
+	// Sparse files never promote: the re-chunk below materializes one
+	// contiguous buffer of w.size bytes, which for a sparse file is
+	// mostly holes (a 100 GB preallocation would OOM), and re-chunking
+	// would turn those holes into real zero chunks. The default tier
+	// is fine — holes cost no chunk_map rows at any tier.
+	if w.sparse {
+		return nil
+	}
 	// Don't auto-promote artificially small chunk sizes — those are
 	// either tests exercising multi-chunk paths with toy sizes, or
 	// user overrides from `telfs init --chunk-size N` that should
@@ -463,9 +508,11 @@ func (w *Writer) materializeZeros(ctx context.Context, from, to int64) error {
 
 // Truncate sets the file's logical size to n. If n shrinks the file:
 // dirty chunks past n are dropped; meta chunks past n are deleted; the
-// last surviving chunk is trimmed if needed. If n grows the file, just
-// updates the recorded size (reads of the new region return zero until
-// it's actually written).
+// last surviving chunk is trimmed if needed (including the PERSISTED
+// copy — otherwise a later re-grow would resurrect the old bytes past
+// n instead of reading zeros). If n grows the file, the recorded size
+// is bumped and the inode is marked sparse so the new region reads as
+// zeros.
 func (w *Writer) Truncate(ctx context.Context, n int64) error {
 	if n < 0 {
 		return fmt.Errorf("writer: negative truncate size %d", n)
@@ -477,20 +524,52 @@ func (w *Writer) Truncate(ctx context.Context, n int64) error {
 	}
 
 	if n > w.size {
-		// Grow: just bump size. Reads past current data return zeros via
-		// chunk.Reader's "missing chunk = EOF" semantics; full sparse
-		// support is deferred.
+		// Grow: bump size and mark sparse — the region [old size, n)
+		// has no chunks, and short boundary chunks must zero-pad on
+		// read. Without the flag the reader would report the missing
+		// region as data-lost EIO.
+		if err := w.markSparseLocked(ctx); err != nil {
+			return err
+		}
 		w.size = n
 		// Persist size eagerly so cold readers see the new size before any
 		// write actually fills the hole.
 		return w.meta.SetSize(ctx, w.ino, n)
 	}
 
-	// Shrink. Drop dirty chunks fully past n.
+	// Shrink. First wait out any in-flight uploads for chunks at/past
+	// the truncation point: their PutChunk (which runs on Background
+	// ctx) would otherwise re-insert rows AFTER our DeleteChunksAbove,
+	// leaving stale chunks that a later re-grow would resurrect.
 	lastIdx := int32((n - 1) / w.chunkSz)
 	if n == 0 {
 		lastIdx = -1
 	}
+	for {
+		var waitCh chan struct{}
+		for idx, ch := range w.uploading {
+			if idx >= lastIdx { // boundary chunk included — we may trim it below
+				waitCh = ch
+				break
+			}
+		}
+		if waitCh == nil {
+			break
+		}
+		w.mu.Unlock()
+		select {
+		case <-waitCh:
+		case <-ctx.Done():
+			w.mu.Lock()
+			return ctx.Err()
+		}
+		w.mu.Lock()
+		if w.closed {
+			return fmt.Errorf("writer: handle closed")
+		}
+	}
+
+	// Drop dirty chunks fully past n; trim the dirty boundary chunk.
 	for idx, dc := range w.dirty {
 		if idx > lastIdx {
 			w.dirtyBytes -= int64(len(dc.data))
@@ -508,6 +587,31 @@ func (w *Writer) Truncate(ctx context.Context, n int64) error {
 			if int64(len(dc.data)) > rel {
 				w.dirtyBytes -= int64(len(dc.data)) - rel
 				dc.data = dc.data[:rel]
+			}
+		}
+	}
+	// If the boundary chunk is NOT dirty but exists persisted with
+	// bytes past n, load + trim + re-dirty it so the next flush
+	// replaces the stored copy. Skipping this used to leave the full
+	// old chunk on the channel: reads clamped at size so it stayed
+	// invisible — until a truncate-grow re-exposed the stale bytes
+	// where POSIX promises zeros.
+	if lastIdx >= 0 {
+		rel := n - int64(lastIdx)*w.chunkSz
+		if rel > 0 {
+			if _, isDirty := w.dirty[lastIdx]; !isDirty {
+				if c, err := w.meta.GetChunk(ctx, w.ino, lastIdx); err == nil && int64(c.Size) > rel {
+					dc, err := w.loadForWrite(ctx, lastIdx)
+					if err != nil {
+						return fmt.Errorf("truncate: load boundary chunk %d: %w", lastIdx, err)
+					}
+					if int64(len(dc.data)) > rel {
+						w.dirtyBytes -= int64(len(dc.data)) - rel
+						dc.data = dc.data[:rel]
+					}
+				} else if err != nil && !errors.Is(err, meta.ErrNotFound) {
+					return fmt.Errorf("truncate: probe boundary chunk %d: %w", lastIdx, err)
+				}
 			}
 		}
 	}
@@ -728,21 +832,37 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	}()
 	var restore bool
 	var lastErr error // captured by the error sites; used by the defer to call recordLost on drop-on-floor
+	// pendingPath is the on-disk staging file for this chunk's wire,
+	// set by whichever route (pack or direct) staged it. Shared with
+	// the restore defer: a failed upload whose wire is staged is NOT
+	// lost — reads serve it via the staging fallback and the next
+	// mount re-submits it.
+	var pendingPath string
 	defer func() {
 		if !restore {
 			return
 		}
 		w.mu.Lock()
 		if w.closed {
-			// Writer already detached. There's no dirty map to put dc
-			// back into and no Flush will retry. Promote the transient
-			// error to a LOST chunk: uploadErr gets the sticky failure
-			// so any concurrent Flush surfaces it (rare race) and the
-			// daemon log records the data-loss event explicitly.
+			// Writer already detached — no dirty map to put dc back
+			// into and no Flush will retry in this session.
 			w.mu.Unlock()
-			if lastErr != nil {
-				w.recordLost(lastErr)
+			if lastErr == nil {
+				return
 			}
+			if pendingPath != "" {
+				// The wire survives on disk: readable now via the
+				// staging fallback, re-submitted on next mount by
+				// recoverPending. Recoverable, not lost.
+				fmt.Fprintf(os.Stderr, "[writer] upload failed after handle close (ino=%d idx=%d): %v — wire staged at %s for recovery\n",
+					w.ino, idx, lastErr, pendingPath)
+				return
+			}
+			// No staging (PendingDir unset) — genuinely lost. Promote
+			// to a LOST chunk: uploadErr gets the sticky failure so
+			// any concurrent Flush surfaces it, and the daemon log
+			// records the data-loss event explicitly.
+			w.recordLost(lastErr)
 			return
 		}
 		if _, hasNew := w.dirty[idx]; !hasNew {
@@ -816,7 +936,6 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		// packer's chunk_map write doesn't lose the bytes. The
 		// pending dir lives under the cache root; restart scans
 		// it and re-submits via Backend.RecoverPending.
-		var pendingPath string
 		if dir := w.pool.PendingDir; dir != "" {
 			p, perr := PersistPending(dir, w.ino, idx, int32(len(dc.data)), wire)
 			if perr != nil {
@@ -826,6 +945,13 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 				return
 			}
 			pendingPath = p
+			// Drop a previous generation of this slot (a retry whose
+			// wire length differed writes a different filename) so
+			// recovery never sees two competing files — same contract
+			// as the direct route below.
+			if old, ok := w.pool.PendingIndex.Lookup(w.ino, idx); ok && old != p {
+				_ = DeletePending(old)
+			}
 			w.pool.PendingIndex.RecordPersist(w.ino, idx, p)
 		}
 		// Release the upload SEM slot before waiting on the packer's
@@ -859,6 +985,33 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		}
 	}
 
+	// Stage the wire on disk BEFORE the network round-trip — same
+	// contract the pack route has always had. Until this existed,
+	// direct-route chunks lived only in RAM: a daemon crash mid-
+	// upload, or a retry ladder exhausted after FUSE Release (when
+	// there's no dirty map left to restore into), silently lost the
+	// bytes even though close() had already returned success. With
+	// the wire staged, (a) reads serve it via the staging fallback,
+	// (b) the next daemon startup re-submits it via recoverPending,
+	// and (c) recordLost stops being a data-loss event.
+	if dir := w.pool.PendingDir; dir != "" {
+		p, perr := PersistPending(dir, w.ino, idx, int32(len(dc.data)), wire)
+		if perr != nil {
+			restore = true
+			lastErr = fmt.Errorf("persist pending chunk %d: %w", idx, perr)
+			w.recordTransient(lastErr)
+			return
+		}
+		pendingPath = p
+		// A previous attempt at this slot may have staged a wire of a
+		// different length (different filename). Drop it so recovery
+		// never sees two generations of the same slot.
+		if old, ok := w.pool.PendingIndex.Lookup(w.ino, idx); ok && old != p {
+			_ = DeletePending(old)
+		}
+		w.pool.PendingIndex.RecordPersist(w.ino, idx, p)
+	}
+
 	name := fmt.Sprintf("ino%d-idx%d", w.ino, idx)
 	msgID, err := uploadWithRetry(ctx, w.uploader, wire, name, "")
 	if err != nil {
@@ -883,6 +1036,18 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		TGMessageID: int64(msgID),
 		Size:        int32(len(dc.data)),
 	}); err != nil {
+		// FK violation = the inode was unlinked while this upload was
+		// in flight. The row isn't wanted anymore; retrying would fail
+		// forever. Drop the chunk (message becomes gc fodder) and the
+		// staged wire (it would re-upload on next mount otherwise).
+		if meta.IsFKViolation(err) {
+			if pendingPath != "" {
+				_ = DeletePending(pendingPath)
+				w.pool.PendingIndex.UnrecordPersist(w.ino, idx)
+			}
+			fmt.Fprintf(os.Stderr, "[writer] dropped orphan chunk ino=%d/%d (inode gone, msg %d kept for gc)\n", w.ino, idx, msgID)
+			return
+		}
 		// At this point the chunk IS on the channel (TG message exists)
 		// but chunk_map didn't get the row. Treat as failure and restore
 		// to dirty for retry — the next Flush will re-upload and the
@@ -891,6 +1056,13 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		lastErr = fmt.Errorf("chunk_map %d: %w", idx, err)
 		w.recordTransient(lastErr)
 		return
+	}
+	// chunk_map row landed — the staged wire is superseded. Leaving it
+	// would re-upload on the next startup and orphan the just-landed
+	// message.
+	if pendingPath != "" {
+		_ = DeletePending(pendingPath)
+		w.pool.PendingIndex.UnrecordPersist(w.ino, idx)
 	}
 	if w.dedupEnabled() {
 		// Best-effort index update. A failure here doesn't lose data —

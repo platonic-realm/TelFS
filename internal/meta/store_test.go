@@ -68,3 +68,25 @@ func TestOpenIdempotent(t *testing.T) {
 		t.Fatalf("kind after reopen = %q, want file", got.Kind)
 	}
 }
+
+// TestUsage: the statfs aggregate counts file bytes and all inodes.
+func TestUsage(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	if _, err := s.CreateChild(ctx, RootIno, "a", Inode{Kind: KindFile, Mode: 0o100644, Size: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateChild(ctx, RootIno, "d", Inode{Kind: KindDir, Mode: 0o40755}); err != nil {
+		t.Fatal(err)
+	}
+	u, err := s.Usage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.FileBytes != 1000 {
+		t.Fatalf("FileBytes = %d, want 1000 (dirs must not count)", u.FileBytes)
+	}
+	if u.Inodes != 3 { // root + file + dir
+		t.Fatalf("Inodes = %d, want 3", u.Inodes)
+	}
+}

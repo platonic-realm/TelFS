@@ -44,9 +44,9 @@ func (s *Server) compressShow(w http.ResponseWriter, r *http.Request) {
 	} else {
 		d.Codec = compress.NameNone
 	}
-	if refs, err := mstore.AllChunkMessageIDs(ctx); err == nil {
-		d.ChunkCount = len(refs)
-		d.HasChunks = len(refs) > 0
+	if n, err := mstore.CountChunks(ctx); err == nil {
+		d.ChunkCount = int(n)
+		d.HasChunks = n > 0
 	}
 	s.renderTemplate(w, "compress/show.html", d)
 }
@@ -62,7 +62,7 @@ func (s *Server) compressInitForm(w http.ResponseWriter, r *http.Request) {
 	if cfg, err := config.Load(); err == nil {
 		if _, err := os.Stat(cfg.DBPath()); err == nil {
 			if mstore, err := meta.Open(cfg.DBPath()); err == nil {
-				if refs, err := mstore.AllChunkMessageIDs(r.Context()); err == nil && len(refs) > 0 {
+				if has, err := mstore.HasAnyChunks(r.Context()); err == nil && has {
 					d.HasChunks = true
 				}
 				if codec, err := mstore.CompressionCodec(r.Context()); err == nil {
@@ -111,14 +111,14 @@ func (s *Server) compressInitSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/compression", http.StatusSeeOther)
 		return
 	}
-	refs, err := mstore.AllChunkMessageIDs(ctx)
+	has, err := mstore.HasAnyChunks(ctx)
 	if err != nil {
 		SetFlash(w, "error", "scan chunk_map: "+err.Error())
 		http.Redirect(w, r, "/compression/init", http.StatusSeeOther)
 		return
 	}
-	if len(refs) > 0 {
-		SetFlash(w, "error", fmt.Sprintf("refuses to change codec from %q to %q while %d chunk(s) exist. Start a fresh TelFS with `cp -r` your data.", current, codec, len(refs)))
+	if has {
+		SetFlash(w, "error", fmt.Sprintf("refuses to change codec from %q to %q while chunks exist. Start a fresh TelFS with `cp -r` your data.", current, codec))
 		http.Redirect(w, r, "/compression/init", http.StatusSeeOther)
 		return
 	}
