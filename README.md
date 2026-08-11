@@ -9,7 +9,7 @@ Files are chunked, optionally encrypted with AES-256-GCM, and uploaded
 as channel messages; a local SQLite database holds the metadata and is
 periodically snapshotted back to the same channel so a fresh machine
 with the right credentials and passphrase can mount and read every
-byte. Pure-Go, single static binary, optional Alpine container.
+byte. Pure-Go, single static binary.
 
 ```sh
 telfs profile create main && telfs profile use main
@@ -112,12 +112,9 @@ sudo install telfs-*/telfs /usr/local/bin/telfs
 
 # Build from source (Go 1.22+):
 git clone https://github.com/platonic-realm/TelFS.git && cd TelFS && make build
-
-# Container (headless / NAS — see Deployment):
-docker pull ghcr.io/platonic-realm/telfs:latest
 ```
 
-All paths produce the same static binary; `fusermount` (`fuse3` or
+Both paths produce the same static binary; `fusermount` (`fuse3` or
 `fuse2`) must be in `$PATH` for unmount. Get a Telegram API ID + hash
 at <https://my.telegram.org/apps>.
 
@@ -481,117 +478,12 @@ exist but aren't the recommended path).
 
 ## Deployment
 
-**Static binary** (desktop/laptop): `make release` →
+**Static binary**: `make release` →
 `dist/telfs-vX.Y.Z-linux-amd64.tar.gz`. Built with `CGO_ENABLED=0
 -trimpath -ldflags '-s -w'`; copies to any Linux host (needs only
-kernel FUSE + `fusermount`).
-
-**Alpine container** (headless/NAS/server, ~20 MB compressed; ships
-`telfs` + `fuse3` + `ca-certificates` + `tini`):
-
-```sh
-docker pull ghcr.io/platonic-realm/telfs:latest      # multi-arch
-make docker                                          # build locally
-```
-
-### FUSE in a container — non-negotiable runtime flags
-
-| Flag | Why |
-|---|---|
-| `--cap-add SYS_ADMIN` | FUSE mounts need it. |
-| `--device /dev/fuse` | Kernel character device passthrough. |
-| `--security-opt apparmor:unconfined` | Default profile on Ubuntu/Debian blocks FUSE. |
-
-### Bind mounts
-
-| Container path | Host path | Purpose |
-|---|---|---|
-| `/root/.config/telfs` | `~/.config/telfs` | Profiles (session + db + cache + config). RW. |
-| `/mnt/telfs` | wherever the FS appears | Mountpoint. **Must use `bind-propagation=rshared`** so the in-container FUSE mount is visible host-side. |
-
-### First-time setup (interactive shell inside the container)
-
-```sh
-docker run --rm -it \
-  --cap-add SYS_ADMIN --device /dev/fuse \
-  --security-opt apparmor:unconfined \
-  -v $HOME/.config/telfs:/root/.config/telfs \
-  --entrypoint sh ghcr.io/platonic-realm/telfs:latest
-
-# Inside:
-telfs profile create main && telfs profile use main
-telfs login
-telfs channel set <id>
-telfs encrypt init                                   # optional
-exit
-```
-
-### Mount + web
-
-```sh
-# Mount as a long-running container (clean shutdown via tini on docker stop):
-mkdir -p /srv/external
-docker run -d --name telfs-main --restart unless-stopped \
-  --cap-add SYS_ADMIN --device /dev/fuse \
-  --security-opt apparmor:unconfined \
-  -v $HOME/.config/telfs:/root/.config/telfs \
-  --mount type=bind,source=/srv/external,target=/mnt/telfs,bind-propagation=rshared \
-  -e TELFS_PROFILE=main -e TELFS_PASSPHRASE=secret \
-  ghcr.io/platonic-realm/telfs:latest mount /mnt/telfs
-
-# Web UI (no FUSE caps needed unless this container itself runs `mount`):
-docker run -d --name telfs-web -p 127.0.0.1:8080:8080 \
-  -v $HOME/.config/telfs:/root/.config/telfs \
-  ghcr.io/platonic-realm/telfs:latest web --listen 0.0.0.0:8080
-```
-
-`-e TELFS_PASSPHRASE` is only needed for encrypted FSes.
-
-### Docker Compose
-
-```yaml
-services:
-  telfs-mount:
-    image: ghcr.io/platonic-realm/telfs:latest
-    command: ["mount", "/mnt/telfs"]
-    restart: unless-stopped
-    cap_add: [SYS_ADMIN]
-    devices: ["/dev/fuse"]
-    security_opt: ["apparmor:unconfined"]
-    environment:
-      TELFS_PROFILE: main
-      TELFS_PASSPHRASE: secret
-    volumes:
-      - ${HOME}/.config/telfs:/root/.config/telfs
-      - type: bind
-        source: /srv/external
-        target: /mnt/telfs
-        bind: { propagation: rshared }
-
-  telfs-web:
-    image: ghcr.io/platonic-realm/telfs:latest
-    command: ["web", "--listen", "0.0.0.0:8080"]
-    restart: unless-stopped
-    ports: ["127.0.0.1:8080:8080"]
-    volumes:
-      - ${HOME}/.config/telfs:/root/.config/telfs
-```
-
-### Container troubleshooting
-
-- `fuse: device not found, try 'modprobe fuse'` → `sudo modprobe fuse`
-  on the host (persist via `/etc/modules-load.d/`).
-- `fusermount: mount failed: Operation not permitted` → missing
-  `--cap-add SYS_ADMIN` or AppArmor is blocking (add
-  `--security-opt apparmor:unconfined`).
-- Mount works inside the container but `ls` on the host shows nothing →
-  bind mount didn't use `rshared`.
-- `failed to drop capability cap_sys_admin` → Docker daemon ran with
-  `--no-new-privileges` globally; lift for this container.
-
-Static binary wins on desktops where mount + UI live next to other
-native tools; container wins on headless servers where FUSE is shared
-but userland is locked.
+kernel FUSE + `fusermount`). Container images were dropped for now —
+FUSE-in-Docker needs `SYS_ADMIN` + `/dev/fuse` + `rshared` bind
+propagation, which is more ceremony than the static binary deserves.
 
 ## Running unattended
 

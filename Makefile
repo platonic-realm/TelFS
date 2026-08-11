@@ -26,11 +26,8 @@ DIST   := dist
 GOOS   ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
-# Docker image tag (override via `make docker DOCKER_TAG=...`).
-DOCKER_TAG ?= telfs:$(VERSION)
-
 .PHONY: help build run test test-race lint fmt vet tidy clean mount umount \
-        release release-all docker docker-run
+        release release-all
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
@@ -100,22 +97,3 @@ _release-one:
 	cp LICENSE README.md $$target/; \
 	tar czf $$target.tar.gz -C $(DIST) telfs-$(VERSION)-$(GOOS)-$(GOARCH); \
 	echo "  $$(du -sh $$target.tar.gz | cut -f1)  $$target.tar.gz"
-
-# ── Container ────────────────────────────────────────────────────────
-
-docker: ## Build the Alpine container image (tag: $(DOCKER_TAG))
-	docker build \
-	  --build-arg VERSION=$(VERSION) \
-	  --build-arg COMMIT=$(COMMIT) \
-	  --build-arg BUILD_DATE=$(BUILD_DATE) \
-	  -t $(DOCKER_TAG) .
-
-# Example invocation — adjust to your paths.
-docker-run: ## Run the container with FUSE caps + propagated bind mount
-	docker run --rm -it \
-	  --cap-add SYS_ADMIN --device /dev/fuse \
-	  --security-opt apparmor:unconfined \
-	  -v $$HOME/.config/telfs:/root/.config/telfs \
-	  --mount type=bind,source=$$PWD/mnt,target=/mnt/telfs,bind-propagation=rshared \
-	  -e TELFS_PROFILE=$${TELFS_PROFILE:-main} \
-	  $(DOCKER_TAG) mount /mnt/telfs

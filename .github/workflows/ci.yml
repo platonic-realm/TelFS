@@ -33,26 +33,3 @@ jobs:
 
       - name: telfs version (sanity)
         run: /tmp/telfs version
-
-  docker-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build container (no push)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          load: true
-          tags: telfs:ci
-          build-args: |
-            VERSION=ci-${{ github.sha }}
-            COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-
-      - name: Smoke-test the image
-        run: docker run --rm telfs:ci version
