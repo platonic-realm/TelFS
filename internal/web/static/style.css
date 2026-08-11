@@ -15,12 +15,13 @@
      margin with a node at each section — the page itself diagrams
      "everything here hangs off one wire".
    · Status is shown as panel LAMPS (colored dots + terse caps), not
-     tinted bubbles. Color is reserved for signal: copper = identity/
-     action, green/amber/red = health. Nothing else gets color.
+     tinted bubbles. Color is reserved for signal: amber = identity/
+     action, green/red = health. Nothing else gets color.
    · Buttons are rubber STAMPS: bordered caps, square corners.
-   · Dark mode is the primary ("night wire": Prussian ink + aged-
-     paper text + copper); light mode is the "day copy" (telegram
-     blank: manila paper + iron-gall ink).
+   · Dark mode is the primary: amber phosphor on black (P3 terminal),
+     per operator request. Light mode is the "day copy": black ink on
+     amber paper. The accent token is still NAMED --copper for
+     stability; it holds amber now.
    ════════════════════════════════════════════════════════════════ */
 
 /* ─── typeface ──────────────────────────────────────────────────── */
@@ -46,59 +47,65 @@
   font-display: swap;
 }
 
-/* ─── tokens: night wire (primary) ──────────────────────────────── */
+/* ─── tokens: night wire (primary) — amber phosphor on black ────── */
+/* Palette per operator request: black and amber. The dark theme is a
+   P3-phosphor terminal: near-black with a warm cast, one amber
+   brightness ladder carrying all text hierarchy, pure amber as the
+   wire/accent. Green/red survive ONLY as health lamps — status
+   semantics are functional, not decorative. (--copper keeps its
+   token name for stability; it now holds amber.) */
 :root {
-  --paper:       #101a2b;  /* Prussian ink                          */
-  --raised:      #16233a;  /* hover rows, menus, flashes            */
-  --well:        #0b1322;  /* inputs, code, table heads             */
-  --ink:         #e8e0ce;  /* aged telegram paper, as text          */
-  --ink-muted:   #a39a86;
-  --ink-subtle:  #6d7688;  /* steel — de-emphasized structure text  */
-  --rule:        #263450;  /* hairlines                             */
-  --rule-strong: #3a4d6e;  /* section rules, input borders          */
-  --copper:      #c87e4f;  /* the wire. identity + primary action   */
-  --copper-hi:   #e29b6a;
-  --on-copper:   #14100b;
-  --lamp-ok:     #82b36c;
-  --lamp-warn:   #d9a036;
-  --lamp-err:    #db4e35;
+  --paper:       #0b0906;  /* black, warm cast                      */
+  --raised:      #17120a;  /* hover rows, menus, flashes            */
+  --well:        #060503;  /* inputs, code, table heads             */
+  --ink:         #e8b96f;  /* body text — mid phosphor              */
+  --ink-muted:   #9a7b45;
+  --ink-subtle:  #6b5834;  /* dimmed structure text                 */
+  --rule:        #2a2213;  /* hairlines                             */
+  --rule-strong: #4a3a1e;  /* section rules, input borders          */
+  --copper:      #ffb000;  /* THE amber. wire + identity + action   */
+  --copper-hi:   #ffc933;
+  --on-copper:   #140e02;
+  --lamp-ok:     #7dc97a;
+  --lamp-warn:   #ffb000;
+  --lamp-err:    #ff5533;
   --ok-fg:       var(--lamp-ok);
   --warn-fg:     var(--lamp-warn);
   --err-fg:      var(--lamp-err);
   --font: "Plex Mono", ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 }
 
-/* day copy (light) — follow system unless the toggle overrides */
+/* day copy (light): black ink on amber paper — same family, inverted */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
-    --paper:       #f2ede2;
-    --raised:      #f8f4eb;
-    --well:        #e9e2d0;
-    --ink:         #262119;
-    --ink-muted:   #6e6552;
-    --ink-subtle:  #97907d;
-    --rule:        #dcd3bf;
-    --rule-strong: #b8ad92;
-    --copper:      #a85e2c;
-    --copper-hi:   #8a4c22;
-    --on-copper:   #f8f4eb;
+    --paper:       #f3e5c3;
+    --raised:      #f8eed5;
+    --well:        #ead9ac;
+    --ink:         #1e1608;
+    --ink-muted:   #6b5a33;
+    --ink-subtle:  #97845a;
+    --rule:        #d9c69a;
+    --rule-strong: #b39b64;
+    --copper:      #a86e00;
+    --copper-hi:   #8a5a00;
+    --on-copper:   #f8eed5;
     --lamp-ok:     #3e7a46;
     --lamp-warn:   #96660a;
     --lamp-err:    #b03a24;
   }
 }
 :root[data-theme="light"] {
-  --paper:       #f2ede2;
-  --raised:      #f8f4eb;
-  --well:        #e9e2d0;
-  --ink:         #262119;
-  --ink-muted:   #6e6552;
-  --ink-subtle:  #97907d;
-  --rule:        #dcd3bf;
-  --rule-strong: #b8ad92;
-  --copper:      #a85e2c;
-  --copper-hi:   #8a4c22;
-  --on-copper:   #f8f4eb;
+  --paper:       #f3e5c3;
+  --raised:      #f8eed5;
+  --well:        #ead9ac;
+  --ink:         #1e1608;
+  --ink-muted:   #6b5a33;
+  --ink-subtle:  #97845a;
+  --rule:        #d9c69a;
+  --rule-strong: #b39b64;
+  --copper:      #a86e00;
+  --copper-hi:   #8a5a00;
+  --on-copper:   #f8eed5;
   --lamp-ok:     #3e7a46;
   --lamp-warn:   #96660a;
   --lamp-err:    #b03a24;
