@@ -80,7 +80,7 @@ func statusPillKind(s string) string {
 
 type mountNewData struct {
 	pageBase
-	Profiles      []string
+	Profiles       []string
 	DefaultProfile string
 }
 
@@ -100,16 +100,17 @@ func (s *Server) mountStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
+	errBack := setupReturn(r, "/mount/new")
 	profile := strings.TrimSpace(r.FormValue("profile"))
 	mountpoint := strings.TrimSpace(r.FormValue("mountpoint"))
 	if profile == "" {
 		SetFlash(w, "error", "profile is required")
-		http.Redirect(w, r, "/mount/new", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	if mountpoint == "" {
 		SetFlash(w, "error", "mountpoint is required")
-		http.Redirect(w, r, "/mount/new", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	opts := StartOpts{
@@ -122,7 +123,7 @@ func (s *Server) mountStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := s.sup.Start(opts); err != nil {
 		SetFlash(w, "error", "start: "+err.Error())
-		http.Redirect(w, r, "/mount/new", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	SetFlash(w, "ok", fmt.Sprintf("starting mount for %s at %s — tail the log to verify", profile, mountpoint))
@@ -155,14 +156,23 @@ func (s *Server) mountUnmountExternal(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirectTo, http.StatusSeeOther)
 }
 
-// ── POST /mount/{profile}/stop ────────────────────────────────────
+// ── POST /mount/stop ──────────────────────────────────────────────
+//
+// Profile arrives as a form field (see router.go: synthetic
+// "adopted:<mountpoint>" keys contain slashes and can't ride in a
+// path segment).
 
 func (s *Server) mountStop(w http.ResponseWriter, r *http.Request) {
 	if err := s.state.CheckCSRF(r); err != nil {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
-	profile := r.PathValue("profile")
+	profile := strings.TrimSpace(r.FormValue("profile"))
+	if profile == "" {
+		SetFlash(w, "error", "stop: profile is required")
+		http.Redirect(w, r, "/mount", http.StatusSeeOther)
+		return
+	}
 	if err := s.sup.Stop(profile); err != nil {
 		SetFlash(w, "error", "stop: "+err.Error())
 		http.Redirect(w, r, "/mount", http.StatusSeeOther)

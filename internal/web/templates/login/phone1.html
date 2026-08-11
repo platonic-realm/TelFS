@@ -1,12 +1,44 @@
 {{define "content"}}
+{{if .LoggedIn}}
+<h2>Login</h2>
+<section class="card">
+  <h3>This profile is logged in</h3>
+  <dl>
+    <dt>Profile</dt><dd><code>{{.Profile}}</code></dd>
+    <dt>Identity</dt><dd><code>{{.Identity}}</code></dd>
+  </dl>
+  {{if .Mounted}}
+  <p><span class="pill warn">mounted</span> The session is in use by the mount at <code>{{.Mountpoint}}</code>. Stop the mount on the <a href="/mount">Mounts page</a> before logging out.</p>
+  {{else}}
+  <form method="post" action="/login/logout" onsubmit="return confirm('Log out {{.Identity}}? The channel binding is kept — logging back into the SAME account resumes where you left off. A different account must re-bind the channel.');">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit" class="danger">Log out</button>
+  </form>
+  {{end}}
+  <p><small>A profile is one identity — logging in again requires logging out first. To run a second account side by side, <a href="/profiles/new">create another profile</a> instead.</small></p>
+</section>
+{{else}}
 <h2>Phone login · step 1 of 3</h2>
 <form method="post" action="/login/phone/start" autocomplete="off">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
+  {{if .NeedAPI}}
+  <fieldset>
+    <legend>API credentials</legend>
+    <p><small>TelFS speaks the MTProto API directly, which requires an application identity. Get the api_id + api_hash pair once at <a href="https://my.telegram.org/apps">my.telegram.org/apps</a> — one pair works for every profile.</small></p>
+    <label>API ID
+      <input type="text" name="api_id" required pattern="[0-9]+" inputmode="numeric" placeholder="numeric id from my.telegram.org" {{if .APIID}}value="{{.APIID}}"{{end}}>
+    </label>
+    <label>API hash
+      <input type="text" name="api_hash" required placeholder="32-char hash from my.telegram.org">
+    </label>
+  </fieldset>
+  {{end}}
   <label>Phone number (international, e.g. +14155552671)
     <input type="text" name="phone" required pattern="\+[0-9]+" placeholder="+...">
   </label>
   <button type="submit">Send code</button>
-  <a href="/login" class="btn">Cancel</a>
+  <a href="/" class="btn">Cancel</a>
 </form>
-<p><small>Telegram will send a 5-digit code via SMS or via the Telegram app's notifications.</small></p>
+<p><small>Telegram will send a 5-digit code via SMS or via the Telegram app's notifications. Active profile: <code>{{.Profile}}</code> — login writes to that profile's <code>session.json</code>.</small></p>
+{{end}}
 {{end}}

@@ -11,20 +11,9 @@
     <h3>Progress</h3>
     <ol class="wizard-stepper">
       {{range $i, $step := .Steps}}
-        <li class="wizard-step
-          {{if $step.Done}}done{{end}}
-          {{if eq $i $.CurrentIdx}}current{{end}}
-          {{if index $.Skipped $i}}skipped{{end}}">
-          {{if $step.Done}}
-            <span class="pill ok">done</span>
-          {{else if eq $i $.CurrentIdx}}
-            <span class="pill acc">step {{add1 $i}}</span>
-          {{else if index $.Skipped $i}}
-            <span class="pill muted">skipped</span>
-          {{else}}
-            <span class="pill muted">step {{add1 $i}}</span>
-          {{end}}
-          <span class="wizard-step-label">{{$step.Label}}</span>
+        <li class="wizard-step{{if $step.Done}} done{{end}}{{if eq $i $.CurrentIdx}} current{{end}}{{if index $.Skipped $i}} skipped{{end}}">
+          <span class="wizard-step-num">{{if $step.Done}}✓{{else}}{{add1 $i}}{{end}}</span>
+          <span class="wizard-step-label">{{$step.Label}}{{if index $.Skipped $i}} (skipped){{end}}</span>
         </li>
       {{end}}
     </ol>
@@ -36,10 +25,119 @@
         <h3>Step {{add1 $.CurrentIdx}} of {{len $.Steps}} — {{.Label}}</h3>
         {{if .Optional}}<p><span class="pill muted">optional</span> You can skip this step. <em>{{.Why}}</em></p>{{end}}
         <p>{{.Detail}}</p>
+
+        {{/* ── the step's INLINE form ─────────────────────────── */}}
+        {{if eq .Key "profile"}}
+        <form method="post" action="/profiles" autocomplete="off">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="from" value="setup">
+          <label>Profile name
+            <input type="text" name="name" required pattern="[a-zA-Z0-9_-]+" placeholder="main" autofocus>
+          </label>
+          <button type="submit">Create &amp; activate</button>
+        </form>
+
+        {{else if eq .Key "api"}}
+        <form method="post" action="/profiles/{{$.Active}}/api" autocomplete="off">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="from" value="setup">
+          <label>API ID
+            <input type="text" name="api_id" required pattern="[0-9]+" inputmode="numeric" placeholder="numeric id from my.telegram.org" {{if $.APIID}}value="{{$.APIID}}"{{end}} autofocus>
+          </label>
+          <label>API hash
+            <input type="text" name="api_hash" required placeholder="32-char hash from my.telegram.org">
+          </label>
+          <button type="submit">Save credentials</button>
+        </form>
+
+        {{else if eq .Key "auth"}}
+          {{if eq $.AuthStage "code"}}
+          <p><span class="pill acc">code sent</span> Telegram just sent a 5-digit code to your account (SMS or the app's notifications). Enter it below.</p>
+          <form method="post" action="/login/phone/code" autocomplete="off">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="from" value="setup">
+            <label>Login code
+              <input type="text" name="code" required inputmode="numeric" autofocus>
+            </label>
+            <button type="submit">Verify code</button>
+          </form>
+          {{else if eq $.AuthStage "password"}}
+          <p><span class="pill acc">2FA</span> This account has two-step verification — enter its password to finish.</p>
+          <form method="post" action="/login/phone/password" autocomplete="off">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="from" value="setup">
+            <label>Two-step verification password
+              <input type="password" name="password" required autofocus>
+            </label>
+            <button type="submit">Log in</button>
+          </form>
+          {{else}}
+          <form method="post" action="/login/phone/start" autocomplete="off">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="from" value="setup">
+            <label>Phone number (international, e.g. +14155552671)
+              <input type="text" name="phone" required pattern="\+[0-9]+" placeholder="+..." autofocus>
+            </label>
+            <button type="submit">Send code</button>
+          </form>
+          {{end}}
+
+        {{else if eq .Key "channel"}}
+        <div hx-get="/setup/channels" hx-trigger="load" hx-swap="innerHTML">
+          <p><em>Scanning your channels…</em></p>
+        </div>
+        <details>
+          <summary>Or enter the channel id manually</summary>
+          <form method="post" action="/channel/set" autocomplete="off">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="from" value="setup">
+            <label>Channel id <input type="text" name="id" required pattern="-?[0-9]+" inputmode="numeric" placeholder="3930934278 or -1003930934278"></label>
+            <button type="submit">Bind channel</button>
+          </form>
+        </details>
+
+        {{else if eq .Key "encrypt"}}
+        <form method="post" action="/encrypt/init" autocomplete="off">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="from" value="setup">
+          <label>Passphrase <input type="password" name="passphrase" required autofocus></label>
+          <label>Confirm <input type="password" name="passphrase_confirm" required></label>
+          <button type="submit">Enable encryption</button>
+        </form>
+
+        {{else if eq .Key "compress"}}
+        <form method="post" action="/compression/init">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="from" value="setup">
+          <fieldset>
+            <legend>Codec</legend>
+            <label><input type="radio" name="codec" value="none" {{if eq $.Codec "none"}}checked{{end}}> none — zero CPU cost</label>
+            <label><input type="radio" name="codec" value="zstd" {{if eq $.Codec "zstd"}}checked{{end}}> zstd — wins on text/logs/code</label>
+          </fieldset>
+          <button type="submit">Set codec</button>
+        </form>
+
+        {{else if eq .Key "mount"}}
+        <form method="post" action="/mount/start" autocomplete="off">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="from" value="setup">
+          <input type="hidden" name="profile" value="{{$.Active}}">
+          <label>Mountpoint (absolute path to an existing empty dir)
+            <input type="text" name="mountpoint" required value="{{$.Mountpoint}}" autofocus>
+          </label>
+          {{if $.CryptoOn}}
+          <label>Passphrase
+            <input type="password" name="passphrase" required>
+          </label>
+          {{end}}
+          <button type="submit">Mount</button>
+        </form>
+        <p><small>Create the directory first if it doesn't exist (<code>mkdir -p {{$.Mountpoint}}</code>). On success you land on the mount's page with a live log — a missing local DB recovers from the channel snapshot automatically.</small></p>
+        {{end}}
+
         <h4>Expected outcome</h4>
         <p><small>{{.Outcome}}</small></p>
         <div class="wizard-actions">
-          <a href="{{.Href}}" class="btn primary">{{if .CTA}}{{.CTA}}{{else}}Open this step{{end}} →</a>
           {{if .Optional}}
             <form method="post" action="/setup/skip" style="display:inline">
               <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -47,6 +145,7 @@
               <button type="submit" class="btn muted">Skip for now</button>
             </form>
           {{end}}
+          <a href="{{.Href}}"><small>{{if .CTA}}{{.CTA}}{{else}}Open the full page{{end}} →</small></a>
         </div>
       </section>
     {{end}}
@@ -55,13 +154,13 @@
   <section class="card">
     <h4>What this wizard does</h4>
     <p><small>
-      The setup wizard tracks five onboarding steps and points you at
-      the right form for whichever one comes next. It does not perform
-      any actions on its own — every step links to the same dedicated
-      form the navigation bar exposes, so power users can ignore the
-      wizard entirely. State (done / skipped) is derived from the
-      filesystem each time you load this page, so refreshing always
-      shows the current truth.
+      Each step is the real form — creating the profile, saving API
+      credentials, running the phone login, binding a channel, the
+      optional encryption/compression choices, and starting the first
+      mount all happen right here. State (done / skipped) is derived
+      from the filesystem on every load, so refreshing always shows
+      the current truth; the same operations remain available on their
+      dedicated pages for later changes.
     </small></p>
   </section>
 {{end}}

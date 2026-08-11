@@ -8,11 +8,19 @@ consumer of the substrate this chapter describes.
 Telegram exposes two surfaces:
 
 - **Bot API** (HTTPS, JSON, bot-only) — convenient, but capped at 50 MB
-  per file and shaped for chat use cases. Not viable for us.
+  per upload / 20 MB per `getFile`, no way to fetch a message by id,
+  no channel-history access. A filesystem must randomly re-read old
+  messages by stored id and rediscover state from history after losing
+  its local DB — the Bot API can do neither. Not viable for us.
 - **MTProto** (custom TCP protocol, binary, supports user accounts) —
-  full power, raw bandwidth, 2 GiB per document.
+  full power, raw bandwidth, 2 GiB per document, fetch-by-id, history.
 
-TelFS uses MTProto. There are several Go implementations; we picked
+TelFS uses MTProto — with user (phone) auth only. Bot-token auth over
+MTProto existed briefly and was removed: MTProto requires the
+api_id/api_hash application credentials even for bots
+(`auth.importBotAuthorization` takes them as parameters), so a bot
+identity saved no setup effort while adding channel-admin requirements
+and an identity-scoped access_hash trap (chapter 16 tells that story). There are several Go implementations; we picked
 [`gotd/td`](https://github.com/gotd/td) because it has the most
 complete schema coverage, decent test discipline, and the cleanest
 middleware story (which we lean on hard).
@@ -209,14 +217,17 @@ watchdog brings recovery to seconds.
 
 ## Channel binding
 
-The "which channel?" question is resolved at `telfs channel set`. Two
-shapes:
+The "which channel?" question is resolved at `telfs channel set`: the
+account's dialog list is scanned and the ID resolves to an access hash
+automatically (`--access-hash` exists as a manual override for
+channels the scan can't see). Two properties worth internalizing:
 
-- **User accounts** can list their channels (dialogs) and resolve an
-  ID to an access hash automatically.
-- **Bots** can NOT list dialogs. The user must paste both the channel
-  ID and the access hash explicitly (`telfs channel set --access-hash N
-  <id>`).
+- The access hash is **identity-scoped** — the same channel has a
+  different hash for every account, and one account's hash is garbage
+  under another. This is why `profile reset-auth` clears the channel
+  binding along with the session.
+- If the account isn't a member of the channel, no hash exists for it
+  at all; membership is the actual prerequisite.
 
 The resolved `(id, access_hash)` lives in `config.toml`. Every channel
 RPC in the codebase calls `Session.channelPeer()` to translate

@@ -16,9 +16,10 @@
     <dt>Status</dt><dd><code>{{.Status}}</code></dd>
   </dl>
   <div class="row">
-    <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline"
+    <form method="post" action="/mount/stop" style="display:inline"
           onsubmit="return confirm('Stop this mount? Any process with open files there will see I/O errors.');">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="profile" value="{{.Profile}}">
       <button type="submit" class="danger">Stop</button>
     </form>
     <a href="/mount" class="btn secondary">Back to list</a>
@@ -29,7 +30,7 @@
 <section class="card">
   <h3>Live log <small>polled every 2 s — last 16 KB</small></h3>
   {{if .HasLog}}
-    <div id="log" hx-get="/mount/{{.Profile}}/log" hx-trigger="load, every 2s" hx-swap="innerHTML">
+    <div id="log" hx-get="/mount/{{pathEscape .Profile}}/log" hx-trigger="load, every 2s" hx-swap="innerHTML">
       <em>loading…</em>
     </div>
   {{else}}

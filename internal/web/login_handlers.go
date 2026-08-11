@@ -1,44 +1,104 @@
 package web
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
-	"time"
 
 	"telfs/internal/config"
+	"telfs/internal/mountctl"
 	"telfs/internal/tg"
 )
 
-// ── /login ────────────────────────────────────────────────────────
+// ── /login → phone flow (the only auth flow) ──────────────────────
+//
+// Bot-token login was removed: MTProto requires api_id/api_hash even
+// for bots, so a bot identity saved nothing over a user login while
+// adding a second auth path and an identity-scoped access_hash trap.
 
-type loginChoiceData struct {
-	pageBase
-	HasAPI  bool
-	Profile string
-	Note    string
-}
-
+// loginChoice is kept as the /login route target for old links and
+// the nav; it just forwards to the phone flow.
 func (s *Server) loginChoice(w http.ResponseWriter, r *http.Request) {
-	d := loginChoiceData{pageBase: s.basePage(w, r), Profile: config.ActiveProfile()}
-	if cfg, err := config.Load(); err == nil {
-		d.HasAPI = cfg.RequireAPI() == nil
-		if !d.HasAPI {
-			d.Note = "Set api_id and api_hash in config.toml first (from https://my.telegram.org/apps)."
-		}
-	}
-	s.renderTemplate(w, "login/choice.html", d)
+	http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
 }
 
 // ── phone login: step 1 — enter phone ─────────────────────────────
 
-type phone1Data struct{ pageBase }
+type phone1Data struct {
+	pageBase
+	Profile string
+	// NeedAPI: the profile has no api_id/api_hash yet, so the form
+	// collects them inline — login shouldn't bounce the user to a
+	// different page for a prerequisite it can gather right here.
+	NeedAPI bool
+	APIID   int
+	// LoggedIn: the profile already holds a completed session — the
+	// page offers logout instead of a second login (a profile is ONE
+	// identity; stacking logins over a live session is never right).
+	LoggedIn bool
+	Identity string
+	// Mounted blocks logout: the running daemon holds the session.
+	Mounted    bool
+	Mountpoint string
+}
 
 func (s *Server) loginPhoneForm(w http.ResponseWriter, r *http.Request) {
-	s.renderTemplate(w, "login/phone1.html", phone1Data{s.basePage(w, r)})
+	d := phone1Data{pageBase: s.basePage(w, r), Profile: config.ActiveProfile()}
+	if cfg, err := config.Load(); err == nil {
+		d.NeedAPI = cfg.RequireAPI() != nil
+		d.APIID = cfg.APIID
+		if cfg.HasSession() && cfg.Identity != nil {
+			d.LoggedIn = true
+			d.Identity = cfg.Identity.Label()
+			if _, mp, ok := mountctl.FindByProfile(d.Profile); ok {
+				d.Mounted = true
+				d.Mountpoint = mp
+			}
+		}
+	}
+	s.renderTemplate(w, "login/phone1.html", d)
+}
+
+// loginLogout removes the active profile's session + recorded
+// identity so a fresh login is possible. The channel binding is
+// KEPT: logging back into the SAME account leaves it valid, and if a
+// different account logs in, mount preflight rejects the stale
+// access_hash with a re-bind hint. Refused while the profile's
+// daemon is mounted — the running session is in active use, and gotd
+// would rewrite session.json under us anyway.
+func (s *Server) loginLogout(w http.ResponseWriter, r *http.Request) {
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		SetFlash(w, "error", "config: "+err.Error())
+		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+		return
+	}
+	profile := config.ActiveProfile()
+	if pid, mp, ok := mountctl.FindByProfile(profile); ok {
+		SetFlash(w, "error", fmt.Sprintf("profile %q is mounted at %s (pid %d) — stop the mount before logging out", profile, mp, pid))
+		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+		return
+	}
+	if err := os.Remove(cfg.SessionPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		SetFlash(w, "error", "remove session: "+err.Error())
+		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+		return
+	}
+	cfg.Identity = nil
+	if err := cfg.Save(); err != nil {
+		SetFlash(w, "error", "save config: "+err.Error())
+		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+		return
+	}
+	SetFlash(w, "ok", "logged out — the channel binding was kept; log back into the same account and everything just works (a different account must re-bind the channel)")
+	http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
 }
 
 func (s *Server) loginPhoneStart(w http.ResponseWriter, r *http.Request) {
@@ -55,31 +115,59 @@ func (s *Server) loginPhoneStart(w http.ResponseWriter, r *http.Request) {
 	cfg, err := config.Load()
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
 		return
+	}
+	// No double login: a completed session means this profile IS that
+	// identity — log out first (button on the login page).
+	if cfg.HasSession() && cfg.Identity != nil {
+		SetFlash(w, "error", fmt.Sprintf("already logged in as %s — log out first to log in again", cfg.Identity.Label()))
+		http.Redirect(w, r, setupReturn(r, "/login/phone"), http.StatusSeeOther)
+		return
+	}
+	// Inline API credentials: when the profile has none, the form
+	// collected them alongside the phone number. Persist immediately —
+	// they are app-level identity (my.telegram.org), valid regardless
+	// of whether this login attempt completes.
+	if cfg.RequireAPI() != nil {
+		idStr := strings.TrimSpace(r.FormValue("api_id"))
+		hash := strings.TrimSpace(r.FormValue("api_hash"))
+		if idStr != "" || hash != "" {
+			id, err := strconv.Atoi(idStr)
+			if err != nil || id <= 0 {
+				SetFlash(w, "error", "api_id must be a positive integer (from https://my.telegram.org/apps)")
+				http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+				return
+			}
+			if hash == "" {
+				SetFlash(w, "error", "api_hash is required (from https://my.telegram.org/apps)")
+				http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+				return
+			}
+			cfg.APIID = id
+			cfg.APIHash = hash
+			if err := cfg.Save(); err != nil {
+				SetFlash(w, "error", "save API credentials: "+err.Error())
+				http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+				return
+			}
+		}
 	}
 	if err := cfg.RequireAPI(); err != nil {
 		SetFlash(w, "error", err.Error())
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
-		return
-	}
-	// User mode for phone login. The CLI persists auth_mode in config
-	// on `login --bot`; mirror that for `login` (no --bot) so a
-	// subsequent mount doesn't accidentally bot-auth.
-	cfg.AuthMode = config.AuthModeUser
-	cfg.BotToken = ""
-	if err := cfg.Save(); err != nil {
-		SetFlash(w, "error", "save config: "+err.Error())
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
 		return
 	}
 
 	sess := newLoginSession(config.ActiveProfile())
 	s.logins.Add(sess)
 	http.SetCookie(w, &http.Cookie{
-		Name:     loginCookie,
-		Value:    sess.ID,
-		Path:     "/login",
+		Name:  loginCookie,
+		Value: sess.ID,
+		// Path "/" (not "/login"): the setup wizard at /setup reads
+		// the in-flight session to render the code/password form
+		// inline; a /login-scoped cookie would be invisible there.
+		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   int(loginSessionTTL.Seconds()),
@@ -107,26 +195,27 @@ func (s *Server) loginPhoneStart(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		SetFlash(w, "error", "telegram: "+err.Error())
 		s.logins.Remove(sess.ID)
-		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+		http.Redirect(w, r, setupReturn(r, "/login/phone"), http.StatusSeeOther)
 		return
 	}
 	switch ev.Kind {
 	case evCodeSent:
-		http.Redirect(w, r, "/login/phone/code", http.StatusSeeOther)
+		sess.SetStage("code")
+		http.Redirect(w, r, setupReturn(r, "/login/phone/code"), http.StatusSeeOther)
 	case evDone:
 		// Already authorized — gotd short-circuited via IfNecessary.
 		s.logins.Remove(sess.ID)
 		if ev.Err != nil {
 			SetFlash(w, "error", "auth: "+ev.Err.Error())
-			http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+			http.Redirect(w, r, setupReturn(r, "/login/phone"), http.StatusSeeOther)
 			return
 		}
 		SetFlash(w, "ok", "already authenticated")
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		http.Redirect(w, r, setupReturn(r, "/"), http.StatusSeeOther)
 	default:
 		SetFlash(w, "error", fmt.Sprintf("unexpected state %s", ev.Kind))
 		s.logins.Remove(sess.ID)
-		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+		http.Redirect(w, r, setupReturn(r, "/login/phone"), http.StatusSeeOther)
 	}
 }
 
@@ -166,25 +255,26 @@ func (s *Server) loginPhoneCodeSubmit(w http.ResponseWriter, r *http.Request) {
 	ev, err := waitForEvent(sess, loginWaitTimeout)
 	if err != nil {
 		SetFlash(w, "error", "telegram: "+err.Error())
-		http.Redirect(w, r, "/login/phone/code", http.StatusSeeOther)
+		http.Redirect(w, r, setupReturn(r, "/login/phone/code"), http.StatusSeeOther)
 		return
 	}
 	switch ev.Kind {
 	case evPasswordNeeded:
-		http.Redirect(w, r, "/login/phone/password", http.StatusSeeOther)
+		sess.SetStage("password")
+		http.Redirect(w, r, setupReturn(r, "/login/phone/password"), http.StatusSeeOther)
 	case evDone:
 		s.logins.Remove(sess.ID)
 		clearLoginCookie(w)
 		if ev.Err != nil {
 			SetFlash(w, "error", "auth: "+ev.Err.Error())
-			http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+			http.Redirect(w, r, setupReturn(r, "/login/phone"), http.StatusSeeOther)
 			return
 		}
 		SetFlash(w, "ok", "logged in successfully")
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		http.Redirect(w, r, setupReturn(r, "/"), http.StatusSeeOther)
 	default:
 		SetFlash(w, "error", fmt.Sprintf("unexpected state %s", ev.Kind))
-		http.Redirect(w, r, "/login/phone/code", http.StatusSeeOther)
+		http.Redirect(w, r, setupReturn(r, "/login/phone/code"), http.StatusSeeOther)
 	}
 }
 
@@ -222,7 +312,7 @@ func (s *Server) loginPhonePasswordSubmit(w http.ResponseWriter, r *http.Request
 	ev, err := waitForEvent(sess, loginWaitTimeout)
 	if err != nil {
 		SetFlash(w, "error", "telegram: "+err.Error())
-		http.Redirect(w, r, "/login/phone/password", http.StatusSeeOther)
+		http.Redirect(w, r, setupReturn(r, "/login/phone/password"), http.StatusSeeOther)
 		return
 	}
 	if ev.Kind == evDone {
@@ -230,15 +320,15 @@ func (s *Server) loginPhonePasswordSubmit(w http.ResponseWriter, r *http.Request
 		clearLoginCookie(w)
 		if ev.Err != nil {
 			SetFlash(w, "error", "auth: "+ev.Err.Error())
-			http.Redirect(w, r, "/login/phone/password", http.StatusSeeOther)
+			http.Redirect(w, r, setupReturn(r, "/login/phone/password"), http.StatusSeeOther)
 			return
 		}
 		SetFlash(w, "ok", "logged in successfully")
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		http.Redirect(w, r, setupReturn(r, "/"), http.StatusSeeOther)
 		return
 	}
 	SetFlash(w, "error", fmt.Sprintf("unexpected state %s", ev.Kind))
-	http.Redirect(w, r, "/login/phone/password", http.StatusSeeOther)
+	http.Redirect(w, r, setupReturn(r, "/login/phone/password"), http.StatusSeeOther)
 }
 
 // activeLoginSession looks up the current login session by cookie.
@@ -259,98 +349,7 @@ func clearLoginCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:   loginCookie,
 		Value:  "",
-		Path:   "/login",
+		Path:   "/",
 		MaxAge: -1,
 	})
-}
-
-// ── bot login (single shot) ───────────────────────────────────────
-
-type botLoginData struct{ pageBase }
-
-func (s *Server) loginBotForm(w http.ResponseWriter, r *http.Request) {
-	s.renderTemplate(w, "login/bot.html", botLoginData{s.basePage(w, r)})
-}
-
-func (s *Server) loginBotSubmit(w http.ResponseWriter, r *http.Request) {
-	if err := s.state.CheckCSRF(r); err != nil {
-		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
-		return
-	}
-	token := strings.TrimSpace(r.FormValue("token"))
-	if token == "" {
-		SetFlash(w, "error", "bot token is required")
-		http.Redirect(w, r, "/login/bot", http.StatusSeeOther)
-		return
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		SetFlash(w, "error", "config: "+err.Error())
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
-		return
-	}
-	if err := cfg.RequireAPI(); err != nil {
-		SetFlash(w, "error", err.Error())
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
-		return
-	}
-	// Apply auth_mode + token to an in-memory cfg copy; only persist
-	// after a successful auth round-trip. Otherwise a bad token would
-	// poison the profile.
-	cfg.AuthMode = config.AuthModeBot
-	cfg.BotToken = token
-	client, err := tg.New(cfg)
-	if err != nil {
-		SetFlash(w, "error", "tg.New: "+err.Error())
-		http.Redirect(w, r, "/login/bot", http.StatusSeeOther)
-		return
-	}
-	// Force a fresh handshake: an existing user-mode session.json would
-	// short-circuit IfNecessary's auth check, and the bot token would
-	// never be validated — the request would falsely report success.
-	// Switching auth_mode is an explicit user choice, so it's correct
-	// to invalidate the prior session at this point.
-	sessPath := cfg.SessionPath()
-	backupPath := sessPath + ".prebot"
-	hadSession := false
-	if _, err := os.Stat(sessPath); err == nil {
-		_ = os.Rename(sessPath, backupPath)
-		hadSession = true
-	}
-	restoreOnFail := func() {
-		_ = os.Remove(sessPath)
-		if hadSession {
-			_ = os.Rename(backupPath, sessPath)
-		}
-	}
-	// 60-second hard budget for bot auth (one round-trip with
-	// floodwait margin); avoids tying up the request indefinitely.
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-	if err := client.Login(ctx); err != nil {
-		restoreOnFail()
-		// Recognize the specific "bad token" return so the message is
-		// useful.
-		switch {
-		case strings.Contains(err.Error(), "ACCESS_TOKEN_INVALID"):
-			SetFlash(w, "error", "Telegram rejected the bot token (ACCESS_TOKEN_INVALID). Check the token from @BotFather.")
-		case errors.Is(err, context.DeadlineExceeded):
-			SetFlash(w, "error", "bot login timed out (60s)")
-		default:
-			SetFlash(w, "error", "auth: "+err.Error())
-		}
-		http.Redirect(w, r, "/login/bot", http.StatusSeeOther)
-		return
-	}
-	// Auth succeeded: commit the new auth_mode + token, drop the backup.
-	if err := cfg.Save(); err != nil {
-		SetFlash(w, "error", "save config: "+err.Error())
-		http.Redirect(w, r, "/login/bot", http.StatusSeeOther)
-		return
-	}
-	if hadSession {
-		_ = os.Remove(backupPath)
-	}
-	SetFlash(w, "ok", "bot logged in")
-	http.Redirect(w, r, "/", http.StatusSeeOther)
 }

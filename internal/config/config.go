@@ -35,33 +35,32 @@ const (
 	activeFile = "active"
 )
 
-// AuthMode picks the authentication style. Default ("" / "user") is
-// interactive phone+code+2FA against a real Telegram user account.
-// "bot" auths via auth.ImportBotAuthorization using a bot token from
-// @BotFather — same MTProto pipeline, same 2 GB per upload limit.
-type AuthMode string
-
-const (
-	AuthModeUser AuthMode = "user"
-	AuthModeBot  AuthMode = "bot"
-)
-
 // Config is the persistent TelFS configuration.
+//
+// Auth is ALWAYS interactive phone+code+2FA against a real Telegram
+// user account. Bot-token auth existed briefly (v0.14 era) and was
+// removed: MTProto requires api_id/api_hash even for bots, so a bot
+// identity saved nothing over a user login while adding a second auth
+// path, an identity-scoped access_hash trap, and channel-admin
+// requirements. Configs from that era may still contain auth_mode /
+// bot_token keys — the TOML decoder ignores unknown keys, and any
+// leftover bot session.json is rejected at login/mount with a
+// reset-auth hint.
 type Config struct {
 	APIID   int    `toml:"api_id"`
 	APIHash string `toml:"api_hash"`
 	Phone   string `toml:"phone,omitempty"`
-	// AuthMode selects user (default) or bot login style. When "bot",
-	// BotToken must be set and Phone is ignored.
-	AuthMode AuthMode `toml:"auth_mode,omitempty"`
-	// BotToken is the @BotFather token used for bot auth. Sensitive —
-	// possession of this string gives full bot control.
-	BotToken string `toml:"bot_token,omitempty"`
 	// DC overrides gotd's default starting datacenter (which is 2). Useful in
 	// environments where DC 2's primary IP is firewalled. Telegram will
 	// migrate the connection to the user's home DC after auth regardless of
 	// the starting DC.
 	DC int `toml:"dc,omitempty"`
+
+	// Identity records who session.json authenticates as, written after
+	// every successful login. Display + consistency checks only — the
+	// session file itself is the credential. Nil until the first login
+	// (or after `telfs profile reset-auth`).
+	Identity *Identity `toml:"identity,omitempty"`
 
 	Channel ChannelConfig `toml:"channel"`
 
@@ -78,13 +77,41 @@ type Config struct {
 	DataDir string `toml:"-"`
 }
 
-// EffectiveAuthMode returns User unless explicitly set to Bot — handles
-// the empty-string-from-old-configs case.
-func (c *Config) EffectiveAuthMode() AuthMode {
-	if c.AuthMode == AuthModeBot {
-		return AuthModeBot
+// Identity records the authenticated account behind session.json.
+// IsBot survives bot-auth removal as a defense flag: a leftover bot
+// session from the removed feature must be detected and rejected, not
+// silently used.
+type Identity struct {
+	UserID   int64  `toml:"user_id,omitempty"`
+	Username string `toml:"username,omitempty"`
+	IsBot    bool   `toml:"is_bot,omitempty"`
+}
+
+// Label renders the identity for humans: "@name (user)".
+func (id *Identity) Label() string {
+	if id == nil {
+		return ""
 	}
-	return AuthModeUser
+	name := id.Username
+	if name == "" {
+		name = fmt.Sprintf("id=%d", id.UserID)
+	} else {
+		name = "@" + name
+	}
+	kind := "user"
+	if id.IsBot {
+		kind = "bot"
+	}
+	return fmt.Sprintf("%s (%s)", name, kind)
+}
+
+// HasSession reports whether this profile has authenticated — the
+// profile IS that identity until `telfs profile reset-auth` wipes it
+// (session + channel binding; the channel access_hash is scoped to
+// the identity that resolved it and dies with it).
+func (c *Config) HasSession() bool {
+	_, err := os.Stat(c.SessionPath())
+	return err == nil
 }
 
 // CacheCapBytes parses Config.CacheCap. Returns 0 (caller falls back
@@ -241,8 +268,13 @@ func ValidateProfileName(name string) error {
 }
 
 // readActiveProfile reads the profile name written by `telfs profile use`.
-// Returns (name, true) on success, (",", false) if the file doesn't exist
+// Returns (name, true) on success, ("", false) if the file doesn't exist
 // or is empty/invalid (callers should fall back to the next resolution step).
+//
+// A name whose profile DIRECTORY no longer exists is treated as unset:
+// a dangling active file (e.g. left by deleting the active profile with
+// an old binary) would otherwise silently resurrect an empty profile
+// dir on the next config.Load and swallow every command into it.
 func readActiveProfile() (string, bool) {
 	root, err := xdgConfigHome()
 	if err != nil {
@@ -256,7 +288,25 @@ func readActiveProfile() (string, bool) {
 	if name == "" || ValidateProfileName(name) != nil {
 		return "", false
 	}
+	if dir, err := ProfileDir(name); err != nil {
+		return "", false
+	} else if _, err := os.Stat(dir); err != nil {
+		return "", false
+	}
 	return name, true
+}
+
+// ClearActiveProfile removes the active-profile selection. Called when
+// the active profile is deleted so the stale name doesn't dangle.
+func ClearActiveProfile() error {
+	root, err := xdgConfigHome()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(root, activeFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // SetActiveProfile writes the named profile to ~/.config/telfs/active so

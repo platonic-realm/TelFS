@@ -333,10 +333,14 @@ inactivity, the goroutine gets canceled). The trickiest invariant:
 every send-into-channel must be matched by a receive, or the
 goroutine deadlocks. The HTTP handlers carry this responsibility.
 
-This is the most complex piece of the web. The bot-login alternative
-is one POST and done. We support both; in practice the bot path is
-the common one, but the phone flow is necessary for users without a
-bot.
+This is the most complex piece of the web, and since bot auth was
+removed (chapter 16) it's the ONLY auth flow — which is why the setup
+wizard embeds it inline: the `/setup` page reads the in-flight login
+session's stage ("code" / "password") and renders the matching form,
+so a reload lands back mid-flow instead of restarting. The step is
+only considered DONE when the login *completed* (`[identity]`
+recorded) — `session.json` alone is not proof, because gotd writes it
+during the handshake, at the exact moment the code is sent.
 
 ## Why a separate process from the daemon
 

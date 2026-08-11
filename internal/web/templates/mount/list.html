@@ -11,7 +11,7 @@
       {{range .Mounts}}
       <tr>
         <td>
-          {{if .HasLog}}<a href="/mount/{{.Profile}}"><strong>{{.Profile}}</strong></a>
+          {{if .HasLog}}<a href="/mount/{{pathEscape .Profile}}"><strong>{{.Profile}}</strong></a>
           {{else}}<strong>{{.Profile}}</strong>{{end}}
         </td>
         <td><code>{{.Mountpoint}}</code></td>
@@ -20,9 +20,10 @@
         <td><span class="pill {{.StatusKind}}">{{.Status}}</span></td>
         <td><small>{{if .Started}}{{.Started}}{{else}}—{{end}}</small></td>
         <td class="actions">
-          <form method="post" action="/mount/{{.Profile}}/stop" style="display:inline"
+          <form method="post" action="/mount/stop" style="display:inline"
                 onsubmit="return confirm('Stop the mount at {{.Mountpoint}}? Any process with open files there will see I/O errors.');">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="profile" value="{{.Profile}}">
             <button type="submit" class="danger">Stop</button>
           </form>
         </td>

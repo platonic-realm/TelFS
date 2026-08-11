@@ -1,0 +1,33 @@
+{{define "content"}}
+{{if .Error}}
+<p class="flash error">channel scan: {{.Error}}</p>
+{{else if not .Channels}}
+<p><em>No channels found. Create a private channel in the Telegram app, then <a href="/setup">reload</a>.</em></p>
+{{else}}
+<table>
+  <thead><tr><th>Title</th><th>ID</th><th>Post</th><th class="actions"></th></tr></thead>
+  <tbody>
+  {{range .Channels}}
+  <tr>
+    <td>{{.Title}}{{if .Username}} <small>(@{{.Username}})</small>{{end}}{{if .IsCreator}} <small>· yours</small>{{end}}</td>
+    <td><code>{{.ID}}</code></td>
+    <td>{{if .CanPost}}yes{{else}}no{{end}}</td>
+    <td class="actions">
+      {{if .CanPost}}
+      <form method="post" action="/channel/set">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <input type="hidden" name="from" value="setup">
+        <input type="hidden" name="id" value="{{.ID}}">
+        <input type="hidden" name="access_hash" value="{{.AccessHash}}">
+        <button type="submit">Use this channel</button>
+      </form>
+      {{else}}
+      <small>no post permission</small>
+      {{end}}
+    </td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}

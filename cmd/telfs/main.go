@@ -40,6 +40,7 @@ import (
 	telfsfs "telfs/internal/fs"
 	"telfs/internal/meta"
 	"telfs/internal/metrics"
+	"telfs/internal/mountctl"
 	"telfs/internal/snapshot"
 	"telfs/internal/tg"
 	"telfs/internal/trash"
@@ -57,18 +58,22 @@ var (
 const usage = `telfs — FUSE filesystem backed by a Telegram channel
 
 Usage:
-  telfs login [--bot <token>]       Authenticate against Telegram (MTProto user
-                                      auth by default; --bot uses a BotFather
-                                      token via auth.ImportBotAuthorization).
+  telfs login                       Authenticate against Telegram (interactive
+                                      MTProto phone → code → 2FA).
   telfs channel list                List your channels (id, title, post permission).
   telfs channel set [--access-hash N] <id>
-                                    Configure the backing channel. In bot mode
-                                    --access-hash is required (bots can't
-                                    auto-discover it from the dialog list).
+                                    Configure the backing channel.
+                                      --access-hash overrides the automatic
+                                      dialog-list discovery when needed.
   telfs channel info                Show the currently configured channel.
   telfs channel ping                Round-trip a test message (smoke test).
   telfs mount [flags] <mountpoint>  Mount the filesystem.
                                       Flags: --readonly --allow-other --debug --no-recover
+  telfs unmount <mountpoint|profile>
+                                    Stop the mount daemon (however it was
+                                      started) and detach the mountpoint.
+                                      SIGTERM → orderly shutdown → verify;
+                                      escalates to SIGKILL + lazy unmount.
   telfs init [--chunk-size N]       Initialize FS settings before first mount.
   telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
   telfs encrypt init [--convergent] Enable AES-256-GCM for this filesystem.
@@ -77,8 +82,10 @@ Usage:
                                       detection visible on the channel).
   telfs encrypt status              Show whether encryption is enabled.
   telfs encrypt rotate              Change passphrase without re-encrypting chunks (v2/v3 FSes).
-  telfs profile {list,show,create,delete,use,export,import}
+  telfs profile {list,show,create,delete,use,reset-auth,export,import}
                                     Manage multiple profiles (accounts/channels).
+                                      Each profile is ONE identity; reset-auth
+                                      wipes it (session + channel binding).
   telfs status                      One-screen summary of the active profile.
   telfs doctor                      Lint local profile + DB state for known invariants.
   telfs web [--listen ADDR] [--token TOKEN]
@@ -133,6 +140,8 @@ func run() error {
 		return cmdChannel(ctx, os.Args[2:])
 	case "mount":
 		return cmdMount(ctx, os.Args[2:])
+	case "unmount", "umount":
+		return cmdUnmount(ctx, os.Args[2:])
 	case "init":
 		return cmdInit(ctx, os.Args[2:])
 	case "encrypt":
@@ -166,7 +175,6 @@ func run() error {
 
 func cmdLogin(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
-	botToken := fs.String("bot", "", "log in as a bot using the given @BotFather token (overrides any phone-auth state)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -174,20 +182,12 @@ func cmdLogin(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	// --bot promotes the profile to bot mode and persists the token.
-	// Subsequent `telfs login` (without --bot) on this profile picks
-	// the same mode automatically because cfg.AuthMode is now "bot".
-	if *botToken != "" {
-		cfg.AuthMode = config.AuthModeBot
-		cfg.BotToken = strings.TrimSpace(*botToken)
-		if err := cfg.Save(); err != nil {
-			return err
-		}
-	}
 	client, err := tg.New(cfg)
 	if err != nil {
 		return err
 	}
+	// Login records the authenticated identity into cfg and saves it
+	// on success.
 	return client.Login(ctx)
 }
 
@@ -248,7 +248,7 @@ func cmdChannelList(ctx context.Context, cfg *config.Config) error {
 
 func cmdChannelSet(ctx context.Context, cfg *config.Config, args []string) error {
 	fs := flag.NewFlagSet("channel set", flag.ContinueOnError)
-	accessHash := fs.Int64("access-hash", 0, "channel access_hash (REQUIRED in bot mode — bots cannot enumerate dialogs to discover it)")
+	accessHash := fs.Int64("access-hash", 0, "explicit channel access_hash — overrides the automatic dialog-list discovery")
 	force := fs.Bool("force", false, "rebind even though this profile already has data on its current channel (DANGEROUS: reads break, writes/snapshots split across channels, and gc against the wrong channel deletes other data)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: telfs channel set [--access-hash N] [--force] <channel-id>")
@@ -280,9 +280,6 @@ func cmdChannelSet(ctx context.Context, cfg *config.Config, args []string) error
 				}
 			}
 		}
-	}
-	if cfg.EffectiveAuthMode() == config.AuthModeBot && *accessHash == 0 {
-		return errors.New("channel set: --access-hash is required in bot mode (bots can't auto-discover it; copy it from a user-account profile or from another tool)")
 	}
 	client, err := tg.New(cfg)
 	if err != nil {
@@ -428,6 +425,58 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
+// cmdUnmount stops a running telfs mount daemon and detaches its
+// mountpoint. Accepts either the mountpoint path or a profile name.
+// Works regardless of who started the daemon (CLI foreground, web
+// supervisor, or a process orphaned by a dead session): the daemon is
+// located via /proc, SIGTERMed so its orderly shutdown (upload drain +
+// final snapshot) runs, and the kernel mount is verified gone
+// afterward — escalating to SIGKILL + lazy unmount only if it wedges.
+func cmdUnmount(_ context.Context, args []string) error {
+	fs := flag.NewFlagSet("unmount", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: telfs unmount <mountpoint | profile-name>")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return errors.New("unmount: expected exactly one <mountpoint | profile-name> argument")
+	}
+	target := fs.Arg(0)
+
+	// Resolve to (pid, mountpoint): try as a mountpoint path first,
+	// then as a profile name (matched against the daemon's
+	// TELFS_PROFILE).
+	var mountpoint string
+	var pid int
+	if abs, err := filepath.Abs(target); err == nil && mountctl.IsMounted(abs) {
+		mountpoint = abs
+		pid, _ = mountctl.FindDaemonPid(abs)
+	} else if p, mp, ok := mountctl.FindByProfile(target); ok {
+		pid, mountpoint = p, mp
+	} else {
+		mounts := mountctl.ScanProcMounts()
+		if len(mounts) == 0 {
+			return fmt.Errorf("unmount: %q is not a fuse.telfs mountpoint or a mounted profile (no telfs mounts are active)", target)
+		}
+		return fmt.Errorf("unmount: %q is not a fuse.telfs mountpoint or a mounted profile\nactive telfs mounts: %s", target, strings.Join(mounts, ", "))
+	}
+
+	if pid > 0 {
+		fmt.Printf("Stopping mount daemon (pid %d) for %s — waiting for orderly shutdown…\n", pid, mountpoint)
+	} else {
+		fmt.Printf("No daemon process found for %s — detaching the mount directly.\n", mountpoint)
+	}
+	if err := mountctl.StopDaemon(pid, mountpoint, 35*time.Second); err != nil {
+		return fmt.Errorf("unmount: %w", err)
+	}
+	fmt.Printf("Unmounted %s\n", mountpoint)
+	return nil
+}
+
 // cmdMount mounts the filesystem and blocks until ctx is canceled.
 //
 // Teardown order (advisor-mandated, tested via ^C):
@@ -462,6 +511,12 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return errors.New("mount: expected exactly one mountpoint argument")
 	}
 	mountpoint := fs.Arg(0)
+	// Normalize to an absolute path: /proc/mounts records the absolute
+	// mountpoint, and every is-it-still-mounted check below compares
+	// against that.
+	if abs, err := filepath.Abs(mountpoint); err == nil {
+		mountpoint = abs
+	}
 	checkFusermount()
 
 	cfg, err := config.Load()
@@ -524,6 +579,20 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	client, err := tg.New(cfg)
 	if err != nil {
 		return err
+	}
+
+	// Seed lifetime Telegram stats from the profile's DB so /telegram
+	// totals continue across restarts instead of resetting to zero.
+	// Persisted back periodically (and at shutdown) below.
+	if b, err := metaStore.GetKV(signalCtx, tg.KVLifetimeStats); err == nil {
+		if serr := client.Tracker().SeedState(b); serr != nil {
+			fmt.Fprintln(os.Stderr, "[stats] seed lifetime stats:", serr)
+		}
+	}
+	persistStats := func(ctx context.Context) {
+		if b, err := client.Tracker().MarshalState(); err == nil {
+			_ = metaStore.PutKV(ctx, tg.KVLifetimeStats, b)
+		}
 	}
 
 	// The gotd session must stay alive past signalCtx cancellation so
@@ -619,6 +688,25 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		stopMgr()
 		<-mgrDone
 		return nil
+	}
+
+	// Preflight: fail fast (with the actor and the fix named) when the
+	// session identity doesn't match auth_mode or can't access the
+	// bound channel — otherwise the mount comes up "fine" and every
+	// channel RPC dies in a CHANNEL_INVALID retry storm only visible
+	// in the log.
+	{
+		verifyCtx, cancelVerify := context.WithTimeout(signalCtx, 30*time.Second)
+		verr := sess.VerifyAccess(verifyCtx)
+		cancelVerify()
+		if verr != nil {
+			stopMgr()
+			<-mgrDone
+			if errors.Is(verr, context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("mount preflight: %w", verr)
+		}
 	}
 
 	err = func() error {
@@ -891,6 +979,24 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			}
 		}()
 
+		// Lifetime-stats persister: lands the tracker's cumulative
+		// totals in meta_kv every minute. Cheap (one JSON marshal +
+		// one UPSERT); the final write happens in the shutdown
+		// sequence BEFORE the last snapshot, so the stats also ride
+		// the snapshot blob into the channel and survive recovery.
+		go func() {
+			t := time.NewTicker(60 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-signalCtx.Done():
+					return
+				case <-t.C:
+					persistStats(signalCtx)
+				}
+			}
+		}()
+
 		// WAL checkpointer: SQLite's auto-checkpoint heuristic (default
 		// at every 1000 pages crossed) can lag badly under bursty
 		// write workloads — we observed db.sqlite-wal at 116 MiB
@@ -987,7 +1093,27 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// catastrophic for recover-from-channel.
 			fmt.Println("Unmounting…")
 			if uerr := server.Unmount(); uerr != nil {
-				fmt.Fprintln(os.Stderr, "unmount:", uerr)
+				// Two benign shapes hide behind a fusermount error:
+				//  - the mount is already gone (unmounted externally)
+				//    → nothing to do;
+				//  - EBUSY from open files → lazy-detach so
+				//    server.Wait below can actually drain instead of
+				//    wedging until the 30 s watchdog SIGKILLs us
+				//    (observed live: a file manager holding the mount
+				//    open turned every clean shutdown into a
+				//    watchdog force-exit, skipping the final
+				//    snapshot).
+				switch {
+				case !mountctl.IsMounted(mountpoint):
+					fmt.Println("mount already detached (unmounted externally)")
+				default:
+					if lerr := mountctl.LazyUnmount(mountpoint); lerr != nil {
+						fmt.Fprintln(os.Stderr, "unmount:", uerr)
+						fmt.Fprintln(os.Stderr, "lazy unmount:", lerr)
+					} else {
+						fmt.Println("unmount was busy — lazily detached (open files keep working until closed)")
+					}
+				}
 			}
 			server.Wait()
 			drainCtx, cancelDrain := context.WithTimeout(context.Background(), 12*time.Second)
@@ -998,6 +1124,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 				_ = metricsSrv.Shutdown(mctx)
 				mcancel()
 			}
+			// Final lifetime-stats write BEFORE the final snapshot so
+			// the snapshot blob carries the up-to-date totals.
+			persistStats(context.Background())
 			// Final snapshot, post-drain. Uploads after RunSession
 			// returns fail with "engine closed", so this MUST run
 			// inside the callback. 10-second budget keeps the total
@@ -1015,7 +1144,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// Orderly shutdown complete.
 		case <-time.After(30 * time.Second):
 			fmt.Fprintln(os.Stderr, "telfs: orderly shutdown timed out — forcing lazy unmount + exit")
-			_ = exec.Command(fusermountBin(), "-uz", mountpoint).Run()
+			_ = mountctl.LazyUnmount(mountpoint)
 			os.Exit(1)
 		}
 		return nil
@@ -1274,22 +1403,8 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 // recovery from a wedged kernel mount. If neither is present we print
 // a clear remediation hint and continue — root-only setups can still
 // mount + unmount via direct syscalls, so this is a warning rather
-// than a hard failure.
-// fusermountBin resolves the FUSE unmount helper: fusermount3 (fuse3)
-// first, then legacy fusermount. Every emergency-unmount path must use
-// this — hardcoding "fusermount" made the shutdown watchdog and
-// force-exit paths silent no-ops on fuse3-only systems (fusermount3
-// ships without a fusermount symlink on e.g. Arch), leaving orphaned
-// kernel mounts exactly when the escape hatch mattered.
-func fusermountBin() string {
-	for _, name := range []string{"fusermount3", "fusermount"} {
-		if p, err := exec.LookPath(name); err == nil {
-			return p
-		}
-	}
-	return "fusermount" // last resort; Run() will surface the error
-}
-
+// than a hard failure. (Emergency-unmount paths themselves go through
+// internal/mountctl, which does the same fusermount3-first lookup.)
 func checkFusermount() {
 	for _, name := range []string{"fusermount3", "fusermount"} {
 		if p, err := exec.LookPath(name); err == nil {
@@ -1435,7 +1550,7 @@ func armForceExit(mountpoint string) {
 		// third.
 		<-ch
 		fmt.Fprintln(os.Stderr, "telfs: second signal — forcing lazy unmount + exit")
-		_ = exec.Command(fusermountBin(), "-uz", mountpoint).Run()
+		_ = mountctl.LazyUnmount(mountpoint)
 		os.Exit(130)
 	}()
 }

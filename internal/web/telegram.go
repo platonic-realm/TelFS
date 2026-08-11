@@ -9,12 +9,14 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"telfs/internal/config"
 	"telfs/internal/meta"
+	"telfs/internal/tg"
 )
 
 // tgState mirrors the JSON shape served by the mount daemon's
@@ -114,6 +116,13 @@ type tgPageData struct {
 	StallSeconds int64 // derived: how long since last success
 	NowUnix      int64
 
+	// Persisted: the daemon is offline but lifetime totals were
+	// loaded from the profile's meta DB (the daemon lands them there
+	// every minute + at shutdown), so the numbers stay visible
+	// instead of vanishing. PersistedAgeSec is how stale they are.
+	Persisted       bool
+	PersistedAgeSec int64
+
 	// RateLimitPerMin is the per-FS UPLOAD requests/min cap, read
 	// fresh from meta_kv on every request so CLI edits show up
 	// immediately. Zero means unlimited. -1 signals "couldn't
@@ -165,7 +174,48 @@ func (s *Server) fetchTelegramStatePartial(r *http.Request) tgPageData {
 		NowUnix: time.Now().Unix(),
 	}
 	populateTGState(&data, url)
+	if !data.Online {
+		loadPersistedTGStats(r.Context(), &data)
+	}
 	return data
+}
+
+// loadPersistedTGStats fills the totals from the profile DB's
+// persisted TrackerState when the daemon is unreachable — the stats
+// stay consistent across daemon restarts and outages instead of
+// disappearing with the process.
+func loadPersistedTGStats(ctx context.Context, data *tgPageData) {
+	mstore, err := openMetaExisting()
+	if err != nil {
+		return
+	}
+	defer mstore.Close()
+	b, err := mstore.GetKV(ctx, tg.KVLifetimeStats)
+	if err != nil {
+		return
+	}
+	var st tg.TrackerState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return
+	}
+	data.Persisted = true
+	if st.UpdatedUnix > 0 {
+		data.PersistedAgeSec = data.NowUnix - st.UpdatedUnix
+	}
+	data.State.TotalOK = st.TotalOK
+	data.State.TotalErr = st.TotalErr
+	data.State.TotalBytes = st.TotalBytes
+	data.State.TotalBytesTx = st.TotalTx
+	data.State.TotalBytesRx = st.TotalRx
+	methods := make([]tgMethod, 0, len(st.PerMethod))
+	for name, mc := range st.PerMethod {
+		methods = append(methods, tgMethod{Method: name, OK: mc.OK, Err: mc.Err, FloodWait: mc.FloodWait, Bytes: mc.Bytes})
+	}
+	// Most-used first, mirroring the daemon's ordering.
+	sort.Slice(methods, func(i, j int) bool {
+		return methods[i].OK+methods[i].Err > methods[j].OK+methods[j].Err
+	})
+	data.State.PerMethod = methods
 }
 
 // sanitizeSourceURL validates the user-supplied metrics source
@@ -207,6 +257,9 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 		DownloadRateLimitPerMin: readDownloadRateLimitFromMeta(r.Context()),
 	}
 	populateTGState(&data, url)
+	if !data.Online {
+		loadPersistedTGStats(r.Context(), &data)
+	}
 	return data
 }
 

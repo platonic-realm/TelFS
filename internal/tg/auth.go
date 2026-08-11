@@ -15,23 +15,14 @@ import (
 	"telfs/internal/config"
 )
 
-// Login runs the appropriate MTProto auth flow and persists the
-// resulting session to disk. Dispatches on cfg.AuthMode:
+// Login runs the interactive MTProto user auth flow (phone → code →
+// 2FA via termAuth) and persists the resulting session to disk.
+// Re-running on an already-authorized session is a no-op.
 //
-//   - "user" (default): interactive phone → code → 2FA via termAuth.
-//     Re-running on an already-authorized session is a no-op.
-//   - "bot": auth.ImportBotAuthorization using cfg.BotToken. The bot
-//     account must already exist in Telegram (created via @BotFather)
-//     and the API ID / hash must come from the SAME developer account
-//     as the bot (otherwise Telegram rejects the import).
+// User auth is the ONLY flow — bot-token auth was removed (MTProto
+// needs api_id/api_hash even for bots, so a bot identity saved
+// nothing and added an identity-scoped access_hash trap).
 func (c *Client) Login(ctx context.Context) error {
-	if c.cfg.EffectiveAuthMode() == config.AuthModeBot {
-		return c.loginBot(ctx)
-	}
-	return c.loginUser(ctx)
-}
-
-func (c *Client) loginUser(ctx context.Context) error {
 	phone := strings.TrimSpace(c.cfg.Phone)
 	if phone == "" {
 		var err error
@@ -59,6 +50,14 @@ func (c *Client) LoginWith(ctx context.Context, ua auth.UserAuthenticator) error
 		if err != nil {
 			return fmt.Errorf("self: %w", err)
 		}
+		// A leftover bot session from the removed bot-auth feature
+		// must be rejected, not silently used as the wrong actor.
+		if self.Bot {
+			return fmt.Errorf("auth: session.json holds a BOT identity (@%s, id=%d) — bot auth is no longer supported; run `telfs profile reset-auth` and log in with your phone", self.Username, self.ID)
+		}
+		if err := c.recordIdentity(self); err != nil {
+			return err
+		}
 		uname := self.Username
 		if uname == "" {
 			uname = "(no username)"
@@ -69,41 +68,20 @@ func (c *Client) LoginWith(ctx context.Context, ua auth.UserAuthenticator) error
 	})
 }
 
-func (c *Client) loginBot(ctx context.Context) error {
-	token := strings.TrimSpace(c.cfg.BotToken)
-	if token == "" {
-		return fmt.Errorf("login: auth_mode=bot but bot_token is empty in config (pass --bot <token> on the login command)")
+// recordIdentity persists who this session authenticates as into the
+// profile's config.toml, so status/web can display it and later logins
+// can enforce the one-identity-per-profile lock without a network
+// round-trip.
+func (c *Client) recordIdentity(self *tg.User) error {
+	c.cfg.Identity = &config.Identity{
+		UserID:   self.ID,
+		Username: self.Username,
+		IsBot:    self.Bot,
 	}
-	tgc := c.newTG()
-	return tgc.Run(ctx, func(ctx context.Context) error {
-		// Skip the auth import if the session is already valid — same
-		// idempotency property as the user flow.
-		status, err := tgc.Auth().Status(ctx)
-		if err != nil {
-			return fmt.Errorf("auth status: %w", err)
-		}
-		if !status.Authorized {
-			if _, err := tgc.Auth().Bot(ctx, token); err != nil {
-				return fmt.Errorf("auth.bot: %w", err)
-			}
-		}
-		self, err := tgc.Self(ctx)
-		if err != nil {
-			return fmt.Errorf("self: %w", err)
-		}
-		uname := self.Username
-		if uname == "" {
-			uname = "(no username)"
-		}
-		fmt.Printf("Logged in as BOT @%s (%s, id=%d). Session saved to %s\n",
-			uname, fullName(self), self.ID, c.cfg.SessionPath())
-		fmt.Println()
-		fmt.Println("Reminders for bot mode:")
-		fmt.Println("  * Add this bot to your channel as an ADMIN before posting.")
-		fmt.Println("  * Bots cannot enumerate dialogs — `telfs channel set` needs")
-		fmt.Println("    both --id and --access-hash supplied explicitly.")
-		return nil
-	})
+	if err := c.cfg.Save(); err != nil {
+		return fmt.Errorf("save identity: %w", err)
+	}
+	return nil
 }
 
 func fullName(u *tg.User) string {

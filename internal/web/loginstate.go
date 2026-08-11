@@ -23,10 +23,10 @@ const (
 type loginEventKind string
 
 const (
-	evCodeSent        loginEventKind = "code_sent"
-	evPasswordNeeded  loginEventKind = "password_needed"
-	evAcceptingTOS    loginEventKind = "tos"
-	evDone            loginEventKind = "done"
+	evCodeSent       loginEventKind = "code_sent"
+	evPasswordNeeded loginEventKind = "password_needed"
+	evAcceptingTOS   loginEventKind = "tos"
+	evDone           loginEventKind = "done"
 )
 
 type loginEvent struct {
@@ -48,8 +48,28 @@ type loginSession struct {
 	PassCh  chan string
 	EventCh chan loginEvent
 
+	// stage is which input the flow is waiting for next: "code" after
+	// the code was sent, "password" when 2FA is needed. The setup
+	// wizard reads it to render the matching inline form on reload.
+	stageMu sync.Mutex
+	stage   string
+
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+// SetStage / Stage: which input the login flow waits for ("code",
+// "password"). Written by the HTTP handlers as events arrive.
+func (s *loginSession) SetStage(st string) {
+	s.stageMu.Lock()
+	s.stage = st
+	s.stageMu.Unlock()
+}
+
+func (s *loginSession) Stage() string {
+	s.stageMu.Lock()
+	defer s.stageMu.Unlock()
+	return s.stage
 }
 
 func newLoginSession(profile string) *loginSession {

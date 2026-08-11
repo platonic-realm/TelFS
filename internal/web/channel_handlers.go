@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -19,7 +18,6 @@ type channelShowData struct {
 	pageBase
 	HasAPI  bool
 	HasAuth bool
-	IsBot   bool
 	Bound   bool
 	Channel channelView
 }
@@ -32,12 +30,10 @@ func (s *Server) channelShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.HasAPI = cfg.RequireAPI() == nil
-	d.IsBot = cfg.EffectiveAuthMode() == config.AuthModeBot
-	// HasAuth is approximated by "session.json exists" — gotd writes
-	// it after a successful auth.
-	if _, err := os.Stat(cfg.SessionPath()); err == nil {
-		d.HasAuth = true
-	}
+	// Authenticated = login completed ([identity] recorded), not just
+	// session.json existing — gotd creates that file during the
+	// handshake, before the user has entered their code.
+	d.HasAuth = cfg.HasSession() && cfg.Identity != nil
 	if cfg.Channel.ID != 0 {
 		d.Bound = true
 		d.Channel = channelView{Set: true, ID: cfg.Channel.ID, Title: cfg.Channel.Title}
@@ -49,7 +45,6 @@ func (s *Server) channelShow(w http.ResponseWriter, r *http.Request) {
 
 type channelListData struct {
 	pageBase
-	IsBot    bool
 	Channels []tg.ChannelInfo
 	Error    string
 }
@@ -59,11 +54,6 @@ func (s *Server) channelList(w http.ResponseWriter, r *http.Request) {
 	cfg, err := config.Load()
 	if err != nil {
 		d.Error = err.Error()
-		s.renderTemplate(w, "channel/list.html", d)
-		return
-	}
-	d.IsBot = cfg.EffectiveAuthMode() == config.AuthModeBot
-	if d.IsBot {
 		s.renderTemplate(w, "channel/list.html", d)
 		return
 	}
@@ -85,19 +75,52 @@ func (s *Server) channelList(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "channel/list.html", d)
 }
 
+// ── GET /setup/channels — wizard channel-picker partial ───────────
+//
+// HTMX-lazy-loaded by the setup wizard's channel step so the wizard
+// page renders instantly while the dialog scan (a network RPC, up to
+// ~15 s) fills in. Each row is a one-click bind: a mini form posting
+// the channel's id + access_hash to /channel/set with from=setup.
+type setupChannelsData struct {
+	CSRF     string
+	Channels []tg.ChannelInfo
+	Error    string
+}
+
+func (s *Server) setupChannels(w http.ResponseWriter, r *http.Request) {
+	d := setupChannelsData{CSRF: s.state.EnsureCSRF(w, r)}
+	cfg, err := config.Load()
+	if err != nil {
+		d.Error = err.Error()
+		s.renderPartial(w, "partials/setup_channels.html", d)
+		return
+	}
+	client, err := tg.New(cfg)
+	if err != nil {
+		d.Error = err.Error()
+		s.renderPartial(w, "partials/setup_channels.html", d)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	chans, err := client.ListChannels(ctx)
+	if err != nil {
+		d.Error = err.Error()
+		s.renderPartial(w, "partials/setup_channels.html", d)
+		return
+	}
+	d.Channels = chans
+	s.renderPartial(w, "partials/setup_channels.html", d)
+}
+
 // ── /channel/set ──────────────────────────────────────────────────
 
 type channelSetData struct {
 	pageBase
-	IsBot bool
 }
 
 func (s *Server) channelSetForm(w http.ResponseWriter, r *http.Request) {
-	d := channelSetData{pageBase: s.basePage(w, r)}
-	if cfg, err := config.Load(); err == nil {
-		d.IsBot = cfg.EffectiveAuthMode() == config.AuthModeBot
-	}
-	s.renderTemplate(w, "channel/set.html", d)
+	s.renderTemplate(w, "channel/set.html", channelSetData{pageBase: s.basePage(w, r)})
 }
 
 func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
@@ -105,16 +128,17 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
+	errBack := setupReturn(r, "/channel/set")
 	idStr := strings.TrimSpace(r.FormValue("id"))
 	if idStr == "" {
 		SetFlash(w, "error", "channel id is required")
-		http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		SetFlash(w, "error", fmt.Sprintf("bad id %q: %v", idStr, err))
-		http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	var accessHash int64
@@ -123,19 +147,14 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 			accessHash = v
 		} else {
 			SetFlash(w, "error", fmt.Sprintf("bad access_hash %q: %v", h, err))
-			http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
+			http.Redirect(w, r, errBack, http.StatusSeeOther)
 			return
 		}
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
-		http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
-		return
-	}
-	if cfg.EffectiveAuthMode() == config.AuthModeBot && accessHash == 0 {
-		SetFlash(w, "error", "bot mode: access_hash is required (bots can't auto-discover it)")
-		http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	// Rebind guard (mirrors `telfs channel set`): once chunk_map
@@ -149,7 +168,7 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 			mstore.Close()
 			if rerr == nil && has {
 				SetFlash(w, "error", fmt.Sprintf("this profile has data in the currently-bound channel (id=%d) — rebinding would orphan all of it. Create a new profile for a new channel, or use `telfs channel set --force` if you really mean it.", cfg.Channel.ID))
-				http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
+				http.Redirect(w, r, errBack, http.StatusSeeOther)
 				return
 			}
 		}
@@ -157,7 +176,7 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 	client, err := tg.New(cfg)
 	if err != nil {
 		SetFlash(w, "error", "tg.New: "+err.Error())
-		http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -165,9 +184,9 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 	info, err := client.SetChannel(ctx, id, accessHash)
 	if err != nil {
 		SetFlash(w, "error", "set: "+err.Error())
-		http.Redirect(w, r, "/channel/set", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	SetFlash(w, "ok", fmt.Sprintf("channel set: %s (id=%d)", info.Title, info.ID))
-	http.Redirect(w, r, "/channel", http.StatusSeeOther)
+	http.Redirect(w, r, setupReturn(r, "/channel"), http.StatusSeeOther)
 }

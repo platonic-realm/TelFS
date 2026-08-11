@@ -88,7 +88,7 @@ func (m *Manager) Run(ctx context.Context) error {
 	// mount, the local DB was just restored from a (now-stale) channel
 	// snapshot; re-uploading now gives us a fresh baseline.
 	if err := m.Once(ctx); err != nil {
-		logger.Printf("[snapshot] initial snapshot failed: %v", err)
+		logger.Printf("[snapshot] initial snapshot failed: %v%s", err, channelLostHint(err))
 	}
 
 	t := time.NewTicker(m.Interval)
@@ -99,10 +99,21 @@ func (m *Manager) Run(ctx context.Context) error {
 			return nil
 		case <-t.C:
 			if err := m.Once(ctx); err != nil {
-				logger.Printf("[snapshot] periodic snapshot failed: %v", err)
+				logger.Printf("[snapshot] periodic snapshot failed: %v%s", err, channelLostHint(err))
 			}
 		}
 	}
+}
+
+// channelLostHint appends the "this won't fix itself" explanation to
+// snapshot failure logs when the error is the identity-scoped
+// channel-access kind. The manager's cadence is already minutes-long,
+// so no extra backoff — just an actionable message.
+func channelLostHint(err error) string {
+	if !channelLost(err) {
+		return ""
+	}
+	return " — channel unreachable for this identity; fix the binding or identity (`telfs status`, `telfs channel set`)"
 }
 
 // Once performs a single snapshot cycle: build, optionally encrypt

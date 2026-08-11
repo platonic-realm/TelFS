@@ -451,6 +451,21 @@ input[type="tel"], input[type="file"], select, textarea {
   border-radius: 2px;
   padding: 7px 10px;
 }
+/* Label-wrapped inputs are the settings-form pattern (API creds,
+   phone, channel id, mountpoint). Stack the field UNDER its caption —
+   inline-after-caption made fields start at different x positions
+   (caption widths differ), so a column of fields never aligned. Size
+   for the longest realistic value: the 32-char api_hash and its
+   placeholder. Checkbox/radio labels and inputs embedded elsewhere
+   (table rows, filters) keep their own layout. */
+label > input[type="text"], label > input[type="password"],
+label > input[type="number"], label > input[type="tel"],
+label > select {
+  display: block;
+  margin-top: 4px;
+  min-width: min(40ch, 86vw);
+  box-sizing: border-box;
+}
 input:focus, select:focus, textarea:focus {
   outline: 2px solid var(--copper);
   outline-offset: 0;
@@ -476,7 +491,20 @@ legend {
 }
 .inline-form { display: inline; margin: 0; }
 .row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
-.actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
+/* A form inside a .row is just a button carrier (Stop, etc.) — the
+   global form margin would lift its button off the row's baseline,
+   misaligning it with sibling .btn links. */
+.row > form { margin: 0; }
+/* .actions marks a ledger row's action strip — always a th/td.
+   Never display:flex here: a flexed cell stops generating a
+   table-cell box, so the browser ejects it from the row grid and
+   the buttons drop onto their own line with a stray rule above
+   them (the artifact on /profiles). Inline-block children give the
+   same horizontal strip while the cell stays in the ledger row. */
+.actions { text-align: right; white-space: nowrap; }
+.actions > * { display: inline-block; vertical-align: middle; }
+.actions > * + * { margin-left: 6px; }
+.actions details[open] { white-space: normal; }
 .sep { color: var(--ink-subtle); margin: 0 4px; }
 
 /* ─── code ──────────────────────────────────────────────────────── */
@@ -540,17 +568,50 @@ pre code { border: 0; padding: 0; background: none; }
 .setup-detail, .setup-why { color: var(--ink-muted); font-size: 12px; }
 .setup-cta { margin-top: 14px; }
 
-.wizard-stepper { display: flex; gap: 4px; flex-wrap: wrap; margin: 10px 0 18px; }
+/* The stepper is an <ol> — kill the browser's own list markers or
+   they leak in as stray misaligned numbers at each wrapped row.
+   Each chip is number-in-a-ring + label, vertically centered. */
+.wizard-stepper {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 10px 0 18px;
+}
 .wizard-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   font-size: 10px;
   letter-spacing: .1em;
   text-transform: uppercase;
+  white-space: nowrap;
   color: var(--ink-subtle);
   border: 1px solid var(--rule);
   border-radius: 2px;
-  padding: 4px 10px;
+  padding: 5px 10px 5px 6px;
 }
-.wizard-step.wizard-current { color: var(--on-copper); background: var(--copper); border-color: var(--copper); }
+.wizard-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-size: 9px;
+  letter-spacing: 0;
+}
+.wizard-step.done { color: var(--ink-muted); }
+.wizard-step.done .wizard-step-num { border-color: var(--copper); color: var(--copper); }
+.wizard-step.current {
+  color: var(--on-copper);
+  background: var(--copper);
+  border-color: var(--copper);
+}
+.wizard-step.skipped { border-style: dashed; }
 .wizard-step-label { letter-spacing: .06em; }
 .wizard-actions { display: flex; gap: 10px; margin-top: 16px; }
 

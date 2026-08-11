@@ -50,8 +50,9 @@ func TestDefaultDirResolutionOrder(t *testing.T) {
 		t.Fatalf("expected ErrNoActiveProfile when nothing is set, got nil")
 	}
 
-	// active file resolves.
-	if err := os.MkdirAll(filepath.Join(xdg, "telfs"), 0o700); err != nil {
+	// active file resolves — the named profile dir must EXIST (a
+	// dangling name is treated as unset; see readActiveProfile).
+	if err := os.MkdirAll(filepath.Join(xdg, "telfs", "profiles", "work"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(xdg, "telfs", "active"), []byte("work\n"), 0o600); err != nil {
@@ -91,5 +92,122 @@ func TestActiveProfileRecoversFromCorruptFile(t *testing.T) {
 	t.Setenv("TELFS_PROFILE", "")
 	if got := ActiveProfile(); got != "" {
 		t.Fatalf("malformed active file: ActiveProfile() = %q, want \"\" (fallthrough)", got)
+	}
+}
+
+// TestActiveProfileIgnoresDanglingName: an active file naming a profile
+// whose directory no longer exists (deleted with an old binary, hand
+// edit) is treated as no selection — it must NOT silently resurrect an
+// empty profile dir via the next config.Load.
+func TestActiveProfileIgnoresDanglingName(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("TELFS_PROFILE", "")
+	if err := os.MkdirAll(filepath.Join(xdg, "telfs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(xdg, "telfs", "active"), []byte("ghost\n"), 0o600)
+	if got := ActiveProfile(); got != "" {
+		t.Fatalf("dangling active name: ActiveProfile() = %q, want \"\"", got)
+	}
+	if _, err := DefaultDir(); err == nil {
+		t.Fatal("dangling active name: DefaultDir() succeeded, want ErrNoActiveProfile")
+	}
+}
+
+// TestClearActiveProfile: use → clear → no selection. Clearing twice
+// is fine (idempotent).
+func TestClearActiveProfile(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("TELFS_PROFILE", "")
+	if err := os.MkdirAll(filepath.Join(xdg, "telfs", "profiles", "work"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetActiveProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ActiveProfile(); got != "work" {
+		t.Fatalf("ActiveProfile() = %q, want work", got)
+	}
+	if err := ClearActiveProfile(); err != nil {
+		t.Fatal(err)
+	}
+	if got := ActiveProfile(); got != "" {
+		t.Fatalf("after clear: ActiveProfile() = %q, want \"\"", got)
+	}
+	if err := ClearActiveProfile(); err != nil {
+		t.Fatalf("second clear should be idempotent, got %v", err)
+	}
+}
+
+// TestIdentityRoundTrip: [identity] persists through Save/Load, and
+// HasSession flips with the session file's existence.
+func TestIdentityRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{DataDir: dir, APIID: 1, APIHash: "h"}
+
+	if cfg.HasSession() {
+		t.Fatal("HasSession true with no session file")
+	}
+
+	cfg.Identity = &Identity{UserID: 42, Username: "arash", IsBot: false}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	// Fake a session file — the identity lock is its existence.
+	if err := os.WriteFile(cfg.SessionPath(), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Identity == nil || got.Identity.UserID != 42 || got.Identity.IsBot || got.Identity.Username != "arash" {
+		t.Fatalf("identity round-trip mismatch: %+v", got.Identity)
+	}
+	if !got.HasSession() {
+		t.Fatal("HasSession false with session file present")
+	}
+	if label := got.Identity.Label(); label != "@arash (user)" {
+		t.Fatalf("Label = %q", label)
+	}
+	// A leftover bot identity (from the removed bot-auth feature) must
+	// still label itself honestly so rejection messages name the actor.
+	bot := &Identity{UserID: 9, Username: "old_bot", IsBot: true}
+	if label := bot.Label(); label != "@old_bot (bot)" {
+		t.Fatalf("bot Label = %q", label)
+	}
+}
+
+// TestConfigIgnoresRemovedBotKeys: configs written while bot auth
+// existed carry auth_mode / bot_token keys — decoding must not fail on
+// them.
+func TestConfigIgnoresRemovedBotKeys(t *testing.T) {
+	dir := t.TempDir()
+	legacy := "api_id = 7\napi_hash = \"h\"\nauth_mode = \"bot\"\nbot_token = \"123:abc\"\n"
+	if err := os.WriteFile(filepath.Join(dir, ConfigFile), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("legacy config with bot keys failed to load: %v", err)
+	}
+	if cfg.APIID != 7 {
+		t.Fatalf("APIID = %d, want 7", cfg.APIID)
+	}
+}
+
+// TestIdentityLabelNil: nil identity renders empty (templates rely on
+// this for the {{if .Identity}} guard).
+func TestIdentityLabelNil(t *testing.T) {
+	var id *Identity
+	if got := id.Label(); got != "" {
+		t.Fatalf("nil Label = %q, want \"\"", got)
+	}
+	noName := &Identity{UserID: 9}
+	if got := noName.Label(); got != "id=9 (user)" {
+		t.Fatalf("no-username Label = %q", got)
 	}
 }

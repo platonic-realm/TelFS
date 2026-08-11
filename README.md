@@ -26,7 +26,7 @@ End-to-end verified on a real Telegram account + private channel:
 
 | Capability | Status |
 |---|---|
-| Login — phone + code + 2FA (user) or bot token (MTProto, not the HTTP Bot API) | ✓ |
+| Login — interactive phone + code + 2FA over MTProto (one identity per profile, logout supported) | ✓ |
 | Read/write mount with full POSIX: files, dirs, hardlinks, symlinks, xattrs | ✓ |
 | Multi-chunk files (no per-file ceiling), cross-chunk-boundary read/write | ✓ |
 | Cold-mount recovery from channel snapshot, journal replay (≤5 s loss) | ✓ |
@@ -43,28 +43,65 @@ End-to-end verified on a real Telegram account + private channel:
 | Content-addressed chunk dedup (plaintext + convergent-encrypted FSes) | ✓ |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
-## Bot vs user auth
+## Telegram API credentials (API ID + hash)
 
-Both go over MTProto via gotd (2 GB per upload either way; the HTTP
-Bot API and its ~50 MB ceiling are never used). The data plane is
-identical; only the dialog/listing surface differs:
+TelFS speaks the MTProto API directly — the same protocol the official
+apps use (2 GB per upload; the HTTP Bot API and its 50 MB / 20 MB
+caps are never used). MTProto requires every client application to
+identify itself with an **API ID + API hash** pair. You create it once
+and reuse it for every profile — it identifies the *application*, not
+your account.
 
-- **User** — `telfs login` (phone + code + 2FA). `channel list`
-  enumerates your channels and `channel set <id>` auto-discovers the
-  access_hash.
-- **Bot** — `telfs login --bot <token>` (from @BotFather; add the bot
-  as an admin to the target channel). Bots cannot enumerate dialogs,
-  so `channel set` requires `--access-hash` explicitly.
+> Bot-token auth existed briefly and was removed: MTProto requires the
+> api_id/api_hash pair even for bots (`auth.importBotAuthorization`
+> takes them as parameters), so a bot identity saved nothing over a
+> user login while adding channel-admin requirements and an
+> identity-scoped access_hash trap. Auth is phone login, full stop.
 
-Bot-mode setup (after a user-account TelFS has printed the channel's
-`access_hash` via `telfs channel info`):
+### Creating the pair (one-time, ~2 minutes)
+
+1. Open <https://my.telegram.org> and log in with your **phone
+   number** — Telegram sends the confirmation code to your Telegram
+   app (not SMS).
+2. Click **API development tools**.
+3. If you have no app yet, fill the short form: any **App title** and
+   **Short name** (e.g. `telfs`), platform **Desktop** or **Other** —
+   URL can stay empty. Submit.
+4. The page now shows your **App api_id** (a number, e.g. `12345678`)
+   and **App api_hash** (32 hex characters). That's the pair. It stays
+   retrievable on that page forever — nothing to write down urgently.
+
+Treat the hash like a password-ish secret: it can't read your account
+by itself (a login still needs your phone + code), but don't publish
+it.
+
+### Entering the pair in TelFS
+
+**Web (recommended):** run `telfs web`, open
+<http://127.0.0.1:8080/setup> and follow the wizard — every step is an
+inline form on that one page: profile → API ID + hash → phone login →
+channel → optional encryption/compression → first mount. The
+credentials form is also on each profile's page, and the login form
+collects the pair inline if it's missing.
+
+![TelFS setup wizard — the API credentials step](assets/setup-wizard.png)
+
+**CLI:** either export them as environment variables before `telfs
+login`:
 
 ```sh
-telfs profile create my-bot
-TELFS_PROFILE=my-bot telfs login --bot 123456:ABCDEF…
-TELFS_PROFILE=my-bot telfs channel set --access-hash <H> <channel-id>
-TELFS_PROFILE=my-bot telfs mount ~/External
+export TELFS_API_ID=12345678 TELFS_API_HASH=0123456789abcdef0123456789abcdef
 ```
+
+or put them in the active profile's config file
+(`~/.config/telfs/profiles/<name>/config.toml`, mode 0600):
+
+```toml
+api_id = 12345678
+api_hash = "0123456789abcdef0123456789abcdef"
+```
+
+The same pair works in every profile you'll ever create.
 
 ## Install
 
@@ -103,7 +140,13 @@ telfs channel set <id>
 telfs channel ping                           # smoke test
 
 mkdir mnt && telfs mount ./mnt               # foreground; ^C to unmount
+# background daemons: `telfs unmount <mountpoint|profile>` stops any
+# telfs mount gracefully, however it was started
 ```
+
+Prefer a browser? `telfs web` serves <http://127.0.0.1:8080> — the
+`/setup` wizard walks every step above with inline forms, and the
+Mounts page starts/stops daemons with a live log tail.
 
 Then in another shell — write, hardlink, symlink, xattr all work:
 
@@ -344,10 +387,12 @@ mode 0600 (don't commit it):
 ```toml
 api_id = 12345678
 api_hash = "..."
-auth_mode = "user"            # or "bot"
-bot_token = ""                # only when auth_mode = "bot"
 phone = "+15551234567"        # optional — prompted if missing
 dc = 1                        # starting datacenter; default 2
+
+[identity]                    # written automatically on login
+user_id = 123456789
+username = "you"
 
 [channel]
 id = 1234567890
@@ -370,7 +415,7 @@ Environment overrides:
 | What | Choice | Why |
 |---|---|---|
 | Language | Go (`hanwen/go-fuse` + `gotd/td` + `modernc.org/sqlite`) | Pure-Go SQLite — no cgo, fully-static binary. |
-| Telegram API | MTProto via `gotd/td` (user *and* bot) | One data-plane path; 2 GB per upload. HTTP Bot API never used. |
+| Telegram API | MTProto via `gotd/td`, user auth only | One data-plane path; 2 GB per upload. HTTP Bot API never used. |
 | Metadata | Local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence. |
 | Chunk size | 4 MiB default, per-FS configurable via `telfs init --chunk-size`; immutable after first chunk; power of two ∈ [64 KiB, 1.5 GiB] | Throughput vs `chunk_map` row count. |
 | POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough for typical workloads. |
@@ -409,13 +454,16 @@ passphrase. Treat it like an SSH private key.
 ## Web management UI
 
 `telfs web` boots a self-contained HTTP UI covering the entire CLI:
-dashboard, profile CRUD + export/import, multi-step phone login,
-bot-token login, channel binding, encryption init, mount supervisor
-with HTMX-polled log tail, and a file browser through a chosen
-mountpoint.
+dashboard, profile CRUD + export/import, multi-step phone login with
+logout, one-click channel binding, encryption init, mount supervisor
+with HTMX-polled log tail, lifetime Telegram stats (persisted in the
+profile's SQLite, visible even while the daemon is down), and a file
+browser through a chosen mountpoint.
 
-First-time users land on a guided `/setup` wizard: API creds → login →
-channel → optional encryption → first mount. State is derived from the
+First-time users land on a guided `/setup` wizard where every step is
+an inline form on one page: create profile → API creds → phone login
+(code + 2FA inline) → pick a channel from your dialog list → optional
+encryption/compression → first mount. State is derived from the
 filesystem on every page load — there's no separate wizard progress
 file to drift.
 

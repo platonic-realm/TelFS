@@ -35,6 +35,7 @@ func cmdStatus(ctx context.Context, _ []string) error {
 		fmt.Println("  active:", active)
 	}
 	fmt.Println("  data:  ", cfg.DataDir)
+	fmt.Println("  auth:  ", authSummary(cfg))
 
 	fmt.Println("\n== Files ==")
 	printFileStat(cfg.ConfigPath(), "config.toml")
@@ -124,6 +125,21 @@ func cmdStatus(ctx context.Context, _ []string) error {
 
 	printMountTable()
 	return nil
+}
+
+// authSummary renders the profile's identity line: who session.json
+// authenticates as.
+func authSummary(cfg *config.Config) string {
+	if !cfg.HasSession() {
+		return "(not logged in — run `telfs login`)"
+	}
+	if cfg.Identity != nil {
+		return cfg.Identity.Label()
+	}
+	// session.json without [identity]: either a login that never
+	// completed (gotd writes the file at handshake time) or a legacy
+	// pre-identity profile — a login or mount settles which.
+	return "(unverified — complete `telfs login` or mount once)"
 }
 
 // printFileStat prints "name  size  mtime" for a single file, or a

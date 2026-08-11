@@ -1,10 +1,8 @@
 package web
 
 import (
-	"os"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestScrubEnvRemovesNamedKeys(t *testing.T) {
@@ -127,45 +125,5 @@ func TestReconcileIdempotent(t *testing.T) {
 	_ = s.List()
 }
 
-// TestResolveStdoutLog_Skip: pipe + tty + non-regular targets must
-// return empty so we never try to read a non-file as the log.
-func TestResolveStdoutLog_Skip(t *testing.T) {
-	// pid 1 (init) on systemd hosts has stdout pointing at a /dev/null
-	// or /dev/console or a journald socket — none of which are regular
-	// files. resolveStdoutLog should return "" without erroring.
-	got := resolveStdoutLog(1)
-	if got != "" {
-		// Some hosts have init's stdout in a regular file (rare); just
-		// log, don't fail.
-		t.Logf("resolveStdoutLog(1) = %q (host-specific)", got)
-	}
-}
-
-// TestReadEnvVar_Missing: a process without the requested env var
-// should return "" without erroring. Self-test: ask for an unlikely
-// var name on our own pid.
-func TestReadEnvVar_Missing(t *testing.T) {
-	got := readEnvVar(os.Getpid(), "TELFS_TEST_DEFINITELY_UNSET_ENV_VAR_xyz_123")
-	if got != "" {
-		t.Fatalf("readEnvVar missing key returned %q, want empty", got)
-	}
-}
-
-// TestProcStartTime: bootTime + procStartTime should return a time
-// in the past, never in the future (sanity check against a parse bug
-// flipping the boot time direction). Uses our own pid as the test
-// subject.
-func TestProcStartTime(t *testing.T) {
-	got := procStartTime(os.Getpid())
-	if got.IsZero() {
-		// /proc/stat parse failed — host doesn't have linux /proc layout.
-		t.Skip("no /proc/<pid>/stat")
-	}
-	if got.After(time.Now()) {
-		t.Fatalf("procStartTime = %v is in the future (now = %v)", got, time.Now())
-	}
-	// Should be no more than a few hours ago for a normal test run.
-	if time.Since(got) > 30*24*time.Hour {
-		t.Logf("procStartTime = %v (more than 30 days ago — odd but not necessarily wrong)", got)
-	}
-}
+// The /proc helper tests (resolveStdoutLog, readEnvVar, procStartTime)
+// moved to internal/mountctl with the code.

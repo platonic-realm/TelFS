@@ -14,12 +14,14 @@ import (
 	"strings"
 
 	"telfs/internal/config"
+	"telfs/internal/meta"
+	"telfs/internal/mountctl"
 )
 
-// cmdProfile dispatches `telfs profile {list,show,create,delete,use,export,import}`.
+// cmdProfile dispatches `telfs profile {list,show,create,delete,use,reset-auth,export,import}`.
 func cmdProfile(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("profile: missing subcommand (list, show, create, delete, use, export, import)")
+		return errors.New("profile: missing subcommand (list, show, create, delete, use, reset-auth, export, import)")
 	}
 	switch args[0] {
 	case "list":
@@ -32,6 +34,8 @@ func cmdProfile(ctx context.Context, args []string) error {
 		return cmdProfileDelete(args[1:])
 	case "use":
 		return cmdProfileUse(args[1:])
+	case "reset-auth":
+		return cmdProfileResetAuth(ctx, args[1:])
 	case "export":
 		return cmdProfileExport(args[1:])
 	case "import":
@@ -109,10 +113,14 @@ func cmdProfileShow(args []string) error {
 }
 
 func cmdProfileCreate(args []string) error {
-	if len(args) == 0 {
+	fs := flag.NewFlagSet("profile create", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
 		return errors.New("profile create: usage: profile create <name>")
 	}
-	name := args[0]
+	name := fs.Arg(0)
 	dir, err := config.ProfileDir(name)
 	if err != nil {
 		return err
@@ -149,15 +157,110 @@ func cmdProfileDelete(args []string) error {
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("profile %q not found", name)
 	}
+	// Deleting under a live daemon leaves it writing to unlinked
+	// files; the next mount then recovers from the channel, losing
+	// everything after the last snapshot.
+	if pid, mp, ok := mountctl.FindByProfile(name); ok {
+		return fmt.Errorf("profile %q has a running mount daemon (pid %d at %s) — run `telfs unmount %s` first", name, pid, mp, name)
+	}
 	if !*force {
 		fmt.Fprintf(os.Stderr, "profile delete: refusing to delete %s without --yes (this removes the SQLite DB and session — channel data is unaffected).\n", dir)
 		return errors.New("aborted")
 	}
+	// Capture BEFORE RemoveAll: once the dir is gone, the active-file
+	// reader treats the dangling name as unset and this check would
+	// never fire.
+	wasActive := config.ActiveProfile() == name
 	if err := os.RemoveAll(dir); err != nil {
 		return err
 	}
 	fmt.Printf("Deleted profile %q (%s)\n", name, dir)
+	// Don't leave the active selection pointing at the void.
+	if wasActive {
+		if err := config.ClearActiveProfile(); err != nil {
+			return fmt.Errorf("clear active profile: %w", err)
+		}
+		fmt.Println("That was the active profile — selection cleared. Pick another with `telfs profile use <name>`.")
+	}
 	return nil
+}
+
+// cmdProfileResetAuth wipes a profile's auth identity: session.json,
+// phone / [identity], AND the channel binding — a channel access_hash
+// is scoped to the identity that resolved it and is garbage under any
+// other. This is the one sanctioned way to change a profile's account
+// (profiles are otherwise locked to one identity), and the escape
+// hatch for sessions left behind by the removed bot-auth feature.
+func cmdProfileResetAuth(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("profile reset-auth", flag.ContinueOnError)
+	force := fs.Bool("yes", false, "skip the confirmation prompt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("profile reset-auth: usage: profile reset-auth [--yes] <name>")
+	}
+	name := fs.Arg(0)
+	dir, err := config.ProfileDir(name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("profile %q not found", name)
+	}
+	if pid, mp, ok := mountctl.FindByProfile(name); ok {
+		return fmt.Errorf("profile %q has a running mount daemon (pid %d at %s) — run `telfs unmount %s` first", name, pid, mp, name)
+	}
+	cfg, err := config.LoadFromDir(dir)
+	if err != nil {
+		return err
+	}
+	hadChannel := cfg.Channel.ID
+	if !*force {
+		fmt.Fprintf(os.Stderr, "profile reset-auth: this wipes %s's identity:\n", name)
+		fmt.Fprintln(os.Stderr, "  - deletes session.json (the Telegram authorization)")
+		fmt.Fprintln(os.Stderr, "  - clears phone and [identity]")
+		fmt.Fprintln(os.Stderr, "  - clears the channel binding (its access_hash belongs to the old identity)")
+		if hadChannel != 0 && profileHasChunks(ctx, cfg) {
+			fmt.Fprintf(os.Stderr, "\n  NOTE: this profile has DATA in channel id=%d. The channel itself is\n", hadChannel)
+			fmt.Fprintln(os.Stderr, "  untouched, but the next identity must be able to access that same")
+			fmt.Fprintf(os.Stderr, "  channel; after logging in, re-bind it with `telfs channel set %d`.\n", hadChannel)
+		}
+		fmt.Fprintln(os.Stderr, "\nRe-run with --yes to proceed.")
+		return errors.New("aborted")
+	}
+	if err := os.Remove(cfg.SessionPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove session: %w", err)
+	}
+	cfg.Phone = ""
+	cfg.Identity = nil
+	cfg.Channel = config.ChannelConfig{}
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("Auth identity of profile %q reset.\n", name)
+	fmt.Println("Next steps:")
+	fmt.Printf("  TELFS_PROFILE=%s telfs login   # authenticate the new identity\n", name)
+	if hadChannel != 0 {
+		fmt.Printf("  TELFS_PROFILE=%s telfs channel set %d   # re-bind the same channel under the new identity\n", name, hadChannel)
+	}
+	return nil
+}
+
+// profileHasChunks reports whether the profile's local DB references
+// uploaded chunks — i.e. the bound channel holds live data. Never
+// creates a DB (stat-first).
+func profileHasChunks(ctx context.Context, cfg *config.Config) bool {
+	if _, err := os.Stat(cfg.DBPath()); err != nil {
+		return false
+	}
+	mstore, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return false
+	}
+	defer mstore.Close()
+	has, err := mstore.HasAnyChunks(ctx)
+	return err == nil && has
 }
 
 func cmdProfileUse(args []string) error {

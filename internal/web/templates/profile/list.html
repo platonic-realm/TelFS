@@ -23,6 +23,10 @@
       <input type="hidden" name="csrf" value="{{$.CSRF}}">
       <button type="submit" class="secondary">Export</button>
     </form>
+    <form method="post" action="/profiles/{{.}}/delete" style="display:inline" onsubmit="return confirm('Delete profile {{.}}? Local data only — channel data is untouched.');">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <button type="submit" class="danger">Delete</button>
+    </form>
   </td>
 </tr>
 {{end}}

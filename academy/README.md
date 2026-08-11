@@ -37,6 +37,7 @@ references inside them point at real code paths so you can keep
 | [13 — Lessons learned](13-lessons-learned.md) | Real bugs and what they taught us | Pattern library for future work |
 | [14 — A perf + correctness pass](14-perf-correctness-pass.md) | Kernel-untar incident: LIMIT_INVALID, FK violations, rate-limit lane split, UX overhaul | Walks through one session that hardened several subsystems at once |
 | [15 — The read-performance pass](15-read-perf-pass.md) | Singleflight, parallel ranged fetch, FileReference cache, RAM hot tier, seek detection, cancellable prefetch | What it takes to make reads bandwidth-bound instead of RTT-bound |
+| [16 — The profile-identity pass](16-profile-identity-pass.md) | Identity-scoped access hashes, bot-auth removal, mount preflight, `telfs unmount`, the inline setup wizard, persistent stats | How "it didn't fail" turned out to be the worst bug report of all |
 
 ## Conventions
 

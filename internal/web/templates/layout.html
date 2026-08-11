@@ -31,6 +31,7 @@
     </details>
   </nav>
   <div class="header-extras">
+    <a class="pill acc" href="/profiles" title="Active profile — every page operates on this profile">{{with activeProfile}}{{.}}{{else}}no profile{{end}}</a>
     <span id="health-pill" class="pill muted" title="Loading…"
           hx-get="/partials/health" hx-trigger="load, every 5s" hx-swap="outerHTML">link…</span>
     <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode">◐</button>

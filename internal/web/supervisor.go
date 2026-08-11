@@ -1,7 +1,6 @@
 package web
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"telfs/internal/config"
+	"telfs/internal/mountctl"
 )
 
 // MountProcess describes one telfs mount daemon. Two flavors:
@@ -58,19 +58,6 @@ type MountProcess struct {
 // pid.
 func (m *MountProcess) markDone() {
 	m.doneOnce.Do(func() { close(m.done) })
-}
-
-// fusermountHelper resolves the FUSE unmount helper: fusermount3
-// (fuse3) first, then legacy fusermount. fuse3-only distros ship no
-// "fusermount" name at all, so hardcoding it made every emergency
-// unmount here a silent no-op.
-func fusermountHelper() string {
-	for _, name := range []string{"fusermount3", "fusermount"} {
-		if p, err := exec.LookPath(name); err == nil {
-			return p
-		}
-	}
-	return "fusermount"
 }
 
 // Status is the short label shown in the UI. For adopted procs
@@ -334,6 +321,9 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 // only know the pid). Exit detection is the channel close from the
 // supervised cmd.Wait goroutine, or a kill-0 poll loop for adopted.
 func (s *Supervisor) Stop(profile string) error {
+	// Reconcile so a daemon started outside this web (or after a web
+	// restart emptied the map) is stoppable by profile name too.
+	s.Reconcile()
 	s.mu.Lock()
 	mp := s.procs[profile]
 	s.mu.Unlock()
@@ -342,21 +332,35 @@ func (s *Supervisor) Stop(profile string) error {
 	}
 	select {
 	case <-mp.done:
-		return nil
+		return ensureUnmounted(mp.Mountpoint)
 	default:
 	}
 	_ = signalProc(mp, syscall.SIGTERM)
 	if waitForExit(mp, 35*time.Second) {
-		return nil
+		// The daemon can exit cleanly yet leave the kernel mount
+		// behind (its own fusermount hit EBUSY). Verify + lazy-detach.
+		return ensureUnmounted(mp.Mountpoint)
 	}
 	// Last-ditch: SIGKILL + lazy unmount.
 	_ = signalProc(mp, syscall.SIGKILL)
-	if err := exec.Command(fusermountHelper(), "-u", "-z", mp.Mountpoint).Run(); err != nil {
+	if err := mountctl.LazyUnmount(mp.Mountpoint); err != nil && mountctl.IsMounted(mp.Mountpoint) {
 		return fmt.Errorf("kill + lazy unmount failed: %w", err)
 	}
 	// Mark done for adopted procs so Status flips. markDone is
 	// sync.Once-guarded — safe unconditionally.
 	mp.markDone()
+	return nil
+}
+
+// ensureUnmounted lazy-detaches the mountpoint if it's still present
+// in /proc/mounts after the daemon exited.
+func ensureUnmounted(mountpoint string) error {
+	if mountpoint == "" || !mountctl.IsMounted(mountpoint) {
+		return nil
+	}
+	if err := mountctl.LazyUnmount(mountpoint); err != nil {
+		return fmt.Errorf("daemon exited but mount remains: %w", err)
+	}
 	return nil
 }
 
@@ -464,14 +468,8 @@ func (s *Supervisor) UnmountExternal(mountpoint string) error {
 	if !found {
 		return fmt.Errorf("mountpoint %q is not currently mounted as fuse.telfs", mountpoint)
 	}
-	if err := exec.Command(fusermountHelper(), "-u", mountpoint).Run(); err == nil {
-		return nil
-	}
-	// EBUSY or stuck — try the lazy form.
-	if err := exec.Command(fusermountHelper(), "-u", "-z", mountpoint).Run(); err != nil {
-		return fmt.Errorf("fusermount -u -z %s: %w", mountpoint, err)
-	}
-	return nil
+	// Polite unmount, lazy on EBUSY.
+	return mountctl.Unmount(mountpoint)
 }
 
 // ExternalMounts returns fuse.telfs mountpoints in /proc/mounts that
@@ -558,12 +556,12 @@ func (s *Supervisor) Reconcile() {
 // by walking /proc/*/cmdline. Returns nil when nothing matches —
 // the mountpoint is a fuse.telfs entry but no live telfs process
 // holds it (zombie or detached). Reads profile from TELFS_PROFILE
-// in /proc/<pid>/environ; falls back to "(unknown)" when absent.
-// LogPath is /proc/<pid>/fd/1 IF it resolves to a regular file —
-// daemons started with stdout redirected to a file (the supervisor
-// pattern, or `telfs mount ... > log.txt`).
+// in /proc/<pid>/environ. LogPath is /proc/<pid>/fd/1 IF it
+// resolves to a regular file — daemons started with stdout
+// redirected to a file (the supervisor pattern, or
+// `telfs mount ... > log.txt`).
 func adoptFromProc(mountpoint string) *MountProcess {
-	pid, found := findTelfsMountPid(mountpoint)
+	pid, found := mountctl.FindDaemonPid(mountpoint)
 	if !found {
 		return nil
 	}
@@ -572,180 +570,16 @@ func adoptFromProc(mountpoint string) *MountProcess {
 		Pid:        pid,
 		Adopted:    true,
 		done:       make(chan struct{}),
-		Profile:    readEnvVar(pid, config.EnvProfile),
-		Started:    procStartTime(pid),
-		LogPath:    resolveStdoutLog(pid),
+		Profile:    mountctl.ReadEnvVar(pid, config.EnvProfile),
+		Started:    mountctl.ProcStartTime(pid),
+		LogPath:    mountctl.ResolveStdoutLog(pid),
 	}
 	return mp
 }
 
-// findTelfsMountPid scans /proc/*/cmdline for the daemon that mounted
-// `mountpoint`. The daemon's argv ends with `<mountpoint>` (see
-// cmd/telfs/main.go's mount subcommand and the supervisor's Start
-// args construction). Returns (pid, true) on match, (0, false) on
-// no match.
-func findTelfsMountPid(mountpoint string) (int, bool) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, false
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if name == "" || name[0] < '0' || name[0] > '9' {
-			continue
-		}
-		cmdline, err := os.ReadFile("/proc/" + name + "/cmdline")
-		if err != nil {
-			continue
-		}
-		argv := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
-		if len(argv) < 2 {
-			continue
-		}
-		// First arg should look like a telfs binary; later args
-		// should contain "mount" and end with the mountpoint.
-		exe := filepath.Base(argv[0])
-		if exe != "telfs" {
-			continue
-		}
-		// Quick scan: need both "mount" subcommand and matching final mountpoint.
-		hasMount := false
-		for _, a := range argv[1:] {
-			if a == "mount" {
-				hasMount = true
-				break
-			}
-		}
-		if !hasMount {
-			continue
-		}
-		if argv[len(argv)-1] != mountpoint {
-			continue
-		}
-		var pid int
-		if _, err := fmt.Sscanf(name, "%d", &pid); err == nil {
-			return pid, true
-		}
-	}
-	return 0, false
-}
-
-// readEnvVar pulls a single environment variable's value from
-// /proc/<pid>/environ. Returns empty string if missing or unreadable
-// — typical when the daemon was started without setting the var.
-func readEnvVar(pid int, key string) string {
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-	if err != nil {
-		return ""
-	}
-	prefix := key + "="
-	for _, kv := range strings.Split(string(b), "\x00") {
-		if strings.HasPrefix(kv, prefix) {
-			return kv[len(prefix):]
-		}
-	}
-	return ""
-}
-
-// procStartTime reads /proc/<pid>/stat's start-time field (jiffies
-// since boot) and converts to a wall-clock time using boot time +
-// the system clock tick. Returns zero time on any parse failure;
-// the UI just shows "—" in that case.
-func procStartTime(pid int) time.Time {
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return time.Time{}
-	}
-	// /proc/<pid>/stat fields are space-separated; field 22 (1-based)
-	// is starttime in clock ticks since boot. The comm field (#2) is
-	// wrapped in parens and may contain spaces, so split AFTER the
-	// closing paren.
-	s := string(b)
-	cp := strings.LastIndexByte(s, ')')
-	if cp < 0 {
-		return time.Time{}
-	}
-	fields := strings.Fields(s[cp+1:])
-	// After the close-paren, field offsets shift: starttime is now
-	// at index 19 (was 22, minus pid + comm).
-	if len(fields) < 20 {
-		return time.Time{}
-	}
-	var startTicks int64
-	if _, err := fmt.Sscanf(fields[19], "%d", &startTicks); err != nil {
-		return time.Time{}
-	}
-	boot := bootTime()
-	if boot.IsZero() {
-		return time.Time{}
-	}
-	// USER_HZ is conventionally 100 on Linux; correct in practice
-	// for every kernel TelFS targets.
-	const userHz = 100
-	return boot.Add(time.Duration(startTicks) * time.Second / userHz)
-}
-
-// bootTime returns the system boot wall-clock by parsing /proc/stat's
-// "btime" line.
-func bootTime() time.Time {
-	b, err := os.ReadFile("/proc/stat")
-	if err != nil {
-		return time.Time{}
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if !strings.HasPrefix(line, "btime ") {
-			continue
-		}
-		var btime int64
-		if _, err := fmt.Sscanf(line, "btime %d", &btime); err == nil {
-			return time.Unix(btime, 0)
-		}
-	}
-	return time.Time{}
-}
-
-// resolveStdoutLog returns the file path that /proc/<pid>/fd/1
-// (stdout) points to, when it's a regular file. Daemons that ran
-// with stdout redirected to a log file (the supervisor pattern, or
-// `telfs mount ... > log` from a shell) get their log surfaced;
-// daemons attached to a tty or piping into another process get
-// empty (no useful log path).
-func resolveStdoutLog(pid int) string {
-	target, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/1", pid))
-	if err != nil {
-		return ""
-	}
-	if target == "" || target[0] != '/' {
-		return ""
-	}
-	// Skip if it's a tty or pipe (/dev/pts/*, pipe:[...]).
-	if strings.HasPrefix(target, "/dev/") || strings.HasPrefix(target, "pipe:") {
-		return ""
-	}
-	if st, err := os.Stat(target); err != nil || !st.Mode().IsRegular() {
-		return ""
-	}
-	return target
-}
-
-// scanProcMounts mirrors activeMounts() in handlers.go but lives here
-// so the supervisor is self-contained.
-func scanProcMounts() []string {
-	f, err := os.Open("/proc/mounts")
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var out []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 3 && fields[2] == "fuse.telfs" {
-			out = append(out, fields[1])
-		}
-	}
-	return out
-}
+// scanProcMounts is the supervisor's local name for the shared
+// /proc/mounts scan.
+func scanProcMounts() []string { return mountctl.ScanProcMounts() }
 
 // mountLogPath is the per-profile log file. Lives in $XDG_RUNTIME_DIR
 // when set (tmpfs, cleaned on session end), otherwise /tmp.

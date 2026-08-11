@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
+	"telfs/internal/config"
 	"telfs/internal/web"
 )
 
@@ -27,6 +29,27 @@ func cmdWeb(ctx context.Context, args []string) error {
 	}
 	if (*tlsCert == "") != (*tlsKey == "") {
 		return errors.New("--tls-cert and --tls-key must be set together")
+	}
+	// The web console manages MULTIPLE profiles, so its pages must
+	// follow ~/.config/telfs/active for "Use <profile>" to take
+	// effect. A TELFS_PROFILE inherited from the launching shell
+	// would pin every config.Load() in this process to one profile
+	// forever (env beats the active file) — which is exactly how the
+	// UI's profile switch used to silently do nothing. Use the env
+	// var only to seed the active file when none is set, then drop
+	// it for this process. (Mount children are unaffected: the
+	// supervisor sets the child's TELFS_PROFILE explicitly.)
+	if envProf := strings.TrimSpace(os.Getenv(config.EnvProfile)); envProf != "" {
+		os.Unsetenv(config.EnvProfile)
+		if active := config.ActiveProfile(); active == "" {
+			if err := config.SetActiveProfile(envProf); err != nil {
+				return fmt.Errorf("seed active profile from %s: %w", config.EnvProfile, err)
+			}
+			fmt.Fprintf(os.Stderr, "telfs web: seeded active profile %q from %s\n", envProf, config.EnvProfile)
+		} else {
+			fmt.Fprintf(os.Stderr, "telfs web: ignoring %s=%q — the web console follows `telfs profile use` (currently %q)\n",
+				config.EnvProfile, envProf, active)
+		}
 	}
 	srv, err := web.New(web.Options{
 		Listen:  *listen,

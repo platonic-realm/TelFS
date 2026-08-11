@@ -5,7 +5,10 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"time"
+
+	"telfs/internal/config"
 )
 
 // registerRoutes binds the P1 surface. Subsequent phases add login,
@@ -21,15 +24,19 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /partials/status", s.statusPartial)
 	s.mux.HandleFunc("GET /partials/health", s.healthPartial)
 
-	// First-run setup wizard.
+	// First-run setup wizard. Steps are inline forms posting to the
+	// dedicated handlers with from=setup; /setup/channels is the
+	// HTMX-lazy channel-picker for the channel step.
 	s.mux.HandleFunc("GET /setup", s.setupWizard)
 	s.mux.HandleFunc("POST /setup/skip", s.setupSkip)
+	s.mux.HandleFunc("GET /setup/channels", s.setupChannels)
 
 	// Profile CRUD.
 	s.mux.HandleFunc("GET /profiles", s.profilesList)
 	s.mux.HandleFunc("GET /profiles/new", s.profilesNewForm)
 	s.mux.HandleFunc("POST /profiles", s.profilesCreate)
 	s.mux.HandleFunc("GET /profiles/{name}", s.profilesShow)
+	s.mux.HandleFunc("POST /profiles/{name}/api", s.profilesSetAPI)
 	s.mux.HandleFunc("POST /profiles/{name}/use", s.profilesUse)
 	s.mux.HandleFunc("POST /profiles/{name}/delete", s.profilesDelete)
 	// POST + CSRF, not GET: the bundle contains session.json — a live
@@ -40,16 +47,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /profiles/import", s.profilesImportForm)
 	s.mux.HandleFunc("POST /profiles/import", s.profilesImport)
 
-	// Login.
+	// Login — phone auth is the only flow (bot-token auth removed:
+	// MTProto needs api_id/api_hash even for bots, so it saved
+	// nothing). /login stays routable for old links; it forwards.
 	s.mux.HandleFunc("GET /login", s.loginChoice)
 	s.mux.HandleFunc("GET /login/phone", s.loginPhoneForm)
+	s.mux.HandleFunc("POST /login/logout", s.loginLogout)
 	s.mux.HandleFunc("POST /login/phone/start", s.loginPhoneStart)
 	s.mux.HandleFunc("GET /login/phone/code", s.loginPhoneCodeForm)
 	s.mux.HandleFunc("POST /login/phone/code", s.loginPhoneCodeSubmit)
 	s.mux.HandleFunc("GET /login/phone/password", s.loginPhonePasswordForm)
 	s.mux.HandleFunc("POST /login/phone/password", s.loginPhonePasswordSubmit)
-	s.mux.HandleFunc("GET /login/bot", s.loginBotForm)
-	s.mux.HandleFunc("POST /login/bot", s.loginBotSubmit)
 
 	// Channel.
 	s.mux.HandleFunc("GET /channel", s.channelShow)
@@ -82,8 +90,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /mount/new", s.mountNewForm)
 	s.mux.HandleFunc("POST /mount/start", s.mountStart)
 	s.mux.HandleFunc("POST /mount/unmount-external", s.mountUnmountExternal)
+	// Stop takes the profile as a FORM FIELD, not a path segment:
+	// adopted daemons without TELFS_PROFILE get synthetic
+	// "adopted:<mountpoint>" keys whose slashes can't ride in a
+	// one-segment path wildcard — the old /mount/{profile}/stop
+	// route 404'd exactly the mounts that most need stopping.
+	s.mux.HandleFunc("POST /mount/stop", s.mountStop)
 	s.mux.HandleFunc("GET /mount/{profile}", s.mountDetail)
-	s.mux.HandleFunc("POST /mount/{profile}/stop", s.mountStop)
 	s.mux.HandleFunc("GET /mount/{profile}/log", s.mountLog)
 
 	// File browser.
@@ -164,6 +177,16 @@ func tmplFuncs() template.FuncMap {
 	return template.FuncMap{
 		"humanBytes": humanBytesTpl,
 		"add1":       func(i int) int { return i + 1 },
+		// pathEscape escapes a value for use as a single URL path
+		// segment. Needed for adopted-mount profile keys of the form
+		// "adopted:/path/to/mnt" — a raw slash would split the
+		// segment and 404 the route.
+		"pathEscape": url.PathEscape,
+		// activeProfile reads the active profile at render time so the
+		// masthead can show which profile every page operates on
+		// without threading a field through each page's data struct.
+		// Cheap: one file read per page render.
+		"activeProfile": config.ActiveProfile,
 		// pctOf / pctOf64: render a "filled %" for the queue visual
 		// bars. Clamped to [0, 100] so an over-target buffer (rare —
 		// the packer flushes on threshold) still produces a sane bar.

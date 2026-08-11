@@ -1,6 +1,10 @@
 {{define "content"}}
 <h2>Profile: {{.Name}} {{if eq .Name .Active}}<small>(active)</small>{{end}}</h2>
 
+{{if and (eq .Name .Active) (or (not .Identity) (not .Channel.Set))}}
+<p><a href="/setup" class="btn primary">Continue the guided setup →</a></p>
+{{end}}
+
 <section class="card">
   <h3>Location</h3>
   <p><code>{{.Dir}}</code></p>
@@ -11,11 +15,35 @@
   {{if .HasAPI}}
     <dl>
       <dt>API ID</dt><dd><code>{{.APIID}}</code></dd>
-      <dt>Auth mode</dt><dd>{{.AuthMode}}{{if .HasBot}} <small>(bot token set)</small>{{end}}</dd>
+      <dt>API hash</dt><dd><code>(set)</code></dd>
+      {{if .Identity}}<dt>Identity</dt><dd><code>{{.Identity}}</code></dd>{{end}}
     </dl>
+    <details>
+      <summary class="btn small">Update credentials</summary>
+      <form method="post" action="/profiles/{{.Name}}/api" autocomplete="off">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <label>API ID
+          <input type="text" name="api_id" required pattern="[0-9]+" inputmode="numeric" value="{{.APIID}}">
+        </label>
+        <label>API hash
+          <input type="text" name="api_hash" placeholder="(keep current)">
+        </label>
+        <button type="submit">Update credentials</button>
+      </form>
+    </details>
   {{else}}
-    <p><em>API credentials not set — edit <code>{{.Dir}}/config.toml</code> with values from <a href="https://my.telegram.org/apps">my.telegram.org</a>.</em></p>
+    <form method="post" action="/profiles/{{.Name}}/api" autocomplete="off">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <label>API ID
+        <input type="text" name="api_id" required pattern="[0-9]+" inputmode="numeric" placeholder="numeric id from my.telegram.org">
+      </label>
+      <label>API hash
+        <input type="text" name="api_hash" required placeholder="32-char hash from my.telegram.org">
+      </label>
+      <button type="submit">Save credentials</button>
+    </form>
   {{end}}
+  <p><small>Get the pair once at <a href="https://my.telegram.org/apps">my.telegram.org/apps</a> (log in with your phone number there). TelFS speaks the MTProto API directly, which requires this application identity. The pair identifies the application, not the account: the SAME pair can be reused across all your profiles. Stored in <code>{{.Dir}}/config.toml</code> at chmod 0600.</small></p>
 </section>
 
 <section class="card">

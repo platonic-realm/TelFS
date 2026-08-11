@@ -6,6 +6,25 @@
   <p>Tried <code>{{.Source}}</code>: {{.FetchError}}</p>
   <p>Make sure <code>telfs mount</code> is running with <code>--metrics-addr 127.0.0.1:9090</code>.</p>
 </div>
+{{if .Persisted}}
+<div class="panel">
+  <h3>Lifetime totals <small>from the profile DB — daemon offline{{if .PersistedAgeSec}}, last updated {{.PersistedAgeSec}}s ago{{end}}</small></h3>
+  <table class="kv">
+    <tr><td>RPCs sent (lifetime)</td><td><strong>{{.State.TotalOK}}</strong> ok / <strong>{{.State.TotalErr}}</strong> err</td></tr>
+    <tr><td>Wire bytes</td><td>tx <strong>{{humanBytes .State.TotalBytesTx}}</strong> · rx <strong>{{humanBytes .State.TotalBytesRx}}</strong> <small>(total payload = {{humanBytes .State.TotalBytes}})</small></td></tr>
+  </table>
+  {{if .State.PerMethod}}
+  <table>
+    <thead><tr><th>Method</th><th class="num">OK</th><th class="num">Err</th><th class="num">Flood</th><th class="num">Bytes</th></tr></thead>
+    <tbody>
+    {{range .State.PerMethod}}
+    <tr><td><code>{{.Method}}</code></td><td class="num">{{.OK}}</td><td class="num">{{.Err}}</td><td class="num">{{.FloodWait}}</td><td class="num">{{humanBytes .Bytes}}</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{end}}
+</div>
+{{end}}
 {{else}}
 
 <div class="panel">
@@ -13,7 +32,7 @@
     {{if .State.ChannelTitle}}
     <tr><td>Channel</td><td><code>{{.State.ChannelTitle}}</code> (id {{.State.ChannelID}})</td></tr>
     {{end}}
-    <tr><td>RPCs sent (since daemon start)</td><td><strong>{{.State.TotalOK}}</strong> ok / <strong>{{.State.TotalErr}}</strong> err</td></tr>
+    <tr><td>RPCs sent (lifetime — persisted across restarts)</td><td><strong>{{.State.TotalOK}}</strong> ok / <strong>{{.State.TotalErr}}</strong> err</td></tr>
     <tr><td>Wire bytes</td><td>tx <strong>{{humanBytes .State.TotalBytesTx}}</strong> · rx <strong>{{humanBytes .State.TotalBytesRx}}</strong> <small>(total payload = {{humanBytes .State.TotalBytes}})</small></td></tr>
     <tr><td>In-flight</td><td><strong>{{.State.InFlight}}</strong></td></tr>
     {{if .State.LastSuccessUnix}}

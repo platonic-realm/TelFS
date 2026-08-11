@@ -39,6 +39,7 @@
   <h3>Profile</h3>
   <dl>
     <dt>Active</dt><dd><strong>{{.Profile}}</strong></dd>
+    {{if .Identity}}<dt>Identity</dt><dd><code>{{.Identity}}</code></dd>{{end}}
     <dt>Data dir</dt><dd><code>{{.DataDir}}</code></dd>
   </dl>
 </section>

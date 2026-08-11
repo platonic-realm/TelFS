@@ -12,8 +12,26 @@ import (
 	"log"
 	"time"
 
+	"github.com/gotd/td/tgerr"
+
 	"telfs/internal/meta"
 	"telfs/internal/tg"
+)
+
+// channelLost reports whether err means the bound channel is
+// unreachable for this session's identity (kicked from the channel,
+// identity-scoped access_hash gone stale).
+// NOT transient: retrying on the normal cadence can't succeed until
+// the operator fixes the binding or identity, so callers back off and
+// say so once instead of spamming the log every tick.
+func channelLost(err error) bool {
+	return tgerr.Is(err, "CHANNEL_INVALID") || tgerr.Is(err, "CHANNEL_PRIVATE")
+}
+
+// Channel-lost backoff bounds for the poster loop.
+const (
+	channelLostBackoffMin = 1 * time.Minute
+	channelLostBackoffMax = 5 * time.Minute
 )
 
 // DefaultPosterInterval is how often the poster drains the local
@@ -59,6 +77,13 @@ func (p *Poster) Run(ctx context.Context) error {
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	// Channel-lost backoff state: when the channel is unreachable for
+	// this identity (CHANNEL_INVALID / CHANNEL_PRIVATE), retrying every
+	// interval is pure log spam — nothing succeeds until the operator
+	// fixes the binding. Log once per backoff window and double it up
+	// to the cap. Any success (or non-lost error) resets.
+	var lostUntil time.Time
+	var lostBackoff time.Duration
 	for {
 		select {
 		case <-ctx.Done():
@@ -73,7 +98,23 @@ func (p *Poster) Run(ctx context.Context) error {
 			cancel()
 			return nil
 		case <-t.C:
-			if err := p.drainOnce(ctx); err != nil {
+			if time.Now().Before(lostUntil) {
+				continue
+			}
+			err := p.drainOnce(ctx)
+			switch {
+			case err == nil:
+				lostBackoff = 0
+			case channelLost(err):
+				if lostBackoff == 0 {
+					lostBackoff = channelLostBackoffMin
+				} else if lostBackoff *= 2; lostBackoff > channelLostBackoffMax {
+					lostBackoff = channelLostBackoffMax
+				}
+				lostUntil = time.Now().Add(lostBackoff)
+				logger.Printf("[journal-poster] channel unreachable for this identity (%v) — pausing %s. Fix the channel binding or identity (`telfs status`, `telfs channel set`), journal entries stay queued locally.", err, lostBackoff)
+			default:
+				lostBackoff = 0
 				logger.Printf("[journal-poster] drain: %v", err)
 			}
 		}

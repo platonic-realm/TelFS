@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"telfs/internal/config"
@@ -28,6 +29,7 @@ type dashboardData struct {
 	Flash     flashData
 	Path      string // layout uses this to highlight the active nav tab
 	Profile   string
+	Identity  string // "@name (user|bot)" — who session.json authenticates as
 	DataDir   string
 	Channel   channelView
 	HasMeta   bool
@@ -55,6 +57,9 @@ type setupChecklist struct {
 }
 
 type setupStep struct {
+	// Key identifies the step for the wizard's inline-form dispatch:
+	// profile | api | auth | channel | encrypt | compress | mount.
+	Key   string
 	Label string
 	Done  bool
 	Href  string
@@ -66,7 +71,18 @@ type setupStep struct {
 	Detail   string
 	Outcome  string
 	Optional bool
-	CTA      string // call-to-action label on the wizard page; default "Open this step"
+	CTA      string // label on the wizard's secondary "full page" link
+}
+
+// setupReturn resolves a mutating handler's redirect target: forms
+// posted from the setup wizard carry from=setup and return there, so
+// the whole onboarding stays on one page; everything else keeps the
+// handler's default target.
+func setupReturn(r *http.Request, def string) string {
+	if r.FormValue("from") == "setup" {
+		return "/setup"
+	}
+	return def
 }
 
 type channelView struct {
@@ -119,24 +135,36 @@ type setupWizardData struct {
 	// (currently used only for the optional encryption step). Tracked
 	// in a cookie so a refresh doesn't lose state.
 	Skipped map[int]bool
+
+	// Form state for the CURRENT step's inline form — the wizard IS
+	// the form, not a launcher for other pages.
+	Active     string // active profile name ("" before the profile step)
+	APIID      int    // pre-fill for the api step
+	AuthStage  string // "" (phone form) | "code" | "password" — in-flight login
+	CryptoOn   bool   // mount step: show the passphrase field
+	Codec      string // compress step: current codec pre-selection
+	Mountpoint string // mount step: suggested default
 }
 
 const setupSkipCookie = "telfs_setup_skip"
 
-// setupWizard is the guided first-run flow. It computes the same
-// setupChecklist the dashboard uses, but renders only the first
-// not-done step in detail — with prerequisites, expected outcome, and
-// a clear "Open this step" CTA pointing at the existing form route.
-//
-// Why a separate page rather than a multi-step form-of-forms: every
-// step's existing handler (login, channel/set, encrypt/init,
-// mount/start) already has its own form, redirect logic, and flash
-// machinery. Folding them into one page would require rewiring all of
-// them to honor a return URL and would duplicate template work.
-// Instead, the wizard is a clear narrative landing page that points
-// at each step's existing page in turn; on return, the wizard
-// advances. This is a thin shell — the work that matters happens in
-// the dedicated handlers.
+// setupSkipCookieName scopes the skip state to the active profile —
+// skipping the optional encryption step on one profile must not mark
+// it skipped on every other profile the operator switches to.
+// Profile names are [A-Za-z0-9_-], all valid cookie-name chars.
+func setupSkipCookieName() string {
+	if p := config.ActiveProfile(); p != "" {
+		return setupSkipCookie + "_" + p
+	}
+	return setupSkipCookie
+}
+
+// setupWizard is the guided first-run flow: one page that carries the
+// whole onboarding, each step rendered as an INLINE form posting to
+// the step's existing handler with from=setup (see setupReturn) so no
+// logic is duplicated and the flow never leaves /setup. The dedicated
+// pages remain for power users; each step links to its full page as a
+// secondary action.
 func (s *Server) setupWizard(w http.ResponseWriter, r *http.Request) {
 	d := s.loadDashboard(r.Context(), w, r)
 	skipped := readSkipCookie(r)
@@ -157,8 +185,38 @@ func (s *Server) setupWizard(w http.ResponseWriter, r *http.Request) {
 		CurrentIdx: currentIdx,
 		Complete:   currentIdx == -1,
 		Skipped:    skipped,
+		Active:     d.Active,
+		Mountpoint: defaultMountpoint(),
+	}
+	if cfg, err := config.Load(); err == nil {
+		pageData.APIID = cfg.APIID
+	}
+	// In-flight phone login? Render the code/password form instead of
+	// the phone form so a reload lands back mid-flow, not at the start.
+	if sess, ok := s.activeLoginSession(r); ok {
+		pageData.AuthStage = sess.Stage()
+	}
+	pageData.CryptoOn = d.Crypto.Enabled
+	pageData.Codec = "none"
+	if cfg, err := config.Load(); err == nil && fileExists(cfg.DBPath()) {
+		if mstore, err := meta.Open(cfg.DBPath()); err == nil {
+			if codec, err := mstore.CompressionCodec(r.Context()); err == nil {
+				pageData.Codec = codec
+			}
+			mstore.Close()
+		}
 	}
 	s.renderTemplate(w, "setup.html", pageData)
+}
+
+// defaultMountpoint suggests ~/telfs as the mount target — purely a
+// pre-fill; the form accepts any absolute path to an existing dir.
+func defaultMountpoint() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "telfs")
 }
 
 // setupSkip toggles a step into the skipped set (currently only the
@@ -188,7 +246,7 @@ func (s *Server) setupSkip(w http.ResponseWriter, r *http.Request) {
 
 func readSkipCookie(r *http.Request) map[int]bool {
 	out := map[int]bool{}
-	c, err := r.Cookie(setupSkipCookie)
+	c, err := r.Cookie(setupSkipCookieName())
 	if err != nil || c.Value == "" {
 		return out
 	}
@@ -210,7 +268,7 @@ func writeSkipCookie(w http.ResponseWriter, m map[int]bool) {
 	}
 	sort.Strings(parts)
 	http.SetCookie(w, &http.Cookie{
-		Name:     setupSkipCookie,
+		Name:     setupSkipCookieName(),
 		Value:    strings.Join(parts, ","),
 		Path:     "/",
 		HttpOnly: true,
@@ -239,6 +297,7 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 	cfg, err := config.Load()
 	if err == nil {
 		d.Profile = nameForDashboard(d.Active)
+		d.Identity = cfg.Identity.Label()
 		d.DataDir = cfg.DataDir
 		if cfg.Channel.ID != 0 {
 			d.Channel = channelView{Set: true, ID: cfg.Channel.ID, Title: cfg.Channel.Title}
@@ -302,7 +361,13 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 func buildSetupChecklist(d dashboardData) setupChecklist {
 	cfg, _ := config.Load()
 	apiOK := cfg != nil && cfg.APIID != 0 && cfg.APIHash != ""
-	sessionOK := cfg != nil && fileExists(cfg.SessionPath())
+	// Authenticated means the LOGIN COMPLETED — [identity] is written
+	// only after a successful auth. session.json alone is NOT enough:
+	// gotd creates it during the MTProto handshake, i.e. the moment
+	// the login code is SENT, which made this step flip to done while
+	// the user was still waiting to type their code (the wizard then
+	// skipped the code form entirely).
+	sessionOK := cfg != nil && fileExists(cfg.SessionPath()) && cfg.Identity != nil
 	channelOK := d.Channel.Set
 	// Encryption is OPTIONAL — mark as "done" if the FS is either
 	// explicitly encrypted OR has chunks already (so opting in later
@@ -319,35 +384,55 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 	// and another profile's mount would falsely mark this one done.)
 	mountedOK := hasChunksFor(cfg)
 
+	apiHref := "/profiles"
+	if d.Active != "" {
+		// Deep-link the active profile's page — it has the actual
+		// api_id/api_hash form, not just the list.
+		apiHref = "/profiles/" + d.Active
+	}
 	steps := []setupStep{
 		{
+			Key:     "profile",
+			Label:   "Create a profile",
+			Done:    d.Active != "",
+			Href:    "/profiles",
+			Why:     "A profile holds one Telegram identity plus its channel binding and local state.",
+			Detail:  "Everything TelFS knows lives under a named profile in ~/.config/telfs/profiles/<name>/ — credentials, session, metadata DB, chunk cache. Create one and it becomes the active profile every page operates on.",
+			Outcome: "The masthead shows the new profile name as active.",
+			CTA:     "Open profiles",
+		},
+		{
+			Key:     "api",
 			Label:   "Telegram API ID + hash",
 			Done:    apiOK,
-			Href:    "/profiles",
-			Why:     "Get them at https://my.telegram.org/apps and put them in the active profile's config.toml.",
-			Detail:  "TelFS uses the MTProto user/bot API directly (never the HTTP Bot API). That requires a personal API ID + hash, free to obtain at my.telegram.org/apps after logging in with your phone number. The credentials are written to your profile's config.toml at chmod 0600.",
+			Href:    apiHref,
+			Why:     "Get them once at https://my.telegram.org/apps — one pair works for every profile.",
+			Detail:  "TelFS uses the MTProto API directly. That requires a personal API ID + hash, free to obtain at my.telegram.org/apps after logging in with your phone number. The pair identifies the application, not the account, and is written to your profile's config.toml at chmod 0600.",
 			Outcome: "config.toml in the active profile has non-zero api_id and a non-empty api_hash.",
 			CTA:     "Open profile settings",
 		},
 		{
-			Label:   "Authenticate (phone or bot token)",
+			Key:     "auth",
+			Label:   "Authenticate (phone)",
 			Done:    sessionOK,
-			Href:    "/login",
-			Why:     "Pick phone for a personal account or bot-token for an automation account.",
-			Detail:  "Phone auth runs the full Telegram code-then-2FA dance in three pages. Bot auth is a single token field (must be issued by @BotFather; the bot needs admin in the target channel before it can post).",
+			Href:    "/login/phone",
+			Why:     "Phone → code → 2FA password (if set). The first login locks the profile to your account.",
+			Detail:  "Telegram sends a 5-digit code via SMS or the app's notifications; accounts with two-step verification also enter their password. The resulting session locks the profile to your account.",
 			Outcome: "session.json appears in the profile directory; subsequent mounts won't prompt for a code.",
-			CTA:     "Start authentication",
+			CTA:     "Open login page",
 		},
 		{
+			Key:     "channel",
 			Label:   "Bind a private channel",
 			Done:    channelOK,
 			Href:    "/channel",
 			Why:     "Pick the channel TelFS will store chunks in. Creating a private channel first in the Telegram app is the smoothest path.",
-			Detail:  "User-authenticated profiles can enumerate your channels (list view). Bot-authenticated profiles must paste the channel id and access_hash explicitly — bots can't list dialogs.",
+			Detail:  "The list below enumerates your channels from your dialogs; picking one resolves its access_hash automatically. Chunks and snapshots for this filesystem will live as messages in that channel.",
 			Outcome: "config.toml's [channel] block has id + access_hash set; the dashboard's Channel card lights up.",
-			CTA:     "Choose a channel",
+			CTA:     "Open channel page",
 		},
 		{
+			Key:      "encrypt",
 			Label:    "Encrypt the FS",
 			Done:     encryptionOK,
 			Href:     "/encrypt",
@@ -358,6 +443,7 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 			CTA:      "Set a passphrase",
 		},
 		{
+			Key:      "compress",
 			Label:    "Pick a compression codec",
 			Done:     compressionOK,
 			Href:     "/compression",
@@ -368,6 +454,7 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 			CTA:      "Choose a codec",
 		},
 		{
+			Key:     "mount",
 			Label:   "Mount it",
 			Done:    mountedOK,
 			Href:    "/mount/new",
@@ -582,26 +669,39 @@ func (s *Server) profilesCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
+	errBack := setupReturn(r, "/profiles/new")
 	name := strings.TrimSpace(r.FormValue("name"))
 	if err := config.ValidateProfileName(name); err != nil {
 		SetFlash(w, "error", "create: "+err.Error())
-		http.Redirect(w, r, "/profiles/new", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	dir, err := config.ProfileDir(name)
 	if err != nil {
 		SetFlash(w, "error", "create: "+err.Error())
-		http.Redirect(w, r, "/profiles/new", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	if _, err := os.Stat(dir); err == nil {
 		SetFlash(w, "error", fmt.Sprintf("profile %q already exists", name))
-		http.Redirect(w, r, "/profiles/new", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		SetFlash(w, "error", "create: "+err.Error())
-		http.Redirect(w, r, "/profiles/new", http.StatusSeeOther)
+		http.Redirect(w, r, errBack, http.StatusSeeOther)
+		return
+	}
+	// Wizard-created profiles become active immediately — the wizard's
+	// remaining steps all operate on the active profile.
+	if r.FormValue("from") == "setup" {
+		if err := config.SetActiveProfile(name); err != nil {
+			SetFlash(w, "error", "activate: "+err.Error())
+			http.Redirect(w, r, "/setup", http.StatusSeeOther)
+			return
+		}
+		SetFlash(w, "ok", fmt.Sprintf("created profile %q — it is now active", name))
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
 	}
 	SetFlash(w, "ok", fmt.Sprintf("created profile %q", name))
@@ -609,20 +709,20 @@ func (s *Server) profilesCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 type profileShowData struct {
-	CSRF      string
-	Flash     flashData
-	Path      string
-	Name      string
-	Active    string
-	Dir       string
-	APIID     int
-	HasAPI    bool
-	Channel   channelView
-	AuthMode  string
-	HasBot    bool
-	HasMeta   bool
-	Crypto    cryptoView
-	ChunkSize int64
+	CSRF       string
+	Flash      flashData
+	Path       string
+	Name       string
+	Active     string
+	Dir        string
+	APIID      int
+	HasAPI     bool
+	Channel    channelView
+	Identity   string
+	HasAPIHash bool
+	HasMeta    bool
+	Crypto     cryptoView
+	ChunkSize  int64
 }
 
 func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
@@ -645,11 +745,11 @@ func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
 	if cfg, ok := readProfileConfig(dir); ok {
 		d.APIID = cfg.APIID
 		d.HasAPI = cfg.APIID != 0 && cfg.APIHash != ""
+		d.HasAPIHash = cfg.APIHash != ""
 		if cfg.Channel.ID != 0 {
 			d.Channel = channelView{Set: true, ID: cfg.Channel.ID, Title: cfg.Channel.Title}
 		}
-		d.AuthMode = string(cfg.EffectiveAuthMode())
-		d.HasBot = cfg.BotToken != ""
+		d.Identity = cfg.Identity.Label()
 		// Stat-before-open so just viewing this profile doesn't
 		// auto-bootstrap a db.sqlite (meta.Open creates one when
 		// missing). Only inspect the meta when it already exists.
@@ -680,6 +780,62 @@ func readProfileConfig(dir string) (*config.Config, bool) {
 		return nil, false
 	}
 	return cfg, true
+}
+
+// profilesSetAPI saves api_id + api_hash into the named profile's
+// config.toml — the web-side equivalent of hand-editing it. App-level
+// identity from my.telegram.org, required by MTProto.
+func (s *Server) profilesSetAPI(w http.ResponseWriter, r *http.Request) {
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	name := r.PathValue("name")
+	if err := config.ValidateProfileName(name); err != nil {
+		http.Error(w, "bad profile name", http.StatusBadRequest)
+		return
+	}
+	dir, err := config.ProfileDir(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		http.Error(w, "no such profile", http.StatusNotFound)
+		return
+	}
+	back := setupReturn(r, "/profiles/"+name)
+	cfg, err := config.LoadFromDir(dir)
+	if err != nil {
+		SetFlash(w, "error", "load config: "+err.Error())
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	id, err := strconv.Atoi(strings.TrimSpace(r.FormValue("api_id")))
+	if err != nil || id <= 0 {
+		SetFlash(w, "error", "api_id must be a positive integer (from https://my.telegram.org/apps)")
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	// Blank hash keeps the stored one — the form doesn't echo secrets
+	// back, so "update only the id" must not wipe the hash.
+	hash := strings.TrimSpace(r.FormValue("api_hash"))
+	if hash == "" && cfg.APIHash == "" {
+		SetFlash(w, "error", "api_hash is required (from https://my.telegram.org/apps)")
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	cfg.APIID = id
+	if hash != "" {
+		cfg.APIHash = hash
+	}
+	if err := cfg.Save(); err != nil {
+		SetFlash(w, "error", "save: "+err.Error())
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	SetFlash(w, "ok", "API credentials saved")
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
 func (s *Server) profilesUse(w http.ResponseWriter, r *http.Request) {
@@ -723,8 +879,18 @@ func (s *Server) profilesDelete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Capture BEFORE RemoveAll: once the dir is gone, the active-file
+	// reader treats the dangling name as unset.
+	wasActive := config.ActiveProfile() == name
 	if err := os.RemoveAll(dir); err != nil {
 		SetFlash(w, "error", "delete: "+err.Error())
+	} else if wasActive {
+		// Don't leave the active selection pointing at the void.
+		if err := config.ClearActiveProfile(); err != nil {
+			SetFlash(w, "error", fmt.Sprintf("deleted profile %q but could not clear the active selection: %v", name, err))
+		} else {
+			SetFlash(w, "ok", fmt.Sprintf("deleted profile %q — it was the active profile, so none is selected now", name))
+		}
 	} else {
 		SetFlash(w, "ok", fmt.Sprintf("deleted profile %q", name))
 	}

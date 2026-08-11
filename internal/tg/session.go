@@ -129,6 +129,62 @@ func (s *Session) channelPeer() (*tg.InputPeerChannel, *tg.InputChannel, error) 
 		}, nil
 }
 
+// VerifyAccess confirms with two cheap RPCs that (1) the session
+// holds a supported (user, non-bot) identity, and (2) that identity
+// can actually access the bound channel. Called by mount preflight so
+// a broken profile fails in seconds with a message naming the actor
+// and the fix — instead of coming up "fine" and burying an endless
+// CHANNEL_INVALID retry storm in the daemon log (channel access
+// hashes are identity-scoped: a hash resolved by one account is
+// garbage under another).
+func (s *Session) VerifyAccess(ctx context.Context) error {
+	api, err := s.currentAPI()
+	if err != nil {
+		return err
+	}
+	users, err := api.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
+	if err != nil {
+		return fmt.Errorf("verify identity: %w", err)
+	}
+	var self *tg.User
+	for _, u := range users {
+		if full, ok := u.(*tg.User); ok {
+			self = full
+			break
+		}
+	}
+	if self == nil {
+		return errors.New("verify identity: users.getUsers returned no usable self user")
+	}
+	who := "@" + self.Username
+	if self.Username == "" {
+		who = fmt.Sprintf("id=%d", self.ID)
+	}
+	// A leftover bot session from the removed bot-auth feature must be
+	// rejected, not silently used as the wrong actor (its channel
+	// access would be broken anyway — access hashes are identity-
+	// scoped).
+	if self.Bot {
+		return fmt.Errorf("session identity is BOT %s — bot auth is no longer supported; run `telfs profile reset-auth` and log in with your phone", who)
+	}
+	// Legacy profiles predate identity tracking — record it once so
+	// status/web can display who this profile acts as.
+	if s.cfg.Identity == nil {
+		s.cfg.Identity = &config.Identity{UserID: self.ID, Username: self.Username, IsBot: self.Bot}
+		_ = s.cfg.Save()
+	}
+	_, input, err := s.channelPeer()
+	if err != nil {
+		return err
+	}
+	if _, err := api.ChannelsGetChannels(ctx, []tg.InputChannelClass{input}); err != nil {
+		return fmt.Errorf("the authenticated account %s cannot access the bound channel (id=%d, %q): %w\n"+
+			"the account may have left the channel, or the stored access_hash is stale — re-run `telfs channel list` then `telfs channel set %d`",
+			who, s.cfg.Channel.ID, s.cfg.Channel.Title, err, s.cfg.Channel.ID)
+	}
+	return nil
+}
+
 // ListChannels enumerates the user's channels from their dialogs. Includes
 // both channels they own and channels they're a member of.
 func (s *Session) ListChannels(ctx context.Context) ([]ChannelInfo, error) {
@@ -196,14 +252,13 @@ func (s *Session) ResolveChannel(ctx context.Context, id int64) (ChannelInfo, er
 // SetChannel resolves the channel id, validates it can be posted to, and
 // persists it to the config. Mutates s.cfg in-place.
 //
-// For user accounts (dialogs accessible) the normal path is to look the
-// channel up by id and harvest its access_hash from the dialog list.
-// For bot accounts, dialogs return nothing — pass the access_hash
-// explicitly (non-zero) and we'll trust it, skipping the scan.
+// The normal path looks the channel up by id and harvests its
+// access_hash from the dialog list. A non-zero accessHash skips the
+// scan and trusts the caller (`channel set --access-hash` — a manual
+// override for channels the dialog scan can't see).
 func (s *Session) SetChannel(ctx context.Context, id int64, accessHash int64) (ChannelInfo, error) {
 	if accessHash != 0 {
-		// Trust-the-caller path. Used by `channel set --access-hash` and
-		// is the only way bots can bind a channel.
+		// Trust-the-caller path (`channel set --access-hash`).
 		nid, err := NormalizeChannelID(id)
 		if err != nil {
 			return ChannelInfo{}, err

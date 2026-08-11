@@ -2,6 +2,7 @@ package tg
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sync"
@@ -12,6 +13,27 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
+
+// KVLifetimeStats is the meta_kv key holding the tracker's persisted
+// lifetime totals (TrackerState JSON). Lives in the profile's
+// db.sqlite, so the numbers survive daemon restarts — and, riding the
+// snapshot blob, even a channel recovery.
+const KVLifetimeStats = "tg_lifetime_stats"
+
+// TrackerState is the persistable slice of a Tracker: lifetime
+// aggregate counters, no ring/no in-flight state. The daemon seeds a
+// fresh Tracker from it at startup and writes it back periodically,
+// so /telegram's totals are continuous instead of resetting to zero
+// on every restart.
+type TrackerState struct {
+	TotalOK     int64                  `json:"total_ok"`
+	TotalErr    int64                  `json:"total_err"`
+	TotalBytes  int64                  `json:"total_bytes"`
+	TotalTx     int64                  `json:"total_bytes_tx"`
+	TotalRx     int64                  `json:"total_bytes_rx"`
+	PerMethod   map[string]MethodCount `json:"per_method"`
+	UpdatedUnix int64                  `json:"updated_unix"`
+}
 
 // Request records one MTProto RPC the daemon has issued. The Tracker
 // keeps the most recent N of these in a ring buffer so the web UI
@@ -259,6 +281,61 @@ func (t *Tracker) Snapshot() Snapshot {
 		TotalBytesRx:   t.totalRx,
 		PerMethod:      perMethod,
 	}
+}
+
+// MarshalState serializes the tracker's lifetime totals for
+// persistence. Because SeedState ADDS the stored baseline into the
+// live counters, marshaling the live counters later yields the full
+// lifetime sum — a plain overwrite of the stored value is always
+// correct.
+func (t *Tracker) MarshalState() ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := TrackerState{
+		TotalOK:     t.totalOK,
+		TotalErr:    t.totalErr,
+		TotalBytes:  t.totalBytes,
+		TotalTx:     t.totalTx,
+		TotalRx:     t.totalRx,
+		PerMethod:   make(map[string]MethodCount, len(t.byMethod)),
+		UpdatedUnix: time.Now().Unix(),
+	}
+	for name, mc := range t.byMethod {
+		st.PerMethod[name] = *mc
+	}
+	return json.Marshal(st)
+}
+
+// SeedState merges previously-persisted lifetime totals into the
+// tracker's counters. Call once at daemon startup, before traffic.
+// Watchdog and adaptive-ratelimit logic compare DELTAS of these
+// counters, so a shifted baseline doesn't affect them.
+func (t *Tracker) SeedState(data []byte) error {
+	var st TrackerState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.totalOK += st.TotalOK
+	t.totalErr += st.TotalErr
+	t.totalBytes += st.TotalBytes
+	t.totalTx += st.TotalTx
+	t.totalRx += st.TotalRx
+	for name, mc := range st.PerMethod {
+		cur := t.byMethod[name]
+		if cur == nil {
+			c := mc
+			c.Method = name
+			t.byMethod[name] = &c
+			continue
+		}
+		cur.OK += mc.OK
+		cur.Err += mc.Err
+		cur.FloodWait += mc.FloodWait
+		cur.Bytes += mc.Bytes
+	}
+	return nil
 }
 
 // TrackingMiddleware wraps gotd's invoker chain to feed the Tracker

@@ -1,8 +1,6 @@
 {{define "content"}}
 <h2>Your channels</h2>
-{{if .IsBot}}
-<p><em>Bot mode: dialog enumeration is not available. Use the <a href="/channel/set">manual set</a> form instead.</em></p>
-{{else if .Error}}
+{{if .Error}}
 <div class="flash error">{{.Error}}</div>
 {{else if not .Channels}}
 <p><em>No channels found. Create a private channel in Telegram first, then re-load.</em></p>
