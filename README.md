@@ -118,7 +118,39 @@ Both paths produce the same static binary; `fusermount` (`fuse3` or
 `fuse2`) must be in `$PATH` for unmount. Get a Telegram API ID + hash
 at <https://my.telegram.org/apps>.
 
-## Quick start
+## Quick start (web — recommended)
+
+One command; everything else happens in the browser:
+
+```sh
+telfs web
+```
+
+Open <http://127.0.0.1:8080> — you land on the `/setup` wizard, and
+every step is an inline form on that one page:
+
+1. **Create a profile** — it becomes active immediately.
+2. **API ID + hash** — paste the pair from
+   [my.telegram.org/apps](https://my.telegram.org/apps) (see
+   [Telegram API credentials](#telegram-api-credentials-api-id--hash)).
+3. **Phone login** — number → the code Telegram sends → 2FA if set.
+4. **Pick a channel** — your channels are listed; one click binds.
+   (Create a private channel in the Telegram app first.)
+5. **Encryption / compression** — optional, skippable; one-way once
+   data lands.
+6. **Mount** — type a mountpoint (existing empty dir) and hit Mount.
+   You land on the mount's page with a live log.
+
+That's it — the daemon runs detached (it survives closing `telfs
+web`), your files are at the mountpoint, and the Files tab browses
+them from the browser. Day-to-day driving — start/stop mounts, log
+tails, Telegram traffic stats, rate limits — all lives in the same
+UI. To make the console permanent, run `telfs web` as a user systemd
+service (see [Running unattended](#running-unattended)).
+
+## Quick start (CLI)
+
+The same flow, scriptable:
 
 ```sh
 # Optional: pick a non-default chunk size BEFORE first mount.
@@ -140,10 +172,6 @@ mkdir mnt && telfs mount ./mnt               # foreground; ^C to unmount
 # background daemons: `telfs unmount <mountpoint|profile>` stops any
 # telfs mount gracefully, however it was started
 ```
-
-Prefer a browser? `telfs web` serves <http://127.0.0.1:8080> — the
-`/setup` wizard walks every step above with inline forms, and the
-Mounts page starts/stops daemons with a live log tail.
 
 Then in another shell — write, hardlink, symlink, xattr all work:
 
