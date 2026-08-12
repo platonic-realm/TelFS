@@ -506,6 +506,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	prefetchWindow := fs.Int("prefetch-window", 0, "how many chunks past the current read cursor to speculatively warm (0 = default 8). Bigger = more parallel reads in flight for sequential streams; smaller = less wasted bandwidth on random reads.")
 	prefetchConcurrency := fs.Int("prefetch-concurrency", 0, "max prefetchOne goroutines (0 = default 4). Each one can issue 4 concurrent upload.getFile RPCs through the parallel ranged fetcher.")
 	memCacheCap := fs.String("mem-cache-cap", "", "in-RAM hot-tier cache size (e.g. 128MiB, 1GiB, 0 to disable). Empty falls through to 128 MiB. Reads hit the mem tier first, skipping os.ReadFile on hot chunks.")
+	blobPrefetch := fs.String("blob-prefetch", "", "packed-blob locality prefetch span (e.g. 4MiB): a cold read of one packed small file warms its blob neighbors in one ranged download. Empty = default 4 MiB; 0 disables.")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] [--cache-cap SIZE] <mountpoint>")
 		fs.PrintDefaults()
@@ -814,6 +815,25 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// reset the other to the default.
 		if *prefetchWindow > 0 || *prefetchConcurrency > 0 {
 			reader.SetPrefetch(*prefetchWindow, *prefetchConcurrency)
+		}
+		// Packed-blob locality prefetch: a cold read of one packed
+		// extent triggers ONE ranged download warming the neighboring
+		// extents of the same blob (files packed together are read
+		// together — tar order ≈ walk order). Turns per-file serial
+		// round trips on cold directory walks (make menuconfig over
+		// ~1,500 Kconfig files) into a handful of span fetches.
+		var blobPF *chunk.BlobPrefetcher
+		blobBudget := chunk.DefaultBlobPrefetchBudget
+		if *blobPrefetch != "" {
+			n, perr := config.ParseHumanBytes(*blobPrefetch)
+			if perr != nil {
+				return fmt.Errorf("--blob-prefetch: %w", perr)
+			}
+			blobBudget = n // 0 disables below
+		}
+		if blobBudget > 0 {
+			blobPF = chunk.NewBlobPrefetcher(metaStore, cache, fetcher, cipher, codec, blobBudget)
+			reader.SetBlobPrefetcher(blobPF)
 		}
 		// Small-file packer: aggregates chunks smaller than
 		// chunk.DefaultPackThreshold into shared TG blobs to amortize
@@ -1179,6 +1199,12 @@ func cmdMount(signalCtx context.Context, args []string) error {
 				}
 			}
 			server.Wait()
+			// Stop the blob prefetcher before draining: its span
+			// downloads share the gotd session and there's no point
+			// warming a cache nobody will read from this process.
+			if blobPF != nil {
+				blobPF.Close()
+			}
 			drainCtx, cancelDrain := context.WithTimeout(context.Background(), 12*time.Second)
 			backend.Shutdown(drainCtx)
 			cancelDrain()

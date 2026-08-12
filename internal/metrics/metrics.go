@@ -139,4 +139,7 @@ var (
 	UploadErrors      = Default.AddCounter("telfs_upload_errors_total", "Chunk uploads that returned a non-FLOOD_WAIT error.")
 	BytesUploaded     = Default.AddCounter("telfs_bytes_uploaded_total", "Bytes (post-compression, post-encryption) sent to the channel.")
 	BytesDownloaded   = Default.AddCounter("telfs_bytes_downloaded_total", "Bytes (post-compression, post-encryption) fetched from the channel.")
+
+	BlobPrefetchSpans   = Default.AddCounter("telfs_blob_prefetch_spans_total", "Packed-blob locality spans fetched (one ranged download warming many neighbor extents).")
+	BlobPrefetchExtents = Default.AddCounter("telfs_blob_prefetch_extents_total", "Neighbor extents decoded and cached by blob-locality prefetch.")
 )

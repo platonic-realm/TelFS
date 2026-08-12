@@ -65,6 +65,40 @@ func (s *Store) GetChunk(ctx context.Context, ino int64, idx int32) (Chunk, erro
 	return c, nil
 }
 
+// PackedExtentsFrom returns packed chunk_map rows that share
+// tgMessageID and start at pack_offset >= fromOffset, ordered by
+// pack_offset, at most limit rows. Powers the blob-locality
+// prefetcher: files packed into one blob were written together (tar /
+// directory order), so the extents after a just-missed one are the
+// files most likely to be read next.
+func (s *Store) PackedExtentsFrom(ctx context.Context, tgMessageID int64, fromOffset int64, limit int) ([]Chunk, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size
+		   FROM chunk_map
+		  WHERE tg_message_id = ? AND pack_size IS NOT NULL AND pack_offset >= ?
+		  ORDER BY pack_offset
+		  LIMIT ?`,
+		tgMessageID, fromOffset, limit)
+	if err != nil {
+		return nil, fmt.Errorf("packed extents msg %d: %w", tgMessageID, err)
+	}
+	defer rows.Close()
+	var out []Chunk
+	for rows.Next() {
+		var c Chunk
+		var packOff, packSize sql.NullInt64
+		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize); err != nil {
+			return nil, fmt.Errorf("packed extents msg %d: scan: %w", tgMessageID, err)
+		}
+		if packSize.Valid {
+			c.PackOffset = packOff.Int64
+			c.PackSize = int32(packSize.Int64)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // ListChunks returns all chunks for an inode in ascending idx order.
 func (s *Store) ListChunks(ctx context.Context, ino int64) ([]Chunk, error) {
 	rows, err := s.db.QueryContext(ctx,

@@ -435,6 +435,35 @@ func isTransientConnErr(err error) bool {
 	return false
 }
 
+// PutDecoded inserts already-decoded plaintext bytes for key, exactly
+// as the miss path would: disk file + LRU insert + mem-tier promote.
+// Used by the blob prefetcher, which decodes many extents out of one
+// span download and lands each as if it had been individually
+// fetched. No-op when the key is already present (a racing Get may
+// have fetched it first — its copy is equally fresh).
+func (c *Cache) PutDecoded(key Key, data []byte) error {
+	if c.Has(key) {
+		return nil
+	}
+	path := filepath.Join(c.dir, key.fileName())
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("cache write %s: %w", path, err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.entries[key]; ok {
+		c.order.MoveToFront(existing.el)
+		return nil
+	}
+	e := &entry{key: key, size: int64(len(data))}
+	e.el = c.order.PushFront(e)
+	c.entries[key] = e
+	c.totalSize += e.size
+	c.evictLocked()
+	c.mem.Put(key, data)
+	return nil
+}
+
 // Has reports whether a chunk is already present in the LRU.
 // Used by the prefetcher to skip work for chunks the cache already
 // has — saves both a Telegram round trip and the disk write inside

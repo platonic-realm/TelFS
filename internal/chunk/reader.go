@@ -80,6 +80,13 @@ type Reader struct {
 	cipher       crypto.Cipher
 	codec        compress.Codec
 
+	// blobPrefetch, when non-nil, is told about cache misses on
+	// PACKED extents so it can warm the neighboring extents of the
+	// same blob (files packed together are read together — tar order
+	// ≈ directory-walk order). Strictly advisory: the foreground
+	// fetch below proceeds regardless.
+	blobPrefetch *BlobPrefetcher
+
 	// Prefetch state. prefetchSem caps in-flight fetches; inflight is
 	// a per-Key dedup so two consecutive ReadAt calls don't both kick
 	// off the same fetch. Both protect against pathological wasted
@@ -439,10 +446,12 @@ func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, 
 	// initial pre-fetch, or when the row was committed by the
 	// packer between the batch fetch and now).
 	if c, ok := batch[idx]; ok {
+		r.noteBlobLocality(ino, idx, c)
 		return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
 	}
 	c, err := r.meta.GetChunk(ctx, ino, idx)
 	if err == nil {
+		r.noteBlobLocality(ino, idx, c)
 		return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
 	}
 	if !errors.Is(err, meta.ErrNotFound) {
@@ -496,6 +505,26 @@ func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, 
 		return nil, nil
 	}
 	return nil, fmt.Errorf("chunk %d/%d: missing from chunk_map AND staging (data lost)", ino, idx)
+}
+
+// SetBlobPrefetcher installs the packed-blob locality prefetcher.
+// Pass nil to disable (the default).
+func (r *Reader) SetBlobPrefetcher(p *BlobPrefetcher) {
+	r.blobPrefetch = p
+}
+
+// noteBlobLocality tells the blob prefetcher about an imminent COLD
+// read of a packed extent — the trigger for warming its neighbors.
+// Hits are ignored (nothing to learn: warm data carries no locality
+// signal worth a queue slot).
+func (r *Reader) noteBlobLocality(ino int64, idx int32, c meta.Chunk) {
+	if r.blobPrefetch == nil || c.PackSize <= 0 {
+		return
+	}
+	if r.cache.Has(Key{Ino: ino, Idx: idx}) {
+		return
+	}
+	r.blobPrefetch.Note(c.TGMessageID, c.PackOffset)
 }
 
 // tryPendingFallback looks under the staging dir for a wire
