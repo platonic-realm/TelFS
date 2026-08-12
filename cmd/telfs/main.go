@@ -100,6 +100,11 @@ Usage:
                                     View or change the TG requests/min cap.
                                     0 = unlimited; running daemon hot-reloads
                                     within 5 s of a CLI change.
+  telfs bench [flags] <dir>         Micro-benchmark IO scenarios (stat storms,
+                                      small files, streaming, random reads)
+                                      against a directory — a TelFS mountpoint,
+                                      or any local dir for a baseline. See
+                                      telfs bench --help for the scenario list.
   telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
 
 Environment:
@@ -166,6 +171,8 @@ func run() error {
 		return cmdDoctor(ctx, os.Args[2:])
 	case "ratelimit":
 		return cmdRateLimit(ctx, os.Args[2:])
+	case "bench":
+		return cmdBench(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n%s", os.Args[1], usage)
 		os.Exit(2)
@@ -494,7 +501,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	allowOther := fs.Bool("allow-other", false, "allow other users to access the mount (FUSE -o allow_other; requires user_allow_other in /etc/fuse.conf)")
 	debug := fs.Bool("debug", false, "log every FUSE op")
 	noRecover := fs.Bool("no-recover", false, "skip cold-mount recovery from channel snapshot (starts with an empty DB if local DB is missing)")
-	metricsAddr := fs.String("metrics-addr", "", "bind a Prometheus /metrics endpoint at this addr (default: off). Example: 127.0.0.1:9090")
+	metricsAddr := fs.String("metrics-addr", "127.0.0.1:9090", "bind the daemon debug HTTP endpoint (/metrics, /telegram, /cache) here. The web UI reads live Telegram stats from the default; pass an empty value (--metrics-addr=) to disable.")
 	cacheCap := fs.String("cache-cap", "", "override the LRU disk-cache size cap (e.g. 8GiB, 512MiB, 2GB). Flag wins over config; empty falls through to config.toml's cache_cap; that falls through to 1 GiB.")
 	prefetchWindow := fs.Int("prefetch-window", 0, "how many chunks past the current read cursor to speculatively warm (0 = default 8). Bigger = more parallel reads in flight for sequential streams; smaller = less wasted bandwidth on random reads.")
 	prefetchConcurrency := fs.Int("prefetch-concurrency", 0, "max prefetchOne goroutines (0 = default 4). Each one can issue 4 concurrent upload.getFile RPCs through the parallel ranged fetcher.")
@@ -506,6 +513,17 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Was --metrics-addr given explicitly? An explicit addr that can't
+	// bind fails the mount loudly (the operator asked for it); the
+	// on-by-default addr degrades to a warning instead, so a second
+	// concurrent daemon (another profile) doesn't die on the port
+	// already being owned by the first.
+	metricsExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "metrics-addr" {
+			metricsExplicit = true
+		}
+	})
 	if fs.NArg() != 1 {
 		fs.Usage()
 		return errors.New("mount: expected exactly one mountpoint argument")
@@ -862,10 +880,19 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// scrape format. Cheap: in-memory atomic loads.
 			metricsSrv.RegisterHandler("/cache", cacheJSONHandler(cache))
 			if err := metricsSrv.Start(); err != nil {
-				return err
+				if metricsExplicit {
+					return err
+				}
+				// Default addr taken (most likely another profile's
+				// daemon) — run without the endpoint rather than
+				// failing the mount. The web UI's live panels will
+				// show whichever daemon owns the port.
+				fmt.Fprintf(os.Stderr, "metrics endpoint disabled: %v\n", err)
+				metricsSrv = nil
+			} else {
+				fmt.Printf("Metrics: http://%s/metrics\n", metricsSrv.Addr())
+				fmt.Printf("Telegram log: http://%s/telegram\n", metricsSrv.Addr())
 			}
-			fmt.Printf("Metrics: http://%s/metrics\n", metricsSrv.Addr())
-			fmt.Printf("Telegram log: http://%s/telegram\n", metricsSrv.Addr())
 		}
 		server, err := telfsfs.Mount(telfsfs.MountOptions{
 			MountPoint: mountpoint,
