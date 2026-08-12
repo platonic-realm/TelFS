@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"sync"
 	"time"
 
 	"telfs/internal/crypto"
@@ -58,6 +59,18 @@ type Manager struct {
 	// to fall back to log.Default.
 	Logger *log.Logger
 
+	// QuiesceCheck, when non-nil, reports whether the upload queue is
+	// fully drained (no packer buffer, no staged wires, no in-flight
+	// uploads, no unposted journal ops). Run's loop uses it to take an
+	// EARLY snapshot shortly after the FS quiesces dirty, instead of
+	// making the operator wait out the full cadence interval to reach
+	// the "channel holds everything" state the web sync indicator
+	// reports.
+	QuiesceCheck func(ctx context.Context) bool
+
+	// mu guards the change-detection baseline below. Once (cadence
+	// goroutine) writes it; Synced (metrics HTTP goroutines) reads it.
+	mu sync.Mutex
 	// lastSnapCounter is Meta.WriteCounter() as of the last successful
 	// snapshot THIS manager took. Together with the journal-seq check
 	// it decides whether a cycle can be skipped: journal seq alone is
@@ -68,6 +81,44 @@ type Manager struct {
 	// "no snapshot yet this process" from a zero counter.
 	lastSnapCounter int64
 	haveSnapCounter bool
+}
+
+// baseline returns the change-detection state under the lock.
+func (m *Manager) baseline() (counter int64, have bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastSnapCounter, m.haveSnapCounter
+}
+
+// setBaseline records the post-snapshot change-detection state.
+func (m *Manager) setBaseline(counter int64) {
+	m.mu.Lock()
+	m.lastSnapCounter = counter
+	m.haveSnapCounter = true
+	m.mu.Unlock()
+}
+
+// Synced reports whether the channel already holds everything the
+// local DB knows — the same condition Once uses to skip a cycle: the
+// journal seq equals the seq captured by the last posted snapshot AND
+// no counted DB writes have happened since that snapshot landed.
+// False before this process has posted its first snapshot: a baseline
+// it never recorded is a baseline it can't vouch for. Cheap (one KV
+// read + one MAX(seq) + one atomic), fine on a 2 s poll.
+func (m *Manager) Synced(ctx context.Context) bool {
+	lastCounter, have := m.baseline()
+	if !have || m.Meta.WriteCounter() != lastCounter {
+		return false
+	}
+	currentSeq, err := m.Meta.LastJournalSeq(ctx)
+	if err != nil {
+		return false
+	}
+	prevSeq, hadPrev, err := loadCurrentJournalSeq(ctx, m.Meta)
+	if err != nil || !hadPrev {
+		return false
+	}
+	return currentSeq == prevSeq
 }
 
 // Run executes the periodic snapshot loop until ctx is canceled. It
@@ -91,13 +142,34 @@ func (m *Manager) Run(ctx context.Context) error {
 		logger.Printf("[snapshot] initial snapshot failed: %v%s", err, channelLostHint(err))
 	}
 
-	t := time.NewTicker(m.Interval)
+	// Tick at a fraction of the interval so quiesce detection is
+	// responsive; only snapshot when the full interval elapsed OR the
+	// FS just went idle-but-dirty (upload queue drained with changes
+	// not yet covered by a snapshot). The early path is what lets the
+	// web's channel-sync indicator turn green within seconds of the
+	// last upload landing, instead of after the next cadence tick —
+	// and Once's own skip check keeps repeated quiesce ticks free.
+	tick := m.Interval / 10
+	if tick < 5*time.Second {
+		tick = 5 * time.Second
+	}
+	const quiesceMinGap = 30 * time.Second
+	lastAttempt := time.Now()
+	t := time.NewTicker(tick)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
+			due := time.Since(lastAttempt) >= m.Interval
+			if !due && m.QuiesceCheck != nil && time.Since(lastAttempt) >= quiesceMinGap {
+				due = m.QuiesceCheck(ctx) && !m.Synced(ctx)
+			}
+			if !due {
+				continue
+			}
+			lastAttempt = time.Now()
 			if err := m.Once(ctx); err != nil {
 				logger.Printf("[snapshot] periodic snapshot failed: %v%s", err, channelLostHint(err))
 			}
@@ -140,7 +212,8 @@ func (m *Manager) Once(ctx context.Context) error {
 		return fmt.Errorf("read prev snap journal seq: %w", err)
 	}
 	counterNow := m.Meta.WriteCounter()
-	if hadPrev && currentSeq == prevSeq && m.haveSnapCounter && counterNow == m.lastSnapCounter {
+	lastCounter, haveCounter := m.baseline()
+	if hadPrev && currentSeq == prevSeq && haveCounter && counterNow == lastCounter {
 		logger := m.Logger
 		if logger == nil {
 			logger = log.Default()
@@ -198,8 +271,7 @@ func (m *Manager) Once(ctx context.Context) error {
 	}
 	// Record the change-detection baseline AFTER our own bookkeeping
 	// writes so they don't count as "new changes" next cycle.
-	m.lastSnapCounter = m.Meta.WriteCounter()
-	m.haveSnapCounter = true
+	m.setBaseline(m.Meta.WriteCounter())
 	// Retention pruning: list every snapshot for this fs_uuid, keep the
 	// `retention` newest, delete the rest. Best-effort — if delete
 	// fails the orphan stays on the channel but the FS keeps working;

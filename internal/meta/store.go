@@ -745,12 +745,27 @@ func isBusyErr(err error) bool {
 //
 // Same backoff schedule as WithTx (10ms → 500ms cap, 5 attempts).
 func (s *Store) execWithRetry(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return s.execWithRetryOpt(ctx, true, query, args...)
+}
+
+// execWithRetryUncounted is execWithRetry for ADVISORY writes
+// (telemetry blobs) that must not bump the write counter: the counter
+// feeds snapshot change-detection, and counting bookkeeping writes
+// makes an idle daemon look permanently dirty. FS-content writes must
+// never route through this.
+func (s *Store) execWithRetryUncounted(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return s.execWithRetryOpt(ctx, false, query, args...)
+}
+
+func (s *Store) execWithRetryOpt(ctx context.Context, counted bool, query string, args ...any) (sql.Result, error) {
 	const maxAttempts = 5
 	backoff := 10 * time.Millisecond
 	for attempt := 1; ; attempt++ {
 		res, err := s.db.ExecContext(ctx, query, args...)
 		if err == nil {
-			s.writeCounter.Add(1)
+			if counted {
+				s.writeCounter.Add(1)
+			}
 			return res, nil
 		}
 		if !isBusyErr(err) || attempt >= maxAttempts {

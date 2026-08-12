@@ -609,7 +609,12 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	}
 	persistStats := func(ctx context.Context) {
 		if b, err := client.Tracker().MarshalState(); err == nil {
-			_ = metaStore.PutKV(ctx, tg.KVLifetimeStats, b)
+			// Uncounted: this fires every 60 s and is telemetry, not FS
+			// content — routing it through PutKV made the snapshot
+			// change-detector see a permanently dirty DB (idle daemons
+			// re-uploaded identical snapshots forever, and the channel-
+			// sync indicator could never report clean).
+			_ = metaStore.PutKVUncounted(ctx, tg.KVLifetimeStats, b)
 		}
 	}
 
@@ -854,6 +859,38 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// poller calls SetPinned* the first time.
 		adaptive := tg.NewAdaptiveController(client.RateLimiter(), client.Tracker())
 
+		// queueDrained reports whether every upload-side backlog is
+		// empty: packer buffer, wires staged on disk, uploads anywhere
+		// between dispatch and chunk_map commit (pool.Pending spans
+		// Register→Release, so sem-queued goroutines count too), and
+		// unposted journal rows. Shared by the snapshot manager's
+		// quiesce trigger and the /telegram sync report.
+		queueDrained := func(ctx context.Context) bool {
+			if packer != nil {
+				if n, _ := packer.QueueDepth(); n > 0 {
+					return false
+				}
+			}
+			if pool != nil && pool.Pending.Total() > 0 {
+				return false
+			}
+			if pendingDir != "" {
+				if ents, err := os.ReadDir(pendingDir); err == nil {
+					for _, e := range ents {
+						if !e.IsDir() {
+							return false
+						}
+					}
+				}
+			}
+			v, err := metaStore.Stats(ctx)
+			return err == nil && v.JournalUnposted == 0
+		}
+		// Created here (started further down) so the /telegram handler
+		// can report snapshot-coverage state from day one of the
+		// process; the sync indicator keys off it.
+		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher, QuiesceCheck: queueDrained}
+
 		// Metrics endpoint (opt-in). Gauges are registered AFTER the
 		// pool & cache exist so they read the live values, not the
 		// nil pre-construction state. Counters are registered in
@@ -873,7 +910,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// upload isn't progressing — was Telegram acking? are
 			// we stuck in FLOOD_WAIT? did we get FILE_PART_MISSING?
 			// JSON only for now; rendering is the web's problem.
-			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore, adaptive))
+			metricsSrv.RegisterHandler("/telegram", telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore, adaptive, snapMgr))
 			// /cache reports the LRU disk cache's live size + cap +
 			// hit/miss counts so the /state web page can render the
 			// cache panel without having to know about the metrics
@@ -907,7 +944,6 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// freshly-recovered DB is re-baselined) then every interval.
 		// We pass signalCtx — the goroutine exits when the gotd session
 		// tears down. The user-stop signal stops it via snapCtx below.
-		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher}
 		snapCtx, stopSnap := context.WithCancel(signalCtx)
 		snapDone := make(chan struct{})
 		go func() {
@@ -1298,7 +1334,7 @@ func cacheJSONHandler(cache *chunk.Cache) http.HandlerFunc {
 // many journal entries are unposted. All of those are cheap to read
 // (one mutex grab + one ReadDir + one SELECT COUNT) on a request that
 // fires every 2 s.
-func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packer, pool *chunk.UploadPool, pendingDir string, mstore *meta.Store, adaptive *tg.AdaptiveController) http.HandlerFunc {
+func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packer, pool *chunk.UploadPool, pendingDir string, mstore *meta.Store, adaptive *tg.AdaptiveController, snapMgr *snapshot.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snap := tr.Snapshot()
@@ -1344,8 +1380,13 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 			}
 		}
 		var poolInFlight, poolCap int
+		var uploadsTotal int64
 		if pool != nil {
 			poolInFlight, poolCap = pool.InFlight(), pool.Cap()
+			// Pending spans Register→Release, so uploads QUEUED for a
+			// sem slot (async dispatch) count too — poolInFlight alone
+			// only sees slot holders.
+			uploadsTotal = pool.Pending.Total()
 		}
 		var journalUnposted int
 		if mstore != nil {
@@ -1366,7 +1407,22 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 		fmt.Fprintf(w, "    \"pending_wires_bytes\": %d,\n", pendingBytes)
 		fmt.Fprintf(w, "    \"pool_in_flight\": %d,\n", poolInFlight)
 		fmt.Fprintf(w, "    \"pool_cap\": %d,\n", poolCap)
+		fmt.Fprintf(w, "    \"uploads_total\": %d,\n", uploadsTotal)
 		fmt.Fprintf(w, "    \"journal_unposted\": %d\n", journalUnposted)
+		fmt.Fprintln(w, "  },")
+		// Channel-sync verdict. channel_complete means the channel
+		// alone is sufficient to recover this FS on fresh hardware:
+		// every upload-side backlog is empty AND a snapshot covering
+		// the current DB has been posted (chunk_map isn't journaled, so
+		// queue-empty by itself leaves chunk mappings local-only until
+		// the next snapshot lands — the quiesce trigger takes one
+		// within seconds of the queue draining).
+		queueEmpty := packerChunks == 0 && pendingFiles == 0 && uploadsTotal == 0 && journalUnposted == 0
+		snapClean := snapMgr != nil && snapMgr.Synced(r.Context())
+		fmt.Fprintln(w, "  \"sync\": {")
+		fmt.Fprintf(w, "    \"queue_empty\": %t,\n", queueEmpty)
+		fmt.Fprintf(w, "    \"snapshot_clean\": %t,\n", snapClean)
+		fmt.Fprintf(w, "    \"channel_complete\": %t\n", queueEmpty && snapClean)
 		fmt.Fprintln(w, "  },")
 		// Adaptive rate-limiter state — pin status + current
 		// effective cap + last-adjustment metadata. Cheap to read

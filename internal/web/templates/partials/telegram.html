@@ -10,6 +10,10 @@
 <div class="panel">
   <h3>Lifetime totals <small>from the profile DB — daemon offline{{if .PersistedAgeSec}}, last updated {{.PersistedAgeSec}}s ago{{end}}</small></h3>
   <table class="kv">
+    <tr title="{{.SyncTip}}">
+      <td>Channel copy</td>
+      <td><span class="pill {{.SyncKind}}">{{.SyncLabel}}</span> <small>{{.SyncTip}}</small></td>
+    </tr>
     <tr><td>RPCs sent (lifetime)</td><td><strong>{{.State.TotalOK}}</strong> ok / <strong>{{.State.TotalErr}}</strong> err</td></tr>
     <tr><td>Wire bytes</td><td>tx <strong>{{humanBytes .State.TotalBytesTx}}</strong> · rx <strong>{{humanBytes .State.TotalBytesRx}}</strong> <small>(total payload = {{humanBytes .State.TotalBytes}})</small></td></tr>
   </table>
@@ -32,6 +36,10 @@
     {{if .State.ChannelTitle}}
     <tr><td>Channel</td><td><code>{{.State.ChannelTitle}}</code> (id {{.State.ChannelID}})</td></tr>
     {{end}}
+    <tr title="{{.SyncTip}}">
+      <td>Channel copy</td>
+      <td><span class="pill {{.SyncKind}}">{{.SyncLabel}}</span> <small>{{.SyncTip}}</small></td>
+    </tr>
     <tr><td>RPCs sent (lifetime — persisted across restarts)</td><td><strong>{{.State.TotalOK}}</strong> ok / <strong>{{.State.TotalErr}}</strong> err</td></tr>
     <tr><td>Wire bytes</td><td>tx <strong>{{humanBytes .State.TotalBytesTx}}</strong> · rx <strong>{{humanBytes .State.TotalBytesRx}}</strong> <small>(total payload = {{humanBytes .State.TotalBytes}})</small></td></tr>
     <tr><td>In-flight</td><td><strong>{{.State.InFlight}}</strong></td></tr>

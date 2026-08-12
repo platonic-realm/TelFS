@@ -33,6 +33,25 @@ func (s *Store) PutKV(ctx context.Context, key string, value []byte) error {
 	return nil
 }
 
+// PutKVUncounted stores an ADVISORY blob (telemetry — e.g. the
+// tracker's lifetime stats, persisted every 60 s) without bumping the
+// store's write counter. The counter feeds snapshot change-detection;
+// when the stats persister went through the counted path, every
+// cadence tick saw "DB changed" and an idle daemon re-uploaded
+// byte-identical snapshots forever — and the channel-sync indicator
+// could never report clean. Never use for filesystem content: a write
+// this path hides from the counter is a write snapshots may miss.
+func (s *Store) PutKVUncounted(ctx context.Context, key string, value []byte) error {
+	_, err := s.execWithRetryUncounted(ctx,
+		`INSERT INTO meta_kv(key, value) VALUES (?,?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		key, value)
+	if err != nil {
+		return fmt.Errorf("put kv %q: %w", key, err)
+	}
+	return nil
+}
+
 // DeleteKV removes a key. Returns ErrNotFound if absent.
 func (s *Store) DeleteKV(ctx context.Context, key string) error {
 	res, err := s.execWithRetry(ctx,

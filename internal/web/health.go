@@ -26,9 +26,17 @@ func (s *Server) healthPartial(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	state := s.fetchTelegramStatePartial(r)
 	kind, label, tip := classifyHealth(state)
+	// Two lamps in one swap target: link health + channel sync. The
+	// sync lamp answers "is the channel a complete copy — could I
+	// lose this machine right now?" (see classifySync); green means
+	// yes, including the offline "as of last unmount" case.
 	fmt.Fprintf(w,
-		`<span id="health-pill" class="pill %s" title="%s" hx-get="/partials/health" hx-trigger="every 5s" hx-swap="outerHTML">%s</span>`,
+		`<span id="health-pill" class="pill-pair" hx-get="/partials/health" hx-trigger="every 5s" hx-swap="outerHTML">`+
+			`<span class="pill %s" title="%s">%s</span>`+
+			`<span class="pill %s" title="%s">%s</span>`+
+			`</span>`,
 		kind, htmlAttr(tip), label,
+		state.SyncKind, htmlAttr(state.SyncTip), state.SyncLabel,
 	)
 }
 

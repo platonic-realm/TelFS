@@ -9,13 +9,16 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"telfs/internal/chunk"
 	"telfs/internal/config"
 	"telfs/internal/meta"
+	"telfs/internal/snapshot"
 	"telfs/internal/tg"
 )
 
@@ -40,6 +43,7 @@ type tgState struct {
 	PerMethod             []tgMethod  `json:"per_method"`
 	Requests              []tgRequest `json:"requests"`
 	Queue                 tgQueue     `json:"queue"`
+	Sync                  *tgSync     `json:"sync,omitempty"`
 	Adaptive              *tgAdaptive `json:"adaptive,omitempty"`
 }
 
@@ -78,9 +82,24 @@ type tgQueue struct {
 	// UploadPool are currently held vs the cap.
 	PoolInFlight int `json:"pool_in_flight"`
 	PoolCap      int `json:"pool_cap"`
+	// UploadsTotal: uploads anywhere between dispatch and chunk_map
+	// commit (includes goroutines queued for a sem slot, which
+	// PoolInFlight misses under async dispatch).
+	UploadsTotal int64 `json:"uploads_total"`
 	// JournalUnposted: rows in the local journal table not yet
 	// posted to the channel.
 	JournalUnposted int `json:"journal_unposted"`
+}
+
+// tgSync is the daemon's channel-sync verdict. ChannelComplete means
+// the channel alone can recover the FS on fresh hardware: upload
+// queue drained AND a snapshot covering the current DB posted
+// (chunk_map isn't journaled, so queue-empty alone leaves chunk
+// mappings local-only until a snapshot lands).
+type tgSync struct {
+	QueueEmpty      bool `json:"queue_empty"`
+	SnapshotClean   bool `json:"snapshot_clean"`
+	ChannelComplete bool `json:"channel_complete"`
 }
 
 type tgMethod struct {
@@ -132,6 +151,99 @@ type tgPageData struct {
 	// upload.getFile RPCs only. -1 on read failure, 0 = unlimited,
 	// >0 = explicit cap.
 	DownloadRateLimitPerMin int
+
+	// Channel-sync lamp, computed by classifySync from the daemon's
+	// sync verdict when online, or from local profile state when
+	// offline (journal drained + no staged wires + journal seq
+	// covered by the last snapshot ⇒ the channel was complete as of
+	// the last unmount). Rendered in the masthead next to the link
+	// pill and as a row on the /telegram tab.
+	SyncKind  string // pill class: ok | warn | muted
+	SyncLabel string // terse lamp caption
+	SyncTip   string // hover/title explanation
+
+	// Offline verdict inputs (daemon unreachable): whether local
+	// state was readable at all, and what it said.
+	OfflineSyncKnown    bool
+	OfflineSyncComplete bool
+}
+
+// classifySync fills the SyncKind/Label/Tip lamp from whichever
+// evidence is available. Ordering: online daemon verdicts first
+// (live truth), then the offline approximation, then unknown.
+func classifySync(d *tgPageData) {
+	switch {
+	case d.Online && d.State.Sync == nil:
+		d.SyncKind, d.SyncLabel = "muted", "sync n/a"
+		d.SyncTip = "Daemon predates the sync report — restart the mount with the current binary."
+	case d.Online && d.State.Sync.ChannelComplete:
+		d.SyncKind, d.SyncLabel = "ok", "synced"
+		d.SyncTip = "Channel holds everything — recoverable without this machine."
+	case d.Online && d.State.Sync.QueueEmpty:
+		d.SyncKind, d.SyncLabel = "warn", "snap due"
+		d.SyncTip = "Uploads drained; waiting for a snapshot to cover the latest chunk maps (automatic within ~30 s; unmount also takes one)."
+	case d.Online:
+		q := d.State.Queue
+		d.SyncKind, d.SyncLabel = "warn", "uploading"
+		d.SyncTip = fmt.Sprintf("Backlog: %d upload(s) in flight, %d wire(s) staged, %d packer chunk(s), %d journal op(s) unposted.",
+			q.UploadsTotal, q.PendingWiresCount, q.PackerChunks, q.JournalUnposted)
+	case d.OfflineSyncKnown && d.OfflineSyncComplete:
+		d.SyncKind, d.SyncLabel = "ok", "synced"
+		d.SyncTip = "As of the last unmount: queue drained and the snapshot covers the journal. Channel is a complete copy."
+	case d.OfflineSyncKnown:
+		d.SyncKind, d.SyncLabel = "warn", "not synced"
+		d.SyncTip = "Local state holds changes the channel may lack (staged wires, unposted journal, or an uncovered snapshot window). Mount to let it drain."
+	default:
+		d.SyncKind, d.SyncLabel = "muted", "sync ?"
+		d.SyncTip = "No daemon and no readable local state — channel-sync unknown."
+	}
+}
+
+// loadOfflineSync computes the daemon-offline sync approximation from
+// the profile's local state. Channel-complete offline ⇔ no unposted
+// journal rows AND no staged wires AND the journal seq is covered by
+// the last posted snapshot (an empty journal counts as covered: the
+// snapshot cadence prunes posted rows ≤ its seq, so a fully-drained,
+// fully-snapshotted FS ends with an empty table). chunk_map rows are
+// only ever written with the daemon up, so "clean at last shutdown"
+// carries over to now.
+func loadOfflineSync(ctx context.Context, data *tgPageData) {
+	cfg, err := config.Load()
+	if err != nil {
+		return
+	}
+	mstore, err := openMetaExisting()
+	if err != nil {
+		return
+	}
+	defer mstore.Close()
+	st, err := mstore.Stats(ctx)
+	if err != nil {
+		return
+	}
+	seq, err := mstore.LastJournalSeq(ctx)
+	if err != nil {
+		return
+	}
+	var snapSeq int64 = -1
+	if raw, err := mstore.GetKV(ctx, snapshot.KVCurrentJournalSeq); err == nil {
+		if v, perr := strconv.ParseInt(string(raw), 10, 64); perr == nil {
+			snapSeq = v
+		}
+	}
+	pendingClean := true
+	pendingDir := filepath.Join(cfg.CachePath(), chunk.PendingDirName)
+	if ents, err := os.ReadDir(pendingDir); err == nil {
+		for _, e := range ents {
+			if !e.IsDir() {
+				pendingClean = false
+				break
+			}
+		}
+	}
+	data.OfflineSyncKnown = true
+	data.OfflineSyncComplete = st.JournalUnposted == 0 && pendingClean &&
+		snapSeq >= 0 && (seq == 0 || seq == snapSeq)
 }
 
 // telegramPage renders the connection-state + request-log view. Data
@@ -176,7 +288,9 @@ func (s *Server) fetchTelegramStatePartial(r *http.Request) tgPageData {
 	populateTGState(&data, url)
 	if !data.Online {
 		loadPersistedTGStats(r.Context(), &data)
+		loadOfflineSync(r.Context(), &data)
 	}
+	classifySync(&data)
 	return data
 }
 
@@ -259,7 +373,9 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 	populateTGState(&data, url)
 	if !data.Online {
 		loadPersistedTGStats(r.Context(), &data)
+		loadOfflineSync(r.Context(), &data)
 	}
+	classifySync(&data)
 	return data
 }
 

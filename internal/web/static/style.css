@@ -427,6 +427,14 @@ button.danger:hover, .btn.danger:hover {
   border-color: var(--lamp-err);
   color: var(--paper);
 }
+/* Masthead lamp pair: link health + channel sync share one HTMX swap
+   target (span#health-pill). Inline-flex so the two pills sit on the
+   pill row like siblings. */
+.pill-pair {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
 /* Busy state: ui.js disables the submit button on slow posts (mount
    stop/start block until the daemon actually finishes). Dim + progress
    cursor so the held state reads as "working", not "broken". */
