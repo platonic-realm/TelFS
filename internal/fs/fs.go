@@ -122,25 +122,26 @@ type Node struct {
 
 // Assert all the FUSE node interfaces we implement.
 var (
-	_ gofuse.NodeGetattrer     = (*Node)(nil)
-	_ gofuse.NodeSetattrer     = (*Node)(nil)
-	_ gofuse.NodeLookuper      = (*Node)(nil)
-	_ gofuse.NodeReaddirer     = (*Node)(nil)
-	_ gofuse.NodeOpener        = (*Node)(nil)
-	_ gofuse.NodeReader        = (*Node)(nil)
-	_ gofuse.NodeReadlinker    = (*Node)(nil)
-	_ gofuse.NodeCreater       = (*Node)(nil)
-	_ gofuse.NodeMkdirer       = (*Node)(nil)
-	_ gofuse.NodeSymlinker     = (*Node)(nil)
-	_ gofuse.NodeLinker        = (*Node)(nil)
-	_ gofuse.NodeUnlinker      = (*Node)(nil)
-	_ gofuse.NodeRmdirer       = (*Node)(nil)
-	_ gofuse.NodeRenamer       = (*Node)(nil)
-	_ gofuse.NodeGetxattrer    = (*Node)(nil)
-	_ gofuse.NodeSetxattrer    = (*Node)(nil)
-	_ gofuse.NodeRemovexattrer = (*Node)(nil)
-	_ gofuse.NodeListxattrer   = (*Node)(nil)
-	_ gofuse.NodeStatfser      = (*Node)(nil)
+	_ gofuse.NodeGetattrer      = (*Node)(nil)
+	_ gofuse.NodeSetattrer      = (*Node)(nil)
+	_ gofuse.NodeLookuper       = (*Node)(nil)
+	_ gofuse.NodeReaddirer      = (*Node)(nil)
+	_ gofuse.NodeOpendirHandler = (*Node)(nil)
+	_ gofuse.NodeOpener         = (*Node)(nil)
+	_ gofuse.NodeReader         = (*Node)(nil)
+	_ gofuse.NodeReadlinker     = (*Node)(nil)
+	_ gofuse.NodeCreater        = (*Node)(nil)
+	_ gofuse.NodeMkdirer        = (*Node)(nil)
+	_ gofuse.NodeSymlinker      = (*Node)(nil)
+	_ gofuse.NodeLinker         = (*Node)(nil)
+	_ gofuse.NodeUnlinker       = (*Node)(nil)
+	_ gofuse.NodeRmdirer        = (*Node)(nil)
+	_ gofuse.NodeRenamer        = (*Node)(nil)
+	_ gofuse.NodeGetxattrer     = (*Node)(nil)
+	_ gofuse.NodeSetxattrer     = (*Node)(nil)
+	_ gofuse.NodeRemovexattrer  = (*Node)(nil)
+	_ gofuse.NodeListxattrer    = (*Node)(nil)
+	_ gofuse.NodeStatfser       = (*Node)(nil)
 )
 
 // NewRoot returns the root Node for a TelFS mount.
@@ -224,10 +225,11 @@ func (n *Node) Setattr(ctx context.Context, fh gofuse.FileHandle, in *fuse.SetAt
 		}
 	}
 	if size, ok := in.GetSize(); ok {
-		// If we have an open handle, use its Writer (it knows about
-		// dirty chunks). Otherwise mint a transient Writer for the
+		// If we have an open WRITE handle, use its Writer (it knows
+		// about dirty chunks). Otherwise (no handle, or a read-only
+		// handle with no writer) mint a transient Writer for the
 		// truncate.
-		if h, ok := fh.(*fileHandle); ok && h != nil {
+		if h, ok := fh.(*fileHandle); ok && h != nil && h.writer != nil {
 			if err := h.writer.Truncate(mctx, int64(size)); err != nil {
 				log.Printf("fs.Setattr.Truncate(ino=%d, size=%d): %v", n.ino, size, err)
 				return syscall.EIO
@@ -303,16 +305,113 @@ func (n *Node) Readdir(ctx context.Context) (gofuse.DirStream, syscall.Errno) {
 	return gofuse.NewListDirStream(entries), 0
 }
 
-// Open allocates a fileHandle backed by a chunk.Writer for the file's
-// lifetime. Handles O_TRUNC by truncating to 0 before returning the
-// handle so subsequent writes start from a clean slate.
+// OpendirHandle serves opendir(2). Returning FOPEN_CACHE_DIR (the
+// bridge ORs in FOPEN_KEEP_CACHE) opts the listing into the kernel's
+// readdir page cache: repeated getdents of an unchanged directory are
+// answered without any FUSE upcall or SQL scan. The kernel invalidates
+// its cached pages itself whenever a mutation (create/unlink/rename/
+// rmdir) goes through this mount, so the cache is coherent under
+// TelFS's single-writer design. The one out-of-band meta writer — the
+// trash TTL GC — can leave a cached /.trash listing stale until the
+// dir's attrs refresh; lookups of reaped names still miss correctly.
+func (n *Node) OpendirHandle(_ context.Context, _ uint32) (gofuse.FileHandle, uint32, syscall.Errno) {
+	return &dirHandle{node: n}, fuse.FOPEN_CACHE_DIR, 0
+}
+
+// dirHandle is the per-opendir state. It builds the entry list
+// LAZILY, on the first Readdirent: with FOPEN_CACHE_DIR the kernel
+// usually serves getdents from its page cache and never calls back at
+// all, so an eager listing at opendir time would pay the SQL scan on
+// exactly the calls the cache exists to eliminate.
+type dirHandle struct {
+	node *Node
+	ds   gofuse.DirStream
+}
+
+// The bridge serializes calls on one file handle, so dirHandle needs
+// no locking of its own.
+var (
+	_ gofuse.FileReaddirenter = (*dirHandle)(nil)
+	_ gofuse.FileSeekdirer    = (*dirHandle)(nil)
+	_ gofuse.FileReleasedirer = (*dirHandle)(nil)
+)
+
+// ensure materializes the underlying entry stream on first use.
+func (d *dirHandle) ensure(ctx context.Context) syscall.Errno {
+	if d.ds != nil {
+		return 0
+	}
+	ds, errno := d.node.Readdir(ctx)
+	if errno != 0 {
+		return errno
+	}
+	d.ds = ds
+	return 0
+}
+
+func (d *dirHandle) Readdirent(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
+	if errno := d.ensure(ctx); errno != 0 {
+		return nil, errno
+	}
+	if !d.ds.HasNext() {
+		return nil, 0
+	}
+	e, errno := d.ds.Next()
+	return &e, errno
+}
+
+func (d *dirHandle) Seekdir(ctx context.Context, off uint64) syscall.Errno {
+	if errno := d.ensure(ctx); errno != 0 {
+		return errno
+	}
+	if sd, ok := d.ds.(gofuse.FileSeekdirer); ok {
+		return sd.Seekdir(ctx, off)
+	}
+	return syscall.ENOTSUP
+}
+
+func (d *dirHandle) Releasedir(context.Context, uint32) {
+	if d.ds != nil {
+		d.ds.Close()
+	}
+}
+
+// Open allocates a fileHandle. Write-capable opens get a chunk.Writer
+// for the handle's lifetime (O_TRUNC truncates to 0 first so writes
+// start from a clean slate); read-only opens get a writer-less handle.
 func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint32, syscall.Errno) {
+	// O_TRUNC counts as mutating even with O_RDONLY accmode (Linux
+	// truncates on that combination).
+	wantsWrite := flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY) ||
+		flags&uint32(syscall.O_TRUNC) != 0
 	if !n.backend.canWrite() {
 		// Read-only mount: reject any open with write flags.
-		if flags&uint32(syscall.O_WRONLY) != 0 || flags&uint32(syscall.O_RDWR) != 0 {
+		if wantsWrite {
 			return nil, 0, syscall.EROFS
 		}
 		return nil, fuse.FOPEN_KEEP_CACHE, 0
+	}
+	if !wantsWrite {
+		// Read-only open on a writable mount: NO chunk.Writer. The
+		// writer exists for mutation, and constructing one also waits
+		// on the pool's per-ino pending barrier — so opening a
+		// freshly-written file for READ used to stall until its
+		// uploads landed, even though the reader's staging fallback
+		// serves the bytes immediately. Write-then-read pipelines
+		// (compile → link, cp → md5sum) hit that constantly. Reads
+		// need none of the writer's machinery; skipping it also drops
+		// a per-open SQL round trip and the writer allocation.
+		h := &fileHandle{node: n}
+		h.lastReadEnd.Store(-1)
+		if in, err := n.backend.Meta.GetInode(ctx, n.ino); err == nil {
+			h.chunkSize = in.ChunkSize
+			if h.chunkSize <= 0 {
+				h.chunkSize = n.backend.chunkSize()
+			}
+			h.size = in.Size
+			h.sparse = in.Sparse
+		}
+		return h, fuse.FOPEN_KEEP_CACHE, 0
 	}
 	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
@@ -353,6 +452,9 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 func (n *Node) Read(ctx context.Context, _ gofuse.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	nread, err := n.backend.Reader.ReadAt(ctx, n.ino, dest, off)
 	if err != nil {
+		if interrupted(ctx, err) {
+			return nil, syscall.EINTR
+		}
 		log.Printf("fs.Read(ino=%d, off=%d, len=%d): %v", n.ino, off, len(dest), err)
 		return nil, syscall.EIO
 	}
@@ -599,7 +701,7 @@ func (n *Node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, 
 		if errors.Is(err, meta.ErrNotFound) {
 			return 0, syscall.ENODATA
 		}
-		return 0, syscall.EIO
+		return 0, logMetaErr("Getxattr", n.ino, err)
 	}
 	if len(dest) < len(v) {
 		return uint32(len(v)), syscall.ERANGE
@@ -612,7 +714,7 @@ func (n *Node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, 
 func (n *Node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
 	names, err := n.backend.Meta.ListXattrs(ctx, n.ino)
 	if err != nil {
-		return 0, syscall.EIO
+		return 0, logMetaErr("Listxattr", n.ino, err)
 	}
 	var total int
 	for _, name := range names {
@@ -743,6 +845,14 @@ func mapMetaErr(err error) syscall.Errno {
 		return syscall.EISDIR
 	case errors.Is(err, meta.ErrNotDir):
 		return syscall.ENOTDIR
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// FUSE interrupt: the kernel cancels an op's ctx when the
+		// calling process takes ANY signal — including the Go
+		// runtime's own SIGURG preemption, so every Go program on
+		// the mount trips this constantly. EINTR tells the kernel
+		// to restart the syscall transparently; the old EIO surfaced
+		// as a spurious "input/output error" in userspace.
+		return syscall.EINTR
 	}
 	return syscall.EIO
 }
@@ -761,9 +871,12 @@ func logMetaErr(op string, ino int64, err error) syscall.Errno {
 	if err == nil {
 		return 0
 	}
+	// Cancellations are FUSE interrupts (see mapMetaErr) — routine,
+	// not worth a log line each.
 	if !errors.Is(err, meta.ErrNotFound) && !errors.Is(err, meta.ErrExists) &&
 		!errors.Is(err, meta.ErrNotEmpty) && !errors.Is(err, meta.ErrIsDir) &&
-		!errors.Is(err, meta.ErrNotDir) {
+		!errors.Is(err, meta.ErrNotDir) &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.Printf("fs.%s(ino=%d): %v", op, ino, err)
 	}
 	return mapMetaErr(err)
@@ -772,3 +885,12 @@ func logMetaErr(op string, ino int64, err error) syscall.Errno {
 // isUserXattr reports whether `name` is in Linux's "user." xattr
 // namespace, the only one TelFS supports in v1.
 func isUserXattr(name string) bool { return strings.HasPrefix(name, "user.") }
+
+// interrupted reports whether a FUSE op failed because its ctx was
+// canceled (kernel interrupt or unmount teardown) rather than a real
+// fault. Checks the ctx itself too: not every layer wraps the ctx
+// sentinel into its returned error.
+func interrupted(ctx context.Context, err error) bool {
+	return ctx.Err() != nil ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}

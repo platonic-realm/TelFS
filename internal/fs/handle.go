@@ -133,6 +133,9 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 		n, err = h.node.backend.Reader.ReadAt(ctx, h.node.ino, dest, off)
 	}
 	if err != nil {
+		if interrupted(ctx, err) {
+			return nil, syscall.EINTR
+		}
 		log.Printf("fs.handle.Read(ino=%d, off=%d, len=%d): %v", h.node.ino, off, len(dest), err)
 		return nil, syscall.EIO
 	}
@@ -148,8 +151,16 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 func (h *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.writer == nil {
+		// Read-only handle — the kernel enforces the access mode, so
+		// this only fires on a protocol violation.
+		return 0, syscall.EBADF
+	}
 	n, err := h.writer.WriteAt(ctx, data, off)
 	if err != nil {
+		if interrupted(ctx, err) {
+			return uint32(n), syscall.EINTR
+		}
 		log.Printf("fs.handle.Write(ino=%d, off=%d, len=%d): wrote %d, err=%v", h.node.ino, off, len(data), n, err)
 		return uint32(n), syscall.EIO
 	}
@@ -173,7 +184,20 @@ func (h *fileHandle) markDirty() {
 func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.writer.Flush(ctx); err != nil {
+	if h.writer == nil {
+		return 0 // read-only handle: nothing buffered
+	}
+	// WithoutCancel: FLUSH is issued from close(2), which userspace
+	// CANNOT retry — the kernel doesn't restart an interrupted FLUSH,
+	// and the fd is gone either way, so aborting on a signal would
+	// strand dirty chunks behind a spurious EINTR from close(). The
+	// flush work is local (stage to pending/ + dispatch within the
+	// staging allowance) and must simply complete; a gate wait during
+	// unmount is still unblocked by the pool's own shutdown ctx.
+	if err := h.writer.Flush(context.WithoutCancel(ctx)); err != nil {
+		if interrupted(ctx, err) {
+			return syscall.EINTR // pool shutdown mid-teardown
+		}
 		log.Printf("fs.handle.Flush(ino=%d): %v", h.node.ino, err)
 		return syscall.EIO
 	}
@@ -187,7 +211,13 @@ func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
 func (h *fileHandle) Fsync(ctx context.Context, _ uint32) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.writer == nil {
+		return 0 // read-only handle: nothing to make durable
+	}
 	if err := h.writer.Sync(ctx); err != nil {
+		if interrupted(ctx, err) {
+			return syscall.EINTR
+		}
 		log.Printf("fs.handle.Fsync(ino=%d): %v", h.node.ino, err)
 		return syscall.EIO
 	}
@@ -200,6 +230,8 @@ func (h *fileHandle) Fsync(ctx context.Context, _ uint32) syscall.Errno {
 func (h *fileHandle) Release(_ context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.writer.Close()
+	if h.writer != nil {
+		h.writer.Close()
+	}
 	return 0
 }
