@@ -2,6 +2,7 @@ package fs
 
 import (
 	"fmt"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -44,17 +45,42 @@ func Mount(opts MountOptions, b *Backend) (*serverHandle, error) {
 	// Our Setattr already accepts mtime updates, which is the one mode
 	// change writeback_cache introduces on the upcall side.
 	fuseOpts.MountOptions.ExtraCapabilities = fuse.CAP_WRITEBACK_CACHE
+	// MaxWrite caps the size of a single WRITE (and READ — go-fuse sets
+	// max_read equal to MaxWrite) request. The go-fuse default is
+	// 128 KiB; the kernel supports 1 MiB. With writeback_cache on,
+	// dirty pages flush in MaxWrite-sized upcalls, so this is an 8×
+	// cut in write round trips. It also raises the ceiling on
+	// MaxReadAhead below, which the kernel clamps to MaxWrite.
+	fuseOpts.MountOptions.MaxWrite = fuse.MAX_KERNEL_WRITE
 	// MaxReadAhead controls how much the kernel reads ahead on top of
 	// the actual read() syscall. The default (128 KiB on Linux) is
 	// tuned for local-filesystem workloads where readahead is cheap;
 	// for TelFS each kernel-side read becomes a FUSE round trip into
 	// Node.Read → Reader.ReadAt, where we coalesce against chunk
-	// boundaries. Setting MaxReadAhead to one chunk lets the kernel
-	// issue whole-chunk reads, which collapses 32 round trips (the
-	// 128 KiB-per-call default vs the 4 MiB chunk) into one. The
-	// chunk pipeline's prefetcher then does its work AHEAD of the
-	// next chunk instead of mid-chunk.
+	// boundaries. We ask for one full chunk; the effective value is
+	// min(MaxReadAhead, MaxWrite) = 1 MiB today, which still turns
+	// the 128 KiB-per-call default into 1 MiB reads (4 round trips
+	// per 4 MiB chunk instead of 32) and keeps the chunk pipeline's
+	// prefetcher working AHEAD of the next chunk instead of mid-chunk.
+	// Keep requesting ChunkSize so readahead tracks any future
+	// MaxWrite/kernel-limit increase automatically.
 	fuseOpts.MountOptions.MaxReadAhead = int(chunk.ChunkSize)
+	// Kernel-side metadata caching. go-fuse leaves these nil, which
+	// means ZERO — without them every path-component resolution is a
+	// LOOKUP upcall, every stat() a GETATTR, and failed lookups are
+	// never remembered, so metadata-heavy workloads (compiles: make
+	// stat-ing every prerequisite, cc probing each include dir per
+	// #include — mostly ENOENT) hammer the daemon + SQLite with
+	// millions of avoidable round trips. libfuse/NFS default to 1 s
+	// under multi-writer assumptions TelFS doesn't have: the local DB
+	// is authoritative and mutated only through this mount, so the
+	// kernel's cached view is self-coherent. The one out-of-band
+	// mutator, the trash TTL GC, only touches aged /.trash entries —
+	// staleness there is bounded by this timeout and harmless.
+	cacheTimeout := 5 * time.Second
+	fuseOpts.EntryTimeout = &cacheTimeout
+	fuseOpts.AttrTimeout = &cacheTimeout
+	fuseOpts.NegativeTimeout = &cacheTimeout
 	// MaxBackground caps how many concurrent FUSE requests the kernel
 	// dispatches before queuing further ones. The default (12) is
 	// tight enough that a multi-threaded reader can stall behind
