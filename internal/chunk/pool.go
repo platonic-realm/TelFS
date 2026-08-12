@@ -3,7 +3,21 @@ package chunk
 import (
 	"context"
 	"sync"
+
+	"golang.org/x/sync/semaphore"
 )
+
+// DefaultStagedCapBytes bounds how much dispatched-but-not-yet-
+// uploaded chunk data (plaintext-accounted) may be held by upload
+// goroutines at once. Within the cap, dispatch is ASYNC: close(2) of
+// a freshly-written file returns at local-disk speed while the wires
+// (already staged to pending/ — the durability story) drain to the
+// channel in the background. Past the cap, dispatch blocks, so a
+// sustained writer is still throttled to upload bandwidth instead of
+// ballooning RAM/disk without bound. 256 MiB absorbs a typical burst
+// (a compile's artifacts, a phone-camera video) without letting a
+// 100 GB dd think it "finished" in a minute.
+const DefaultStagedCapBytes int64 = 256 << 20
 
 // UploadPool is the backend-scoped dispatch layer all Writers funnel
 // chunk uploads through. It owns three things that, prior to async
@@ -43,6 +57,14 @@ type UploadPool struct {
 	// success), and consulted by the reader. Nil disables the
 	// acceleration; the disk scan still works.
 	PendingIndex *PendingIndex
+
+	// staged bounds the bytes of dirty-chunk data handed to upload
+	// goroutines that haven't completed yet (see DefaultStagedCapBytes).
+	// Acquired in the writer's dispatch path (the only place that
+	// blocks the FUSE writeback flusher now), released when the
+	// upload goroutine finishes — success or failure.
+	staged    *semaphore.Weighted
+	stagedCap int64
 }
 
 // NewUploadPool constructs a pool with the given concurrency cap.
@@ -57,6 +79,39 @@ func NewUploadPool(concurrency int) *UploadPool {
 		uploadCancel: cancel,
 		sem:          make(chan struct{}, concurrency),
 		Pending:      NewPendingInodes(),
+		staged:       semaphore.NewWeighted(DefaultStagedCapBytes),
+		stagedCap:    DefaultStagedCapBytes,
+	}
+}
+
+// AcquireStaged blocks until n bytes of staging allowance are free (or
+// ctx / the pool ctx fires). Returns the possibly-CLAMPED weight the
+// caller must later pass to ReleaseStaged: a single chunk larger than
+// the whole cap is admitted at cap weight instead of deadlocking.
+func (p *UploadPool) AcquireStaged(ctx context.Context, n int64) (int64, error) {
+	if n > p.stagedCap {
+		n = p.stagedCap
+	}
+	// A child ctx canceled on pool shutdown, so a dispatch waiting on
+	// the gate can't outlive the pool.
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(p.uploadCtx, cancel)
+	defer stop()
+	if err := p.staged.Acquire(waitCtx, n); err != nil {
+		if p.uploadCtx.Err() != nil {
+			return 0, p.uploadCtx.Err()
+		}
+		return 0, err
+	}
+	return n, nil
+}
+
+// ReleaseStaged returns allowance taken by AcquireStaged. Pass the
+// clamped weight AcquireStaged returned, not the original size.
+func (p *UploadPool) ReleaseStaged(n int64) {
+	if n > 0 {
+		p.staged.Release(n)
 	}
 }
 
@@ -85,9 +140,9 @@ func (p *UploadPool) Cap() int { return cap(p.sem) }
 // files the packer can aggregate per batch at DefaultUploadConcurrency
 // — defeating most of the point of having a packer.
 type Reservation struct {
-	pool       *UploadPool
-	ino        int64
-	semHeld    bool
+	pool        *UploadPool
+	ino         int64
+	semHeld     bool
 	pendingHeld bool
 }
 
@@ -116,35 +171,52 @@ func (r *Reservation) Release() {
 	r.pool.wg.Done()
 }
 
-// Reserve registers a pending upload for ino and acquires a global
-// concurrency slot, BLOCKING if the pool is saturated. Returns a
-// *Reservation the upload goroutine MUST Release exactly once on
-// completion (success or failure).
-//
-// Cancellation: the wait can be unblocked by either the caller's ctx
-// or the pool's own ctx (shutdown). Returns the canceling ctx's err
-// in either case; in that case any resources already-acquired are
-// returned so Begin/End stay balanced.
-func (p *UploadPool) Reserve(ctx context.Context, ino int64) (*Reservation, error) {
+// Register records a pending upload for ino WITHOUT acquiring a
+// concurrency slot: the R-A-W barrier (Pending) and the drain
+// WaitGroup are armed synchronously, so a reader or unmount that
+// races the dispatch always sees the work. Never blocks. The upload
+// goroutine acquires its slot later via Reservation.AcquireSem and
+// MUST Release exactly once on completion (success or failure).
+func (p *UploadPool) Register(ino int64) *Reservation {
 	p.wg.Add(1)
 	p.Pending.Begin(ino)
-	select {
-	case p.sem <- struct{}{}:
-	case <-ctx.Done():
-		p.Pending.End(ino)
-		p.wg.Done()
-		return nil, ctx.Err()
-	case <-p.uploadCtx.Done():
-		p.Pending.End(ino)
-		p.wg.Done()
-		return nil, p.uploadCtx.Err()
+	return &Reservation{pool: p, ino: ino, pendingHeld: true}
+}
+
+// AcquireSem blocks until an upload concurrency slot frees (or a ctx
+// fires). Idempotent-safe with ReleaseSem/Release via semHeld.
+//
+// Cancellation: the wait can be unblocked by either the caller's ctx
+// or the pool's own ctx (shutdown). Returns the canceling ctx's err;
+// the registration itself stays held either way (the caller's
+// Release handles it).
+func (r *Reservation) AcquireSem(ctx context.Context) error {
+	if r.semHeld {
+		return nil
 	}
-	return &Reservation{
-		pool:        p,
-		ino:         ino,
-		semHeld:     true,
-		pendingHeld: true,
-	}, nil
+	select {
+	case r.pool.sem <- struct{}{}:
+		r.semHeld = true
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.pool.uploadCtx.Done():
+		return r.pool.uploadCtx.Err()
+	}
+}
+
+// Reserve registers a pending upload for ino and acquires a global
+// concurrency slot, BLOCKING if the pool is saturated. Kept for
+// callers that want the two steps fused (tests, tools); the FUSE
+// writer dispatches via Register + a deferred AcquireSem instead so
+// the writeback flusher never waits on the network.
+func (p *UploadPool) Reserve(ctx context.Context, ino int64) (*Reservation, error) {
+	res := p.Register(ino)
+	if err := res.AcquireSem(ctx); err != nil {
+		res.Release()
+		return nil, err
+	}
+	return res, nil
 }
 
 // Drain blocks until every dispatched upload completes or ctx fires.

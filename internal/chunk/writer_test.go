@@ -841,26 +841,39 @@ func TestPoolGlobalConcurrency(t *testing.T) {
 	if _, err := w2.WriteAt(ctx, []byte("bbbbb"), 0); err != nil {
 		t.Fatal(err)
 	}
-	// Flush w1 — sem grabbed by w1's upload (which is stuck on gate).
+	// Since async dispatch, Flush no longer blocks on the sem — both
+	// return once their chunk is dispatched within the staging
+	// allowance. The serialization now lives BETWEEN the upload
+	// goroutines: with one slot, w2's upload queues on the sem until
+	// w1's (stuck in the gated uploader) completes.
 	if err := w1.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// w2.Flush must now block on dispatch's pool.Reserve.
-	flush2Done := make(chan error, 1)
-	go func() { flush2Done <- w2.Flush(ctx) }()
-	select {
-	case <-flush2Done:
-		t.Fatal("w2.Flush returned with only 1 sem slot and 1 in-flight upload — sem isn't actually global")
-	case <-time.After(50 * time.Millisecond):
+	if err := w2.Flush(ctx); err != nil {
+		t.Fatalf("w2.Flush must not block under async dispatch: %v", err)
+	}
+	// Steady state: w1 holds the only slot, w2 queued behind it. The
+	// sem channel can never exceed its cap of 1, so once InFlight hits
+	// 1 with zero completed uploads we know the second upload is
+	// waiting, not running.
+	deadline := time.Now().Add(2 * time.Second)
+	for pool.InFlight() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("in-flight = %d, want 1 (w1 holding the only slot)", pool.InFlight())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if n := up.nextID.Load(); n != 0 {
+		t.Fatalf("%d upload(s) completed while the uploader gate was closed", n)
 	}
 	up.release()
-	if err := <-flush2Done; err != nil {
-		t.Fatalf("w2.Flush after release: %v", err)
-	}
 	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if !pool.Drain(drainCtx) {
 		t.Fatal("pool drain timed out")
+	}
+	if n := up.nextID.Load(); n != 2 {
+		t.Fatalf("uploads completed = %d, want 2 (both writers, serialized)", n)
 	}
 }
 

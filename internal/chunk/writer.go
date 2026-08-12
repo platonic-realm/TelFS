@@ -734,15 +734,16 @@ func (w *Writer) Sync(ctx context.Context) error {
 }
 
 // dispatchFlushLocked pops the dirty chunk at idx, marks it as in-flight,
-// acquires a pool slot (BLOCKING for backpressure), and launches a
-// goroutine that does the encrypt + upload + chunk_map update.
+// acquires staging-byte allowance (BLOCKING only past the pool's
+// staged cap — flow control, not network wait), and launches a
+// goroutine that does the encrypt + stage + upload + chunk_map update.
 //
 // The caller holds w.mu on entry; this method releases the mutex during
-// the pool Reserve (so other writers can keep filling new chunks) and
-// reacquires it before returning.
+// the staging-gate wait (so other writers can keep filling new chunks)
+// and reacquires it before returning.
 //
-// Returns the error from pool.Reserve if the upload ctx or caller ctx
-// canceled while we waited for a slot — in which case nothing was
+// Returns the error from AcquireStaged if the upload ctx or caller ctx
+// canceled while we waited for allowance — in which case nothing was
 // dispatched and dc stays available to retry via a future Flush.
 func (w *Writer) dispatchFlushLocked(ctx context.Context, idx int32) error {
 	dc, ok := w.dirty[idx]
@@ -764,12 +765,19 @@ func (w *Writer) dispatchFlushLocked(ctx context.Context, idx int32) error {
 	w.uploading[idx] = doneCh
 	w.uploadWg.Add(1)
 	w.mu.Unlock()
-	res, err := w.pool.Reserve(ctx, w.ino)
+	// Staging gate, NOT the upload sem: dispatch only waits for RAM
+	// allowance (DefaultStagedCapBytes of in-flight chunk data), never
+	// for the network. The upload goroutine stages the wire to
+	// pending/ first and only then queues for a concurrency slot
+	// (Reservation.AcquireSem inside uploadOne), so close(2) of a
+	// burst that fits the gate returns at local speed while uploads
+	// drain behind it. A sustained over-cap writer still blocks here —
+	// that's the flow control that keeps a 100 GB dd honest.
+	stagedN, err := w.pool.AcquireStaged(ctx, int64(len(dc.data)))
 	if err != nil {
-		// Couldn't get a slot — undo the bookkeeping and put dc back
-		// where dispatchFlushLocked found it so the next Flush can
-		// retry. Reservation already cleaned up its own Begin/End +
-		// wg accounting via the failure path in pool.Reserve.
+		// Couldn't get allowance (ctx canceled / shutdown) — undo the
+		// bookkeeping and put dc back where dispatchFlushLocked found
+		// it so the next Flush can retry.
 		w.mu.Lock()
 		w.uploadWg.Done()
 		delete(w.uploading, idx)
@@ -779,7 +787,14 @@ func (w *Writer) dispatchFlushLocked(ctx context.Context, idx int32) error {
 		w.dirtyBytes += int64(len(dc.data))
 		return err
 	}
-	go w.uploadOne(w.pool.UploadCtx(), idx, dc, doneCh, res)
+	// Register arms the R-A-W barrier + drain wg synchronously —
+	// before this dispatch returns — so readers and unmount can never
+	// miss the in-flight upload.
+	res := w.pool.Register(w.ino)
+	go func() {
+		defer w.pool.ReleaseStaged(stagedN)
+		w.uploadOne(w.pool.UploadCtx(), idx, dc, doneCh, res)
+	}()
 	w.mu.Lock()
 	return nil
 }
@@ -954,16 +969,14 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 			}
 			w.pool.PendingIndex.RecordPersist(w.ino, idx, p)
 		}
-		// Release the upload SEM slot before waiting on the packer's
-		// result chan — the packer runs its own serialized flusher,
-		// so holding a pool slot through the pack wait would cap
-		// per-batch aggregation at DefaultUploadConcurrency (4) for
-		// no reason (advisor-noted limitation in v1, now fixed).
-		// Pending + wg stay held until res.Release() at the bottom
-		// of this function, so reader-side R-A-W barrier remains
-		// honored.
+		// The pack route takes NO upload sem slot: the packer runs its
+		// own serialized flusher, so a slot would neither bound extra
+		// network concurrency nor help aggregation (holding one used
+		// to cap per-batch aggregation at DefaultUploadConcurrency).
+		// Pending + wg (via Register) stay held until res.Release()
+		// at the bottom of this function, so the reader-side R-A-W
+		// barrier remains honored.
 		resultCh := w.packer.Submit(w.ino, idx, int32(len(dc.data)), wire, pendingPath)
-		res.ReleaseSem()
 		select {
 		case packRes := <-resultCh:
 			if packRes.err != nil {
@@ -1012,6 +1025,17 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		w.pool.PendingIndex.RecordPersist(w.ino, idx, p)
 	}
 
+	// Queue for an upload concurrency slot ONLY now that the wire is
+	// staged on disk: while we wait, reads are served via the staging
+	// fallback and a crash/shutdown loses nothing (recoverPending
+	// re-submits on next mount). A canceled wait therefore restores
+	// to dirty with pendingPath set — the recoverable shape.
+	if err := res.AcquireSem(ctx); err != nil {
+		restore = true
+		lastErr = fmt.Errorf("upload slot chunk %d: %w", idx, err)
+		w.recordTransient(lastErr)
+		return
+	}
 	name := fmt.Sprintf("ino%d-idx%d", w.ino, idx)
 	msgID, err := uploadWithRetry(ctx, w.uploader, wire, name, "")
 	if err != nil {
