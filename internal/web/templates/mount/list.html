@@ -24,7 +24,7 @@
                 onsubmit="return confirm('Stop the mount at {{.Mountpoint}}? Any process with open files there will see I/O errors.');">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
             <input type="hidden" name="profile" value="{{.Profile}}">
-            <button type="submit" class="danger">Stop</button>
+            <button type="submit" class="danger" data-busy="Stopping…">Stop</button>
           </form>
         </td>
       </tr>
@@ -52,7 +52,7 @@
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
             <input type="hidden" name="mountpoint" value="{{.}}">
             <input type="hidden" name="return_to" value="/mount">
-            <button type="submit" class="danger">Unmount</button>
+            <button type="submit" class="danger" data-busy="Unmounting…">Unmount</button>
           </form>
         </td>
       </tr>

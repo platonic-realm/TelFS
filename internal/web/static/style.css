@@ -427,6 +427,14 @@ button.danger:hover, .btn.danger:hover {
   border-color: var(--lamp-err);
   color: var(--paper);
 }
+/* Busy state: ui.js disables the submit button on slow posts (mount
+   stop/start block until the daemon actually finishes). Dim + progress
+   cursor so the held state reads as "working", not "broken". */
+button[disabled], .btn[disabled], input[type="submit"][disabled] {
+  opacity: 0.55;
+  cursor: progress;
+  pointer-events: none;
+}
 .btn.secondary, button.secondary, .btn.muted, button.muted {
   color: var(--ink-muted);
 }

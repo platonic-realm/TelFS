@@ -20,7 +20,7 @@
           onsubmit="return confirm('Stop this mount? Any process with open files there will see I/O errors.');">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <input type="hidden" name="profile" value="{{.Profile}}">
-      <button type="submit" class="danger">Stop</button>
+      <button type="submit" class="danger" data-busy="Stopping…">Stop</button>
     </form>
     <a href="/mount" class="btn secondary">Back to list</a>
     <a href="/browse/dir?at={{.Mountpoint}}" class="btn secondary">Browse files</a>

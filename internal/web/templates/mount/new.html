@@ -25,7 +25,7 @@
     <label><input type="checkbox" name="allow_other"> allow_other</label>
     <label><input type="checkbox" name="debug"> debug</label>
   </fieldset>
-  <button type="submit">Start mount</button>
+  <button type="submit" data-busy="Starting…">Start mount</button>
   <a href="/mount" class="btn">Cancel</a>
 </form>
 <p><small>The web server detaches the child into its own session. Stop it via the mount list to trigger a graceful shutdown (SIGTERM, then lazy unmount as a fallback after 25 s).</small></p>

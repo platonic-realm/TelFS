@@ -24,18 +24,40 @@
     const btn = document.getElementById('theme-toggle');
     if (!btn) return;
     btn.addEventListener('click', function () {
-      const cur = document.documentElement.getAttribute('data-theme');
-      // Cycle: (system) -> light -> dark -> (system).
-      let next = 'light';
-      if (cur === 'light') next = 'dark';
-      else if (cur === 'dark') next = '';
+      // Toggle the EFFECTIVE theme, not the attribute. The old
+      // (system) -> light -> dark -> (system) cycle had a dead click:
+      // stepping from explicit-dark to (system) on a dark-preference
+      // OS rendered identically, so dark -> light took two presses.
+      // Now every click flips what's on screen; when the flip lands
+      // on the system's own preference we drop the override entirely,
+      // so "follow the OS" remains the steady state it can return to.
+      const sysLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+      const attr = document.documentElement.getAttribute('data-theme');
+      const curLight = attr ? attr === 'light' : sysLight;
+      const next = curLight ? 'dark' : 'light';
+      const matchesSystem = (next === 'light') === sysLight;
       try {
-        if (next) localStorage.setItem('telfs-theme', next);
-        else localStorage.removeItem('telfs-theme');
+        if (matchesSystem) localStorage.removeItem('telfs-theme');
+        else localStorage.setItem('telfs-theme', next);
       } catch (e) { /* storage disabled */ }
-      if (next) document.documentElement.setAttribute('data-theme', next);
-      else document.documentElement.removeAttribute('data-theme');
+      if (matchesSystem) document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.setAttribute('data-theme', next);
     });
+  });
+
+  // ── busy feedback on slow form posts ────────────────────────────
+  // Stop/unmount (and mount start) block until the daemon actually
+  // finishes — worst case ~35 s when a FLOOD_WAIT'd shutdown runs to
+  // the watchdog. With no feedback that reads as a dead click and
+  // people press the button again. On submit (after any inline
+  // confirm() has passed — a canceled confirm sets defaultPrevented),
+  // disable the submit button and swap its label to data-busy.
+  document.addEventListener('submit', function (e) {
+    if (e.defaultPrevented) return;
+    const btn = e.target.querySelector('button[type="submit"]');
+    if (!btn || btn.disabled) return;
+    if (btn.dataset.busy) btn.textContent = btn.dataset.busy;
+    btn.disabled = true;
   });
 
   // ── close <details class="nav-group"> on outside click ──────────
