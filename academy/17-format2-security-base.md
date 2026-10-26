@@ -65,7 +65,11 @@ Random 96-bit nonces are safe for 2^32 encryptions per key (NIST SP
 counts in `meta_kv` (uncounted, so they don't keep the snapshot dirty),
 the daemon warns at 2^31 and `Box.Seal` refuses at 2^32 — the filesystem
 turns read-only. A first full backup of a 1.2-million-file home folder
-uses about 1/3000 of the budget.
+uses about 1/3000 of the budget. A DB rebuilt by `recover --from-captions`
+has no counts of its own; the rebuild seeds them from what it read (one
+chunk-key use per chunk and pack extent, one meta-key use per pack index,
+snapshot and journal body, one caption-key use per document). That is a
+lower bound, since messages gc already deleted aren't seen, but not zero.
 
 ## Where the secret comes from
 
@@ -213,6 +217,12 @@ before use). `telfs status` and `fsck` compare the pinned message with
 the local header byte for byte; the daemon checks at mount and every 6 h
 and only warns; `fsck --fix` and `mount --key-header` repair.
 
+`--key-header` applies only to a missing local DB; with a `db.sqlite`
+present the mount refuses rather than ignoring the flag. If the export
+is the very key message still on the channel (unpinned, say), recovery
+goes through that message and re-pins it; the export is re-posted only
+when the channel has no key message at all.
+
 `secret change` re-wraps the DEK — it does not change it. So the order
 of its steps matters and is crash-safe: post the new key message → write
 `session.enc.new` → switch the local header → pin → rename the session
@@ -273,7 +283,12 @@ the empty file, the symlink, the second link name, the later rename).
   without checking it existed; `meta.Open` creates one with a fresh
   fs_uuid, and the next mount then skips recovery. Same for the web's
   compression form. Both stat first now — the trap CLAUDE.md already
-  recorded for the web.
+  recorded for the web. The break-glass drill then showed the other half:
+  the P1 test tool made the same mistake, and `telfs mount` took the
+  empty database for a filesystem and posted its empty snapshot. The
+  mount now refuses a database that no `telfs init` and no recovery
+  produced (format 1, never snapshotted, only the root directory, no
+  chunks, no journal) — "never implicitly" holds for a stray file too.
 - **`telfs unmount` and relative mountpoints.** mountctl finds a daemon by
   its command line (`telfs … mount … <mountpoint>`). Started as
   `telfs mount ./mnt`, the line said `./mnt` while `/proc/mounts` said

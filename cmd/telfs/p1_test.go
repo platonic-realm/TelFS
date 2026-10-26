@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"telfs/internal/crypto"
+	"telfs/internal/meta"
+	"telfs/internal/rebuild"
 	"telfs/internal/secret"
+	"telfs/internal/snapshot"
+	"telfs/internal/wire"
 )
 
 func TestExtractGlobalFlags(t *testing.T) {
@@ -38,5 +44,69 @@ func TestExitCodes(t *testing.T) {
 	}
 	if exitCode(errors.New("other")) != 1 {
 		t.Error("other errors exit 1")
+	}
+}
+
+// A DB that meta.Open created on a missing path is not a filesystem:
+// mount refuses it (the P1 key-header drill mounted one and posted its
+// empty snapshot). Anything init, a recovery or a mount leaves behind is.
+func TestNeverUsedDB(t *testing.T) {
+	ctx := context.Background()
+	open := func(t *testing.T) *meta.Store {
+		m, err := meta.Open(filepath.Join(t.TempDir(), "db.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { m.Close() })
+		return m
+	}
+	check := func(t *testing.T, m *meta.Store, want bool) {
+		t.Helper()
+		got, err := neverUsedDB(ctx, m)
+		if err != nil || got != want {
+			t.Fatalf("neverUsedDB = %v, %v; want %v", got, err, want)
+		}
+	}
+	t.Run("fresh", func(t *testing.T) { check(t, open(t), true) })
+	t.Run("format2", func(t *testing.T) {
+		m := open(t)
+		if err := m.PutKV(ctx, meta.KVFormat, []byte("2")); err != nil {
+			t.Fatal(err)
+		}
+		check(t, m, false)
+	})
+	t.Run("snapshotted", func(t *testing.T) {
+		m := open(t)
+		if err := m.PutKV(ctx, snapshot.KVCurrentMsgID, []byte("7")); err != nil {
+			t.Fatal(err)
+		}
+		check(t, m, false)
+	})
+	t.Run("has a file", func(t *testing.T) {
+		m := open(t)
+		if _, err := m.CreateInode(ctx, meta.Inode{Kind: meta.KindFile, Mode: 0o644}); err != nil {
+			t.Fatal(err)
+		}
+		check(t, m, false)
+	})
+}
+
+// A rebuilt DB starts with the use counts the channel shows, not zero,
+// and the mount's loadUses reads them back.
+func TestSeedUsesFromRebuild(t *testing.T) {
+	ctx := context.Background()
+	m, err := meta.Open(filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	st := rebuild.Stats{ChunkCaptions: 18, Packs: 5, PackEntries: 747, Snapshots: 3, JournalBatches: 6}
+	if err := seedUsesFromRebuild(ctx, m, st); err != nil {
+		t.Fatal(err)
+	}
+	var c wire.Counters
+	loadUses(ctx, m, &c)
+	if c.Chunk.Load() != 765 || c.Meta.Load() != 14 || c.Caption.Load() != 32 {
+		t.Fatalf("chunk %d meta %d caption %d; want 765 14 32", c.Chunk.Load(), c.Meta.Load(), c.Caption.Load())
 	}
 }

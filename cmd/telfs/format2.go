@@ -15,6 +15,7 @@ import (
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
 	"telfs/internal/mountctl"
+	"telfs/internal/rebuild"
 	"telfs/internal/secret"
 	"telfs/internal/snapshot"
 	"telfs/internal/tg"
@@ -50,6 +51,25 @@ func persistUses(ctx context.Context, m *meta.Store, c *wire.Counters) {
 	}
 	b, _ := json.Marshal(usesState{Chunk: c.Chunk.Load(), Meta: c.Meta.Load(), Caption: c.Caption.Load()})
 	_ = m.PutKVUncounted(ctx, meta.KVUses, b)
+}
+
+// seedUsesFromRebuild gives a DB rebuilt from captions the per-key use
+// counts it would otherwise start without (at zero, the 2^31 warning and
+// the 2^32 refusal would restart from nothing). It counts what the
+// channel shows was sealed: chunk key, one per chunk and pack extent;
+// meta key, one per pack index, snapshot and journal body; caption key,
+// one per document. A lower bound: messages gc already deleted, and
+// documents whose caption no longer opens, aren't seen.
+func seedUsesFromRebuild(ctx context.Context, m *meta.Store, st rebuild.Stats) error {
+	b, err := json.Marshal(usesState{
+		Chunk:   uint64(st.ChunkCaptions + st.PackEntries),
+		Meta:    uint64(st.Packs + st.Snapshots + st.JournalBatches),
+		Caption: uint64(st.ChunkCaptions + st.Packs + st.Snapshots + st.JournalBatches),
+	})
+	if err != nil {
+		return err
+	}
+	return m.PutKVUncounted(ctx, meta.KVUses, b)
 }
 
 // keyHeaderOf reads the local copy of a format-2 key header.
@@ -173,6 +193,16 @@ func recover2(ctx context.Context, cfg *config.Config, sess *tg.Session, sec *se
 			return true, perr
 		}
 		cands = []snapshot.KeyFound{{Header: h, JSON: h.JSON()}}
+		// The export may be the very message still on the channel (only
+		// unpinned, or --key-header given when it wasn't needed): recover
+		// through that message (re-pinning it) instead of warning that
+		// the channel's header differs.
+		for _, k := range onChannel {
+			if bytes.Equal(k.Header.JSON(), h.JSON()) {
+				cands = []snapshot.KeyFound{k}
+				break
+			}
+		}
 	} else {
 		cands = onChannel
 	}

@@ -141,6 +141,9 @@ func cmdRecover(ctx context.Context, args []string) error {
 		if res.Codecs["zstd"] > 0 {
 			_ = m.SetCompressionCodec(ctx, "zstd")
 		}
+		if err := seedUsesFromRebuild(ctx, m, res.Stats); err != nil {
+			return err
+		}
 		if err := writeReport(*reportPath, res); err != nil {
 			return err
 		}

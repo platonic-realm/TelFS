@@ -240,7 +240,9 @@ telfs mount ./mnt
 ```
 
 A channel with no TelFS filesystem is an error ("run `telfs init`") —
-a filesystem is created only by `telfs init`, never implicitly.
+a filesystem is created only by `telfs init`, never implicitly. An
+empty `db.sqlite` that neither `init` nor a recovery made (something
+opened a missing database) is refused too, not mounted.
 
 On a format-2 filesystem the mount first reads the **pinned key
 message**, unlocks it with the profile's secret, then finds the newest
@@ -249,6 +251,9 @@ snapshot. If the key message is gone, recover with the export:
 ```sh
 telfs mount --key-header ~/telfs-main-key.txt ./mnt   # re-posts + pins it
 ```
+
+`--key-header` only applies when the local DB is missing; with a
+`db.sqlite` present the mount refuses instead of ignoring it.
 
 **Every snapshot gone?** `telfs recover --from-captions` rebuilds the
 metadata from the chunk captions, the packs' encrypted indexes and any

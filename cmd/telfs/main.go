@@ -661,6 +661,14 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	}
 	defer lock.Close()
 
+	// --key-header recovers a MISSING local DB; with a DB present it
+	// would be silently ignored, so say so before the slow secret read.
+	_, statErr := os.Stat(cfg.DBPath())
+	dbMissing := errors.Is(statErr, os.ErrNotExist)
+	if *keyHeader != "" && !dbMissing {
+		return fmt.Errorf("--key-header recovers a missing local DB, but %s exists — move it away first (or mount without --key-header)", cfg.DBPath())
+	}
+
 	// The profile's secret, read ONCE: it opens session.enc (Argon2id
 	// #1) and, below, the filesystem key (Argon2id #2 on format 2, the
 	// passphrase of an encrypted format-1 FS). Zeroed as soon as both
@@ -678,7 +686,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// Cold-mount recovery: if the local DB is missing, restore it from
 	// the channel. A channel with no TelFS filesystem is an ERROR now
 	// (decision N3): a filesystem is created only by `telfs init`.
-	if _, err := os.Stat(cfg.DBPath()); errors.Is(err, os.ErrNotExist) {
+	if dbMissing {
 		if *noRecover {
 			return errors.New("--no-recover: there is no local DB to mount — run `telfs init` to create a filesystem, or mount without --no-recover to restore one from the channel")
 		}
@@ -692,6 +700,13 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return err
 	}
 	defer metaStore.Close()
+	if !dbMissing {
+		if blank, err := neverUsedDB(signalCtx, metaStore); err != nil {
+			return err
+		} else if blank {
+			return fmt.Errorf("%s is not a filesystem: no `telfs init` and no recovery made it (empty, never snapshotted — something opened a missing DB, which creates one). Mounting it would post an empty filesystem to the channel. Move it away, then mount again to restore this profile's filesystem from the channel, or run `telfs init` to create a new one", cfg.DBPath())
+		}
+	}
 	fsUUID, err := metaStore.FSUUID(signalCtx)
 	if err != nil {
 		return err
@@ -1871,6 +1886,30 @@ func armForceExit(mountpoint string) {
 		_ = mountctl.LazyUnmount(mountpoint)
 		os.Exit(130)
 	}()
+}
+
+// neverUsedDB reports a DB that neither `telfs init` nor a recovery
+// produced: format 1 (no format marker), never snapshotted, nothing but
+// the root directory, no chunks, no journal. That is what meta.Open
+// leaves behind when it is called on a missing path. (Every filesystem
+// that was ever mounted has a snapshot record: the daemon snapshots at
+// mount. Format 2 always carries its marker.)
+func neverUsedDB(ctx context.Context, m *meta.Store) (bool, error) {
+	if f, err := m.Format(ctx); err != nil || f != 1 {
+		return false, err
+	}
+	for _, k := range []string{snapshot.KVCurrentMsgID, snapshot.KVSnapMsgIDs} {
+		if _, err := m.GetKV(ctx, k); err == nil {
+			return false, nil
+		} else if !errors.Is(err, meta.ErrNotFound) {
+			return false, err
+		}
+	}
+	st, err := m.Stats(ctx)
+	if err != nil {
+		return false, err
+	}
+	return st.InodesTotal <= 1 && st.ChunkRows == 0 && st.JournalRows == 0, nil
 }
 
 // tryRecover restores a missing local DB from the channel. Format 2
