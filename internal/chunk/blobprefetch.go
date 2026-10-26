@@ -64,8 +64,7 @@ type BlobPrefetcher struct {
 	meta    *meta.Store
 	cache   *Cache
 	fetcher RangedFetcher
-	cipher  crypto.Cipher
-	codec   compress.Codec
+	wc      WireCodec
 	budget  int64
 
 	queue  chan blobSpan
@@ -89,22 +88,23 @@ type BlobPrefetcher struct {
 // (plaintext / no compression), mirroring NewCache's defaults —
 // decode here MUST match what the cache's own miss path would do.
 func NewBlobPrefetcher(m *meta.Store, c *Cache, f RangedFetcher, cipher crypto.Cipher, codec compress.Codec, budget int64) *BlobPrefetcher {
+	return NewBlobPrefetcherWire(m, c, f, NewFormat1Codec(cipher, codec), budget)
+}
+
+// NewBlobPrefetcherWire is NewBlobPrefetcher with an explicit wire codec.
+func NewBlobPrefetcherWire(m *meta.Store, c *Cache, f RangedFetcher, wc WireCodec, budget int64) *BlobPrefetcher {
 	if budget <= 0 {
 		budget = DefaultBlobPrefetchBudget
 	}
-	if cipher == nil {
-		cipher = crypto.NoopCipher{}
-	}
-	if codec == nil {
-		codec = compress.None{}
+	if wc == nil {
+		wc = NewFormat1Codec(nil, nil)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &BlobPrefetcher{
 		meta:    m,
 		cache:   c,
 		fetcher: f,
-		cipher:  cipher,
-		codec:   codec,
+		wc:      wc,
 		budget:  budget,
 		queue:   make(chan blobSpan, 32),
 		ctx:     ctx,
@@ -270,14 +270,9 @@ func (p *BlobPrefetcher) fetchSpan(span blobSpan) {
 		}
 		rel := c.PackOffset - start
 		wire := raw[rel : rel+int64(c.PackSize)]
-		compressed, err := p.cipher.Open(c.Ino, c.Idx, wire)
+		data, err := p.wc.Decode(c.Ino, c.Idx, c.Hash, wire)
 		if err != nil {
-			log.Printf("[blob-prefetch] decrypt %d/%d: %v", c.Ino, c.Idx, err)
-			continue
-		}
-		data, err := p.codec.Decompress(compressed)
-		if err != nil {
-			log.Printf("[blob-prefetch] decompress %d/%d: %v", c.Ino, c.Idx, err)
+			log.Printf("[blob-prefetch] decode %d/%d: %v", c.Ino, c.Idx, err)
 			continue
 		}
 		if err := p.cache.PutDecoded(key, data); err != nil {

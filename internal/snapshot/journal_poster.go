@@ -16,6 +16,7 @@ import (
 
 	"telfs/internal/meta"
 	"telfs/internal/tg"
+	"telfs/internal/wire"
 )
 
 // channelLost reports whether err means the bound channel is
@@ -60,6 +61,10 @@ type Poster struct {
 	Interval  time.Duration
 	BatchSize int // 0 → DefaultPosterBatchSize
 	Logger    *log.Logger
+	// Keys, when set, posts FORMAT-2 batches: body sealed under the
+	// meta key, `blob` document, encrypted caption (decision D3 — the
+	// journal carried names, folders and sizes in clear before).
+	Keys *wire.Keys
 }
 
 // Run drains the local journal periodically until ctx is canceled.
@@ -158,7 +163,13 @@ func (p *Poster) drainOnce(ctx context.Context) error {
 		for i, e := range batch {
 			entries[i] = tg.JournalBatchEntry{Seq: e.Seq, Op: e.OpJSON}
 		}
-		if _, err := p.Session.UploadJournalOpBatch(ctx, entries, time.Now().Unix(), fsUUID); err != nil {
+		var err error
+		if p.Keys != nil {
+			_, err = UploadJournal2(ctx, p.Session, p.Keys, entries)
+		} else {
+			_, err = p.Session.UploadJournalOpBatch(ctx, entries, time.Now().Unix(), fsUUID)
+		}
+		if err != nil {
 			return fmt.Errorf("post batch first_seq=%d last_seq=%d: %w",
 				batch[0].Seq, batch[len(batch)-1].Seq, err)
 		}

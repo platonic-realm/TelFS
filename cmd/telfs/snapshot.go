@@ -12,9 +12,51 @@ import (
 
 	"telfs/internal/config"
 	"telfs/internal/meta"
+	"telfs/internal/mountctl"
+	"telfs/internal/secret"
 	"telfs/internal/snapshot"
 	"telfs/internal/tg"
+	"telfs/internal/wire"
 )
+
+// localKeys2 unlocks the local DB's keys when it is format 2; nil (no
+// error) for format 1 or no local DB.
+func localKeys2(ctx context.Context, cfg *config.Config, sec *secret.Secret) (*wire.Keys, error) {
+	if _, err := os.Stat(cfg.DBPath()); err != nil {
+		return nil, nil
+	}
+	m, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return nil, err
+	}
+	defer m.Close()
+	if f, err := m.Format(ctx); err != nil || f != 2 {
+		return nil, err
+	}
+	keys, _, err := unlock2(ctx, m, sec)
+	return keys, err
+}
+
+// listSnapshots2 lists format-2 snapshots newest first by decrypting
+// captions.
+func listSnapshots2(ctx context.Context, sess *tg.Session, keys *wire.Keys, max int) ([]tg.LatestSnapshot, error) {
+	var out []tg.LatestSnapshot
+	err := sess.WalkChannelMessages(ctx, snapshot.ScanPages, func(cm tg.ChannelMessage) error {
+		if !cm.HasDoc || !wire.LooksLikeCaption(cm.RawCaption) {
+			return nil
+		}
+		c, err := keys.OpenCaption(cm.RawCaption)
+		if err != nil || c.K != wire.KindSnapshot {
+			return nil
+		}
+		out = append(out, tg.LatestSnapshot{MessageID: cm.ID, Caption: tg.SnapshotCaption{Kind: "snap", Seq: c.Seq, TSUnix: c.TS, FSUUID: c.FS}})
+		if len(out) >= max {
+			return tg.ErrStopWalk
+		}
+		return nil
+	})
+	return out, err
+}
 
 // readFSUUIDFromMetaKV opens the local DB (read-only OK) and reads the
 // FS uuid that snapshots are filtered by. Returns "" if the DB isn't
@@ -96,12 +138,28 @@ func cmdSnapshotList(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	client, err := tg.New(cfg)
+	sec, err := readSecret(ctx, cfg, secret.Unlock)
 	if err != nil {
 		return err
 	}
+	defer sec.Zero()
+	client, err := newClientWith(cfg, sec)
+	if err != nil {
+		return err
+	}
+	keys, err := localKeys2(ctx, cfg, sec)
+	if err != nil {
+		return err
+	}
+	sec.Zero()
 	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
-		snaps, err := sess.ListSnapshots(ctx, fsUUID, *max)
+		var snaps []tg.LatestSnapshot
+		var err error
+		if keys != nil {
+			snaps, err = listSnapshots2(ctx, sess, keys, *max)
+		} else {
+			snaps, err = sess.ListSnapshots(ctx, fsUUID, *max)
+		}
 		if err != nil {
 			return err
 		}
@@ -146,8 +204,10 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 	}
 	// Refuse to restore while the mount is live — restoring the DB
 	// from under a running daemon would lead to inconsistent state.
-	if isProfileMounted(cfg) {
-		return fmt.Errorf("the profile's mount daemon is running; unmount it first (`fusermount -u <mountpoint>` or stop the daemon)")
+	if _, mp, ok, ferr := mountctl.FindByProfile(cfg.ProfileName()); ferr != nil {
+		return ferr // fail closed
+	} else if ok {
+		return fmt.Errorf("profile %s is mounted at %s; unmount it first (`telfs unmount %s`)", cfg.ProfileName(), mp, cfg.ProfileName())
 	}
 	if !*yes {
 		fmt.Printf("This will replace %s with the contents of snapshot msg=%d.\n", cfg.DBPath(), msgID)
@@ -160,19 +220,42 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 			return nil
 		}
 	}
-	client, err := tg.New(cfg)
+	sec, err := readSecret(ctx, cfg, secret.Unlock)
 	if err != nil {
 		return err
 	}
+	defer sec.Zero()
+	client, err := newClientWith(cfg, sec)
+	if err != nil {
+		return err
+	}
+	keys, err := localKeys2(ctx, cfg, sec)
+	if err != nil {
+		return err
+	}
+	// Format 2: a snapshot from before a secret change carries the OLD
+	// key header; keep the CURRENT one so the restored DB still opens
+	// with today's secret.
+	var currentHeader []byte
+	if keys != nil {
+		if m, merr := meta.Open(cfg.DBPath()); merr == nil {
+			_, currentHeader, _ = keyHeaderOf(ctx, m)
+			m.Close()
+		}
+	}
 	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
 		fmt.Printf("Downloading snapshot msg=%d…\n", msgID)
-		data, err := sess.DownloadSnapshot(ctx, msgID)
-		if err != nil {
-			return err
+		var plaintext []byte
+		if keys != nil {
+			plaintext, err = snapshot.DownloadSnapshot2(ctx, sess, keys, msgID)
+		} else {
+			var data []byte
+			if data, err = sess.DownloadSnapshot(ctx, msgID); err == nil {
+				plaintext, err = maybeUnwrapEncrypted(data, sec)
+			}
 		}
-		plaintext, err := maybeUnwrapEncrypted(data)
 		if err != nil {
-			return fmt.Errorf("decrypt snapshot: %w", err)
+			return fmt.Errorf("snapshot %d: %w", msgID, err)
 		}
 		// Backup the existing DB before overwriting. Move the WAL/SHM
 		// sidecars along with the main file — a WAL left behind would
@@ -195,39 +278,17 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 		if err := snapshot.Restore(ctx, plaintext, cfg.DBPath()); err != nil {
 			return err
 		}
+		if len(currentHeader) > 0 {
+			if m, merr := meta.Open(cfg.DBPath()); merr == nil {
+				_ = m.PutKV(ctx, meta.KVKeyHeader, currentHeader)
+				_ = snapshot.RecordSnapID(ctx, m, msgID)
+				m.Close()
+			}
+		}
 		fmt.Printf("Restored snapshot msg=%d → %s\n", msgID, cfg.DBPath())
 		fmt.Println("Mount the profile to see the rolled-back state.")
 		return nil
 	})
-}
-
-// isProfileMounted checks /proc/mounts for any fuse.telfs entry whose
-// mountpoint is a child of the active profile's data dir. Strictly
-// best-effort — we only need to detect the common case.
-func isProfileMounted(cfg *config.Config) bool {
-	f, err := os.Open("/proc/mounts")
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if len(line) == 0 {
-			continue
-		}
-		// fields: src mountpoint fstype options ...
-		var src, mp, fstype string
-		fmt.Sscanf(line, "%s %s %s", &src, &mp, &fstype)
-		if fstype == "fuse.telfs" {
-			// Any fuse.telfs mount blocks restore — we can't reliably
-			// tell from /proc/mounts which profile a mount belongs to,
-			// and rolling back any profile's DB while it's live is
-			// unsafe.
-			return true
-		}
-	}
-	return false
 }
 
 // shortAge prints a duration as "5m", "3h", "12d" — a single

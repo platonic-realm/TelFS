@@ -1,6 +1,12 @@
 {{define "content"}}
 <h2>Your channels</h2>
-{{if .Error}}
+{{if .NeedSecret}}
+<form method="post" action="/channel/list" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  {{template "secretfield" .}}
+  <button type="submit">List my channels</button>
+</form>
+{{else if .Error}}
 <div class="flash error">{{.Error}}</div>
 {{else if not .Channels}}
 <p><em>No channels found. Create a private channel in Telegram first, then re-load.</em></p>

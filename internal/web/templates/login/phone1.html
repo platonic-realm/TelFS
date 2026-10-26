@@ -36,9 +36,10 @@
   <label>Phone number (international, e.g. +14155552671)
     <input type="text" name="phone" required pattern="\+[0-9]+" placeholder="+...">
   </label>
+  {{template "secretfield" .}}
   <button type="submit">Send code</button>
   <a href="/" class="btn">Cancel</a>
 </form>
-<p><small>Telegram will send a 5-digit code via SMS or via the Telegram app's notifications. Active profile: <code>{{.Profile}}</code> — login writes to that profile's <code>session.json</code>.</small></p>
+<p><small>Telegram will send a 5-digit code via SMS or via the Telegram app's notifications. Active profile: <code>{{.Profile}}</code> — login writes that profile's <code>session.enc</code>, encrypted with the profile's secret.</small></p>
 {{end}}
 {{end}}

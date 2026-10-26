@@ -12,6 +12,7 @@ import (
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
 	"telfs/internal/tg"
+	"telfs/internal/wire"
 )
 
 // KVCurrentMsgID is the meta_kv key under which we persist the
@@ -55,6 +56,11 @@ type Manager struct {
 	// encryption enabled. nil → plaintext snapshot (chunk_map still
 	// uses whatever cipher the chunk pipeline has).
 	Cipher crypto.Cipher
+	// Keys, when set, makes this a FORMAT-2 manager: the snapshot body
+	// is sealed under the meta key, posted as a `blob` with an
+	// encrypted caption, and retention follows the locally recorded
+	// snapshot ids (KVSnapMsgIDs) instead of a channel scan.
+	Keys *wire.Keys
 	// Logger receives a one-line update per snapshot attempt; set to nil
 	// to fall back to log.Default.
 	Logger *log.Logger
@@ -226,26 +232,32 @@ func (m *Manager) Once(ctx context.Context) error {
 		return fmt.Errorf("take: %w", err)
 	}
 
-	// If the FS is encrypted, wrap the gzipped blob in an envelope
-	// that bundles the KDF state so recovery can decrypt with just
-	// the user's passphrase. Plaintext filesystems upload the
-	// gzipped DB directly (still compatible with M5-vintage clients).
-	body := snap.Bytes
-	if m.shouldEncrypt() {
-		opts, kerr := loadWrapOpts(ctx, m.Meta)
-		if kerr != nil {
-			return fmt.Errorf("snapshot encryption: %w", kerr)
+	var newID int
+	if m.Keys != nil {
+		if newID, err = m.once2(ctx, snap); err != nil {
+			return err
 		}
-		wrapped, werr := Wrap(m.Cipher, opts, snap.Bytes)
-		if werr != nil {
-			return fmt.Errorf("wrap snapshot: %w", werr)
+	} else {
+		// If the FS is encrypted, wrap the gzipped blob in an envelope
+		// that bundles the KDF state so recovery can decrypt with just
+		// the user's passphrase. Plaintext filesystems upload the
+		// gzipped DB directly (still compatible with M5-vintage clients).
+		body := snap.Bytes
+		if m.shouldEncrypt() {
+			opts, kerr := loadWrapOpts(ctx, m.Meta)
+			if kerr != nil {
+				return fmt.Errorf("snapshot encryption: %w", kerr)
+			}
+			wrapped, werr := Wrap(m.Cipher, opts, snap.Bytes)
+			if werr != nil {
+				return fmt.Errorf("wrap snapshot: %w", werr)
+			}
+			body = wrapped
 		}
-		body = wrapped
-	}
-
-	newID, err := m.Session.UploadSnapshot(ctx, body, snap.JournalSeq, time.Now().Unix(), snap.FSUUID)
-	if err != nil {
-		return fmt.Errorf("upload: %w", err)
+		newID, err = m.Session.UploadSnapshot(ctx, body, snap.JournalSeq, time.Now().Unix(), snap.FSUUID)
+		if err != nil {
+			return fmt.Errorf("upload: %w", err)
+		}
 	}
 	if err := storeCurrentMsgID(ctx, m.Meta, newID); err != nil {
 		return fmt.Errorf("persist new snap msg_id: %w", err)
@@ -269,9 +281,19 @@ func (m *Manager) Once(ctx context.Context) error {
 	} else if pruned > 0 && m.Logger != nil {
 		m.Logger.Printf("[snapshot] pruned %d superseded journal rows", pruned)
 	}
+	// Format 2: record the id and prune by the local list (a bookkeeping
+	// write, so it happens BEFORE the baseline below).
+	if m.Keys != nil {
+		if err := m.pruneRetention2(ctx, newID); err != nil && m.Logger != nil {
+			m.Logger.Printf("[snapshot] retention prune: %v", err)
+		}
+	}
 	// Record the change-detection baseline AFTER our own bookkeeping
 	// writes so they don't count as "new changes" next cycle.
 	m.setBaseline(m.Meta.WriteCounter())
+	if m.Keys != nil {
+		return nil
+	}
 	// Retention pruning: list every snapshot for this fs_uuid, keep the
 	// `retention` newest, delete the rest. Best-effort — if delete
 	// fails the orphan stays on the channel but the FS keeps working;

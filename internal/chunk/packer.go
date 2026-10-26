@@ -78,6 +78,10 @@ type Packer struct {
 	target    int64
 	window    time.Duration
 
+	// wc names, captions and (format 2) indexes each pack. Defaults
+	// to format 1 (`pack-<ns>`, no caption, no index).
+	wc WireCodec
+
 	// pendingIndex mirrors the on-disk pending dir for O(1) reader
 	// fallback lookups. Set via SetPendingIndex from the daemon's
 	// main loop after constructing the index. nil disables — the
@@ -111,12 +115,17 @@ type packReq struct {
 	// wires to the packer.
 	pendingPath string
 	result      chan packResult
+	// hash/codec: format 2 only — the extent's content hash (its AAD,
+	// stored in chunk_map) and the codec it used, for the pack index.
+	hash     []byte
+	codec    string
+	fileSize int64
 }
 
 type packResult struct {
-	msgID     int64
-	packOff   int64
-	err       error
+	msgID   int64
+	packOff int64
+	err     error
 }
 
 // NewPacker constructs a Packer with the given dependencies and
@@ -212,6 +221,17 @@ func (p *Packer) DropInode(ino int64) int {
 	return len(dropped)
 }
 
+// SetWire installs the wire codec (format 2). Call before the first
+// Submit.
+func (p *Packer) SetWire(wc WireCodec) { p.wc = wc }
+
+func (p *Packer) wire() WireCodec {
+	if p.wc == nil {
+		return NewFormat1Codec(nil, nil)
+	}
+	return p.wc
+}
+
 // Submit enqueues a wire for the next packed-blob upload and
 // returns a chan that will deliver the (msgID, packOffset) once
 // the upload lands. The caller MUST receive on the chan — otherwise
@@ -225,18 +245,29 @@ func (p *Packer) DropInode(ino int64) int {
 // the target, Submit wakes the flusher immediately (a "trigger
 // flush" condition complementing the window-elapsed condition).
 func (p *Packer) Submit(ino int64, idx int32, plaintextSize int32, wire []byte, pendingPath string) <-chan packResult {
+	return p.SubmitHashed(ino, idx, plaintextSize, wire, pendingPath, nil, "")
+}
+
+// SubmitHashed is Submit with the format-2 content hash and the codec
+// the extent used.
+func (p *Packer) SubmitHashed(ino int64, idx int32, plaintextSize int32, wire []byte, pendingPath string, hash []byte, codec string) <-chan packResult {
+	return p.submit(packReq{ino: ino, idx: idx, plaintextSize: plaintextSize, wire: wire,
+		pendingPath: pendingPath, hash: hash, codec: codec})
+}
+
+// SubmitFrom is SubmitHashed for the writer, which also knows the file's
+// current size (for the pack index's rebuild facts).
+func (p *Packer) SubmitFrom(ino int64, idx int32, plaintextSize int32, wire []byte, pendingPath string, hash []byte, codec string, fileSize int64) <-chan packResult {
+	return p.submit(packReq{ino: ino, idx: idx, plaintextSize: plaintextSize, wire: wire,
+		pendingPath: pendingPath, hash: hash, codec: codec, fileSize: fileSize})
+}
+
+func (p *Packer) submit(req packReq) <-chan packResult {
 	ch := make(chan packResult, 1)
-	req := packReq{
-		ino:           ino,
-		idx:           idx,
-		plaintextSize: plaintextSize,
-		wire:          wire,
-		pendingPath:   pendingPath,
-		result:        ch,
-	}
+	req.result = ch
 	p.mu.Lock()
 	p.pending = append(p.pending, req)
-	p.bufBytes += int64(len(wire))
+	p.bufBytes += int64(len(req.wire))
 	overTarget := p.bufBytes >= p.target
 	p.mu.Unlock()
 	if overTarget {
@@ -344,12 +375,25 @@ func (p *Packer) flush() {
 	// Assemble blob. Per-chunk pack_offset is the running prefix sum.
 	var buf bytes.Buffer
 	offsets := make([]int64, len(batch))
+	items := make([]PackItem, len(batch))
 	for i, r := range batch {
 		offsets[i] = int64(buf.Len())
 		buf.Write(r.wire)
+		items[i] = PackItem{Ino: r.ino, Idx: r.idx, Off: offsets[i], WLen: int32(len(r.wire)),
+			Len: int64(r.plaintextSize), Hash: r.hash, Codec: r.codec, FileSize: r.fileSize}
 	}
-
-	name := fmt.Sprintf("pack-%d", time.Now().UnixNano())
+	// Name, caption and (format 2) the encrypted contents index that
+	// goes after the extents (feature 10: a pack describes itself).
+	tail, name, caption, derr := p.wire().PackDoc(context.Background(), items, int64(buf.Len()))
+	if derr != nil {
+		fmt.Fprintf(os.Stderr, "[packer] describe pack (%d chunks): %v\n", len(batch), derr)
+		for _, r := range batch {
+			r.result <- packResult{err: fmt.Errorf("packer describe: %w", derr)}
+			close(r.result)
+		}
+		return
+	}
+	buf.Write(tail)
 	// Uploads use a long-deadline context so a stuck MTProto
 	// connection — where TCP send buffer is queued but Telegram
 	// isn't acking, gotd has no app-level timeout — doesn't wedge
@@ -391,7 +435,7 @@ func (p *Packer) flush() {
 	// the bytes.Buffer was drained.
 	blobBytes := buf.Bytes()
 	blobSize := len(blobBytes)
-	msgID, err := uploadWithRetry(uploadCtx, p.uploader, blobBytes, name, "")
+	msgID, err := uploadWithRetry(uploadCtx, p.uploader, blobBytes, name, caption)
 	if err != nil {
 		metrics.UploadErrors.Inc()
 		fmt.Fprintf(os.Stderr, "[packer] upload (%d chunks, %d bytes): %v\n", len(batch), blobSize, err)
@@ -416,6 +460,7 @@ func (p *Packer) flush() {
 			Size:        r.plaintextSize,
 			PackOffset:  offsets[i],
 			PackSize:    int32(len(r.wire)),
+			Hash:        r.hash,
 		}
 		if err := p.meta.PutChunk(context.Background(), c); err != nil {
 			// FK violation = the inode was unlinked between our

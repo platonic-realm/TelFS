@@ -36,22 +36,33 @@ type ChannelMessage struct {
 	SnapCap    SnapshotCaption
 	JnlCap     JournalCaption // populated when Kind == KindJournal
 	RawCaption string
+	DocName    string // the document's filename attribute (HasDoc only)
+	DocSize    int64  // the document's size in bytes (HasDoc only)
 }
 
 // WalkChannelMessages calls fn for every message in the configured
 // channel, newest-first, up to a soft cap of pageLimit*100 messages.
 // fn may return ErrStopWalk to halt iteration early.
 func (s *Session) WalkChannelMessages(ctx context.Context, pageLimit int, fn func(ChannelMessage) error) error {
+	_, err := s.WalkChannelMessagesExhaust(ctx, pageLimit, fn)
+	return err
+}
+
+// WalkChannelMessagesExhaust is WalkChannelMessages that also reports
+// whether the walk reached the START of the channel (exhausted = true)
+// rather than stopping at the page cap or on ErrStopWalk — what a scan
+// that must not be silently truncated needs to know.
+func (s *Session) WalkChannelMessagesExhaust(ctx context.Context, pageLimit int, fn func(ChannelMessage) error) (exhausted bool, err error) {
 	if pageLimit <= 0 {
 		pageLimit = 50
 	}
 	peer, _, err := s.channelPeer()
 	if err != nil {
-		return err
+		return false, err
 	}
 	api, err := s.currentAPI()
 	if err != nil {
-		return err
+		return false, err
 	}
 	offsetID := 0
 	for page := 0; page < pageLimit; page++ {
@@ -61,11 +72,11 @@ func (s *Session) WalkChannelMessages(ctx context.Context, pageLimit int, fn fun
 			Limit:    100,
 		})
 		if err != nil {
-			return fmt.Errorf("get history page %d: %w", page, err)
+			return false, fmt.Errorf("get history page %d: %w", page, err)
 		}
 		msgs := extractMessages(res)
 		if len(msgs) == 0 {
-			return nil
+			return true, nil
 		}
 		for _, m := range msgs {
 			msg, ok := m.(*tg.Message)
@@ -75,20 +86,20 @@ func (s *Session) WalkChannelMessages(ctx context.Context, pageLimit int, fn fun
 			cm := classifyMessage(msg)
 			if err := fn(cm); err != nil {
 				if err == ErrStopWalk {
-					return nil
+					return false, nil
 				}
-				return err
+				return false, err
 			}
 		}
 		next, ok := lastMessageID(msgs)
 		if !ok {
 			// Page of nothing but unidentifiable entries — can't
 			// advance the cursor, so stop rather than loop forever.
-			return nil
+			return false, nil
 		}
 		offsetID = next
 	}
-	return nil
+	return false, nil
 }
 
 // lastMessageID returns the ID of the last message in a page regardless
@@ -121,11 +132,20 @@ func (stopWalk) Error() string { return "stop walk" }
 // identify is KindUnknown (left alone by GC).
 func classifyMessage(msg *tg.Message) ChannelMessage {
 	cm := ChannelMessage{ID: msg.ID, Date: msg.Date, RawCaption: msg.Message}
-	if _, ok := msg.Media.(*tg.MessageMediaDocument); !ok {
+	media, ok := msg.Media.(*tg.MessageMediaDocument)
+	if !ok {
 		// Plain text or other media — not a TelFS object.
 		return cm
 	}
 	cm.HasDoc = true
+	if doc, ok := media.Document.(*tg.Document); ok {
+		cm.DocSize = doc.Size
+		for _, a := range doc.Attributes {
+			if fn, ok := a.(*tg.DocumentAttributeFilename); ok {
+				cm.DocName = fn.FileName
+			}
+		}
+	}
 	if strings.TrimSpace(msg.Message) == "" {
 		cm.Kind = KindChunk
 		return cm

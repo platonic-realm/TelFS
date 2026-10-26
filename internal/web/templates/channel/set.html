@@ -5,6 +5,7 @@
   <label>Channel ID
     <input type="text" name="id" required pattern="-?[0-9]+" inputmode="numeric" placeholder="3930934278 or -1003930934278">
   </label>
+  {{template "secretfield" .}}
   <button type="submit">Set</button>
   <a href="/channel" class="btn">Cancel</a>
 </form>

@@ -50,6 +50,25 @@
           <button type="submit">Save credentials</button>
         </form>
 
+        {{else if eq .Key "secret"}}
+        <form method="post" action="/profiles/{{$.Active}}/secret" autocomplete="off">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="from" value="setup">
+          <fieldset>
+            <legend>Where the secret comes from</legend>
+            <label><input type="radio" name="source" value="keepassxc" {{if eq $.SecretSource "keepassxc"}}checked{{end}}> keepassxc — the running KeePassXC gives it (Secret Service)</label>
+            <label><input type="radio" name="source" value="file" {{if eq $.SecretSource "file"}}checked{{end}}> file — a secret file (boot mounts; on S9 written by svc-secret)</label>
+            <label><input type="radio" name="source" value="prompt" {{if eq $.SecretSource "prompt"}}checked{{end}}> prompt — typed in each time</label>
+          </fieldset>
+          <label>KeePassXC entry (path inside the exposed group)
+            <input type="text" name="entry" value="{{$.SecretEntry}}" placeholder="Services/TelFS/home">
+          </label>
+          <label>Secret file (absolute path)
+            <input type="text" name="file" value="{{$.SecretFile}}" placeholder="/srv/services/&lt;group&gt;/&lt;service&gt;/secrets/telfs">
+          </label>
+          <button type="submit">Save source</button>
+        </form>
+
         {{else if eq .Key "auth"}}
           {{if eq $.AuthStage "code"}}
           <p><span class="pill acc">code sent</span> Telegram just sent a 5-digit code to your account (SMS or the app's notifications). Enter it below.</p>
@@ -78,6 +97,7 @@
             <label>Phone number (international, e.g. +14155552671)
               <input type="text" name="phone" required pattern="\+[0-9]+" placeholder="+..." autofocus>
             </label>
+            {{template "secretfield" $}}
             <button type="submit">Send code</button>
           </form>
           {{end}}
@@ -92,30 +112,30 @@
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
             <input type="hidden" name="from" value="setup">
             <label>Channel id <input type="text" name="id" required pattern="-?[0-9]+" inputmode="numeric" placeholder="3930934278 or -1003930934278"></label>
+            {{template "secretfield" $}}
             <button type="submit">Bind channel</button>
           </form>
         </details>
 
-        {{else if eq .Key "encrypt"}}
-        <form method="post" action="/encrypt/init" autocomplete="off">
+        {{else if eq .Key "init"}}
+        <form method="post" action="/setup/init" autocomplete="off" data-busy="Creating…">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <input type="hidden" name="from" value="setup">
-          <label>Passphrase <input type="password" name="passphrase" required autofocus></label>
-          <label>Confirm <input type="password" name="passphrase_confirm" required></label>
-          <button type="submit">Enable encryption</button>
-        </form>
-
-        {{else if eq .Key "compress"}}
-        <form method="post" action="/compression/init">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <input type="hidden" name="from" value="setup">
+          <label>Chunk size
+            <select name="chunk_size">
+              <option value="4MiB" selected>4 MiB (default)</option>
+              <option value="16MiB">16 MiB</option>
+              <option value="1MiB">1 MiB</option>
+            </select>
+          </label>
           <fieldset>
-            <legend>Codec</legend>
-            <label><input type="radio" name="codec" value="none" {{if eq $.Codec "none"}}checked{{end}}> none — zero CPU cost</label>
-            <label><input type="radio" name="codec" value="zstd" {{if eq $.Codec "zstd"}}checked{{end}}> zstd — wins on text/logs/code</label>
+            <legend>Compression</legend>
+            <label><input type="radio" name="codec" value="none" {{if ne $.Codec "zstd"}}checked{{end}}> none — zero CPU cost</label>
+            <label><input type="radio" name="codec" value="zstd" {{if eq $.Codec "zstd"}}checked{{end}}> zstd — wins on text, code, documents</label>
           </fieldset>
-          <button type="submit">Set codec</button>
+          {{template "secretfield" $}}
+          <button type="submit">Create the filesystem</button>
         </form>
+        <p><small>Derives the key with Argon2id over 2 GiB (about a second). Afterwards run <code>telfs key export</code> and keep the export with the secret — together they open this filesystem from the channel alone. If the channel already holds a TelFS filesystem, skip this step: mounting recovers it.</small></p>
 
         {{else if eq .Key "mount"}}
         <form method="post" action="/mount/start" autocomplete="off">
@@ -125,9 +145,9 @@
           <label>Mountpoint (absolute path to an existing empty dir)
             <input type="text" name="mountpoint" required value="{{$.Mountpoint}}" autofocus>
           </label>
-          {{if $.CryptoOn}}
-          <label>Passphrase
-            <input type="password" name="passphrase" required>
+          {{if $.SecretPrompt}}
+          <label>Secret for this profile
+            <input type="password" name="passphrase" required autocomplete="current-password">
           </label>
           {{end}}
           <button type="submit">Mount</button>
@@ -155,9 +175,9 @@
     <h4>What this wizard does</h4>
     <p><small>
       Each step is the real form — creating the profile, saving API
-      credentials, running the phone login, binding a channel, the
-      optional encryption/compression choices, and starting the first
-      mount all happen right here. State (done / skipped) is derived
+      credentials, choosing where the secret comes from, running the
+      phone login, binding a channel, creating the filesystem, and
+      starting the first mount all happen right here. State (done / skipped) is derived
       from the filesystem on every load, so refreshing always shows
       the current truth; the same operations remain available on their
       dedicated pages for later changes.

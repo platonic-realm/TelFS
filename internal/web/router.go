@@ -29,7 +29,9 @@ func (s *Server) registerRoutes() {
 	// HTMX-lazy channel-picker for the channel step.
 	s.mux.HandleFunc("GET /setup", s.setupWizard)
 	s.mux.HandleFunc("POST /setup/skip", s.setupSkip)
+	s.mux.HandleFunc("POST /setup/init", s.setupInit)
 	s.mux.HandleFunc("GET /setup/channels", s.setupChannels)
+	s.mux.HandleFunc("POST /setup/channels", s.setupChannels)
 
 	// Profile CRUD.
 	s.mux.HandleFunc("GET /profiles", s.profilesList)
@@ -37,6 +39,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /profiles", s.profilesCreate)
 	s.mux.HandleFunc("GET /profiles/{name}", s.profilesShow)
 	s.mux.HandleFunc("POST /profiles/{name}/api", s.profilesSetAPI)
+	s.mux.HandleFunc("POST /profiles/{name}/secret", s.profilesSetSecret)
 	s.mux.HandleFunc("POST /profiles/{name}/use", s.profilesUse)
 	s.mux.HandleFunc("POST /profiles/{name}/delete", s.profilesDelete)
 	// POST + CSRF, not GET: the bundle contains session.json — a live
@@ -62,6 +65,7 @@ func (s *Server) registerRoutes() {
 	// Channel.
 	s.mux.HandleFunc("GET /channel", s.channelShow)
 	s.mux.HandleFunc("GET /channel/list", s.channelList)
+	s.mux.HandleFunc("POST /channel/list", s.channelList)
 	s.mux.HandleFunc("GET /channel/set", s.channelSetForm)
 	s.mux.HandleFunc("POST /channel/set", s.channelSetSubmit)
 

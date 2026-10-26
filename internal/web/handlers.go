@@ -141,9 +141,11 @@ type setupWizardData struct {
 	Active     string // active profile name ("" before the profile step)
 	APIID      int    // pre-fill for the api step
 	AuthStage  string // "" (phone form) | "code" | "password" — in-flight login
-	CryptoOn   bool   // mount step: show the passphrase field
-	Codec      string // compress step: current codec pre-selection
+	CryptoOn   bool   // (kept for templates of format-1 profiles)
+	Codec      string // init step: current codec pre-selection
 	Mountpoint string // mount step: suggested default
+	// Secret step: the configured source.
+	SecretSource, SecretFile, SecretEntry string
 }
 
 const setupSkipCookie = "telfs_setup_skip"
@@ -198,6 +200,11 @@ func (s *Server) setupWizard(w http.ResponseWriter, r *http.Request) {
 	}
 	pageData.CryptoOn = d.Crypto.Enabled
 	pageData.Codec = "none"
+	if cfg, err := config.Load(); err == nil {
+		pageData.SecretSource = cfg.Secret.EffectiveSource()
+		pageData.SecretFile = cfg.Secret.File
+		pageData.SecretEntry = cfg.Secret.Entry
+	}
 	if cfg, err := config.Load(); err == nil && fileExists(cfg.DBPath()) {
 		if mstore, err := meta.Open(cfg.DBPath()); err == nil {
 			if codec, err := mstore.CompressionCodec(r.Context()); err == nil {
@@ -308,7 +315,7 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 			Label string
 		}{
 			{cfg.ConfigPath(), "config.toml"},
-			{cfg.SessionPath(), "session.json"},
+			{cfg.SessionPath(), "session.enc"},
 			{cfg.DBPath(), "db.sqlite"},
 		} {
 			if info, err := os.Stat(f.Path); err == nil {
@@ -369,14 +376,13 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 	// skipped the code form entirely).
 	sessionOK := cfg != nil && fileExists(cfg.SessionPath()) && cfg.Identity != nil
 	channelOK := d.Channel.Set
-	// Encryption is OPTIONAL — mark as "done" if the FS is either
-	// explicitly encrypted OR has chunks already (so opting in later
-	// is no longer possible).
-	encryptionOK := d.Crypto.Enabled || hasChunksFor(cfg)
-	// Compression is OPTIONAL — same lock-after-first-chunk rule.
-	// "Done" means either non-default codec chosen OR chunks already
-	// exist (so the codec is now immutable).
-	compressionOK := compressionConfigured(cfg) || hasChunksFor(cfg)
+	// The secret step is done once a source is written to config.toml
+	// or a session exists (the first login set the secret).
+	secretOK := cfg != nil && (cfg.Secret.Source != "" || cfg.HasSession())
+	// The filesystem step is done once a local DB exists — made by
+	// `init` (a new filesystem) or by a mount's recovery (an existing
+	// one). Skipping it means "this channel already holds a filesystem".
+	fsOK := cfg != nil && fileExists(cfg.DBPath())
 	// "Mount it" is done when THIS profile has written chunks — a
 	// reliable signal that the FS has been mounted at some point.
 	// (Checking active /proc/mounts entries is unreliable because
@@ -412,13 +418,23 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 			CTA:     "Open profile settings",
 		},
 		{
+			Key:     "secret",
+			Label:   "Choose where the secret comes from",
+			Done:    secretOK,
+			Href:    apiHref,
+			Why:     "One secret per profile encrypts the Telegram session and the filesystem key.",
+			Detail:  "TelFS never stores the secret itself — only WHERE it comes from. \"prompt\": you type it (fine for occasional use). \"file\": a file only you (and the service's group) can read — what boot mounts use; on S9 svc-secret writes it from KeePassXC. \"keepassxc\": TelFS asks the running KeePassXC for the entry over the Secret Service, as svc-secret does. A KeePassXC-generated password of 32+ characters is the safe choice: the filesystem's key header is readable on the channel, so a short secret can be guessed offline.",
+			Outcome: "config.toml's [secret] names the source; the next steps use it.",
+			CTA:     "Open profile settings",
+		},
+		{
 			Key:     "auth",
 			Label:   "Authenticate (phone)",
 			Done:    sessionOK,
 			Href:    "/login/phone",
 			Why:     "Phone → code → 2FA password (if set). The first login locks the profile to your account.",
 			Detail:  "Telegram sends a 5-digit code via SMS or the app's notifications; accounts with two-step verification also enter their password. The resulting session locks the profile to your account.",
-			Outcome: "session.json appears in the profile directory; subsequent mounts won't prompt for a code.",
+			Outcome: "session.enc (encrypted with the profile's secret) appears in the profile directory; subsequent mounts won't prompt for a code.",
 			CTA:     "Open login page",
 		},
 		{
@@ -432,26 +448,15 @@ func buildSetupChecklist(d dashboardData) setupChecklist {
 			CTA:     "Open channel page",
 		},
 		{
-			Key:      "encrypt",
-			Label:    "Encrypt the FS",
-			Done:     encryptionOK,
-			Href:     "/encrypt",
-			Why:      "AES-256-GCM with an Argon2id-derived key. Once any chunk exists, this becomes a one-way choice.",
-			Detail:   "Optional but you can only enable it on a fresh filesystem (no chunks yet). Encrypts chunk bytes AND the snapshot blob's metadata. Pre-v0.14 used aes-gcm-v1 (passphrase encrypts everything); from v0.14 onward, aes-gcm-v2 wraps a per-FS DEK so the passphrase can be rotated later without re-uploading chunks. Skipping this step leaves the FS plaintext — Telegram operators and channel members can read your files.",
-			Outcome:  "telfs encrypt status reports mode=aes-gcm-v2 and rotation is available.",
+			Key:      "init",
+			Label:    "Create the filesystem",
+			Done:     fsOK,
+			Href:     "/setup",
+			Why:      "A new filesystem on this channel — always encrypted. Skip this if the channel already holds one: the mount recovers it.",
+			Detail:   "Creates the filesystem's random data key, wraps it under the profile's secret, posts the key header as a pinned message in the channel, and takes the first snapshot. Everything TelFS posts from now on is encrypted: chunks, captions, snapshots and the journal; only message sizes and times stay visible. The chunk size and compression are fixed from here on. Zstd shrinks text, code and documents before encryption; media and archives gain nothing.",
+			Outcome:  "The key message is pinned in the channel; `telfs key export` prints the export to keep with the secret.",
 			Optional: true,
-			CTA:      "Set a passphrase",
-		},
-		{
-			Key:      "compress",
-			Label:    "Pick a compression codec",
-			Done:     compressionOK,
-			Href:     "/compression",
-			Why:      "Default is none. Zstd saves bandwidth/storage on compressible data; the choice locks once chunks exist.",
-			Detail:   "Compression runs before encryption + upload. None keeps bytes as-is (zero CPU cost). Zstd usually pays for itself on logs, text, code, JSON, and uncompressed media; binary or already-compressed formats (JPEG/MP4/zip) get marginal-to-no win. The choice is recorded in meta_kv and becomes immutable as soon as the first chunk is written.",
-			Outcome:  "/compression reports the chosen codec; subsequent writes feed through it.",
-			Optional: true,
-			CTA:      "Choose a codec",
+			CTA:      "Stay on the wizard",
 		},
 		{
 			Key:     "mount",
@@ -645,15 +650,26 @@ type pageBase struct {
 	CSRF  string
 	Flash flashData
 	Path  string
+	// SecretPrompt: the active profile types its secret, so every form
+	// that talks to Telegram carries a secret field (derive, act, drop).
+	SecretPrompt bool
+	// NewSecret: the profile has no session yet — its first login SETS
+	// the secret (field asked twice).
+	NewSecret bool
 }
 
 func (s *Server) basePage(w http.ResponseWriter, r *http.Request) pageBase {
 	kind, msg := ConsumeFlash(w, r)
-	return pageBase{
+	pb := pageBase{
 		CSRF:  s.state.EnsureCSRF(w, r),
 		Flash: flashData{Kind: kind, Msg: msg},
 		Path:  r.URL.Path,
 	}
+	if cfg, err := config.Load(); err == nil {
+		pb.SecretPrompt = secretIsPrompt(cfg)
+		pb.NewSecret = !cfg.HasSession()
+	}
+	return pb
 }
 
 type profilesNewData struct {
@@ -723,6 +739,10 @@ type profileShowData struct {
 	HasMeta    bool
 	Crypto     cryptoView
 	ChunkSize  int64
+	Format     int
+	// Secret source ([secret]) and session state.
+	SecretSource, SecretFile, SecretEntry string
+	HasSession, LegacySession             bool
 }
 
 func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
@@ -750,6 +770,9 @@ func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
 			d.Channel = channelView{Set: true, ID: cfg.Channel.ID, Title: cfg.Channel.Title}
 		}
 		d.Identity = cfg.Identity.Label()
+		d.SecretSource = cfg.Secret.EffectiveSource()
+		d.SecretFile, d.SecretEntry = cfg.Secret.File, cfg.Secret.Entry
+		d.HasSession, d.LegacySession = cfg.HasSession(), cfg.HasLegacySession()
 		// Stat-before-open so just viewing this profile doesn't
 		// auto-bootstrap a db.sqlite (meta.Open creates one when
 		// missing). Only inspect the meta when it already exists.
@@ -764,6 +787,7 @@ func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
 				if cs, err := mstore.ChunkSize(ctx); err == nil {
 					d.ChunkSize = cs
 				}
+				d.Format, _ = mstore.Format(ctx)
 				mstore.Close()
 			}
 		}
@@ -897,7 +921,7 @@ func (s *Server) profilesDelete(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/profiles", http.StatusSeeOther)
 }
 
-var bundleFiles = []string{config.ConfigFile, config.SessionFile, config.DBFile}
+var bundleFiles = []string{config.ConfigFile, config.SessionEncFile, config.DBFile} // never a plaintext session.json
 
 func (s *Server) profilesExport(w http.ResponseWriter, r *http.Request) {
 	if err := s.state.CheckCSRF(r); err != nil {

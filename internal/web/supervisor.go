@@ -1,9 +1,11 @@
 package web
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 
 	"telfs/internal/config"
 	"telfs/internal/mountctl"
+	"telfs/internal/secret"
 )
 
 // MountProcess describes one telfs mount daemon. Two flavors:
@@ -154,7 +157,11 @@ func (s *Supervisor) Get(profile string) *MountProcess {
 type StartOpts struct {
 	Profile    string
 	Mountpoint string
-	Passphrase string // optional; pass-through via TELFS_PASSPHRASE
+	// Passphrase, for a prompt-source profile, is handed to the daemon
+	// through an inherited pipe (fd 3, `--secret-fd 3`) — never the
+	// environment (decision 4d). Profiles with a file or KeePassXC source
+	// need nothing: the daemon reads its own source.
+	Passphrase string
 	Readonly   bool
 	AllowOther bool
 	Debug      bool
@@ -258,6 +265,17 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 		metricsAddr = DefaultMetricsAddr
 	}
 	args = append(args, "--metrics-addr", metricsAddr)
+	var secretR, secretW *os.File
+	if opts.Passphrase != "" {
+		r, w, perr := os.Pipe()
+		if perr != nil {
+			logFile.Close()
+			unreserve()
+			return nil, fmt.Errorf("secret pipe: %w", perr)
+		}
+		secretR, secretW = r, w
+		args = append(args, "--secret-fd", "3")
+	}
 	args = append(args, opts.Mountpoint)
 
 	cmd := exec.Command(s.selfPath, args...)
@@ -269,19 +287,30 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	env := os.Environ()
-	env = scrubEnv(env, config.EnvProfile, "TELFS_PASSPHRASE")
+	env = scrubEnv(env, config.EnvProfile, secret.EnvPassphrase)
 	if opts.Profile != "" && opts.Profile != "(default)" {
 		env = append(env, config.EnvProfile+"="+opts.Profile)
 	}
-	if opts.Passphrase != "" {
-		env = append(env, "TELFS_PASSPHRASE="+opts.Passphrase)
-	}
 	cmd.Env = env
+	if secretR != nil {
+		cmd.ExtraFiles = []*os.File{secretR} // becomes fd 3 in the child
+	}
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
+		if secretR != nil {
+			secretR.Close()
+			secretW.Close()
+		}
 		unreserve()
 		return nil, fmt.Errorf("spawn %s mount: %w", s.selfPath, err)
+	}
+	if secretR != nil {
+		// The child holds its copy of the read end; write the secret,
+		// close our ends so it sees EOF after one read.
+		secretR.Close()
+		_, _ = secretW.Write([]byte(opts.Passphrase))
+		secretW.Close()
 	}
 
 	mp := &MountProcess{
@@ -560,6 +589,11 @@ func (s *Supervisor) Reconcile() {
 // resolves to a regular file — daemons started with stdout
 // redirected to a file (the supervisor pattern, or
 // `telfs mount ... > log.txt`).
+//
+// Since P1 daemons are non-dumpable: their environ and fd/1 are hidden.
+// The profile then comes from the mount source ("telfs:<profile>",
+// readable by everyone in /proc/mounts) and the log path from the
+// daemon itself (its /status endpoint reads its own /proc/self/fd/1).
 func adoptFromProc(mountpoint string) *MountProcess {
 	pid, found := mountctl.FindDaemonPid(mountpoint)
 	if !found {
@@ -570,11 +604,46 @@ func adoptFromProc(mountpoint string) *MountProcess {
 		Pid:        pid,
 		Adopted:    true,
 		done:       make(chan struct{}),
-		Profile:    mountctl.ReadEnvVar(pid, config.EnvProfile),
 		Started:    mountctl.ProcStartTime(pid),
 		LogPath:    mountctl.ResolveStdoutLog(pid),
 	}
+	for _, m := range mountctl.ScanMounts() {
+		if m.Point == mountpoint {
+			if p, ok := mountctl.ProfileOf(m); ok {
+				mp.Profile = p
+			}
+		}
+	}
+	if mp.LogPath == "" {
+		if st, err := fetchDaemonStatus(DefaultMetricsAddr); err == nil && st.Mountpoint == mountpoint {
+			mp.LogPath = st.LogPath
+		}
+	}
 	return mp
+}
+
+// daemonStatus is the mount daemon's /status JSON.
+type daemonStatus struct {
+	Profile    string `json:"profile"`
+	Pid        int    `json:"pid"`
+	Mountpoint string `json:"mountpoint"`
+	LogPath    string `json:"log_path"`
+	Format     int    `json:"format"`
+}
+
+func fetchDaemonStatus(addr string) (daemonStatus, error) {
+	var st daemonStatus
+	c := http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get("http://" + addr + "/status")
+	if err != nil {
+		return st, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return st, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&st)
+	return st, err
 }
 
 // scanProcMounts is the supervisor's local name for the shared

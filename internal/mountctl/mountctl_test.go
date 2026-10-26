@@ -2,6 +2,7 @@ package mountctl
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,7 +66,24 @@ func TestStopDaemonNoPidNoMount(t *testing.T) {
 
 // TestFindByProfileEmpty: empty profile never matches.
 func TestFindByProfileEmpty(t *testing.T) {
-	if _, _, found := FindByProfile(""); found {
-		t.Fatal("FindByProfile(\"\") reported a match")
+	if _, _, found, err := FindByProfile(""); found || err != nil {
+		t.Fatalf("FindByProfile(\"\") = found %v, err %v", found, err)
+	}
+}
+
+func TestProfileOfSource(t *testing.T) {
+	if p, ok := ProfileOf(Mount{Source: SourceFor("home"), Point: "/x"}); !ok || p != "home" {
+		t.Fatalf("telfs:home → %q %v", p, ok)
+	}
+	// A v0.22-style source with no daemon behind it: unknown.
+	if _, ok := ProfileOf(Mount{Source: "telfs", Point: "/definitely/not/mounted"}); ok {
+		t.Fatal("a plain \"telfs\" source without a readable daemon must be unknown")
+	}
+	if got := unescapeMount(`/home/a\040b`); got != "/home/a b" {
+		t.Fatalf("unescape: %q", got)
+	}
+	e := &ErrUnknownMount{Mountpoints: []string{"/m"}}
+	if !strings.Contains(e.Error(), "/m") {
+		t.Fatal(e.Error())
 	}
 }

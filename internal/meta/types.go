@@ -72,6 +72,11 @@ type Chunk struct {
 	// without migration, so older filesystems keep working.
 	PackOffset int64
 	PackSize   int32
+	// Hash is the chunk's keyed content hash on format-2 filesystems
+	// (HMAC-SHA256 under the FS hash key): the AAD its wire is sealed
+	// under, rechecked after decryption, and its dedup identity. Nil
+	// on format 1 (column NULL).
+	Hash []byte
 }
 
 // IsPacked reports whether this chunk is an extent into a shared

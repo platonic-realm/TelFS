@@ -24,10 +24,11 @@ const SaltLen = 16
 // meta_kv['crypto_argon_params'] so a future upgrade to stronger
 // parameters doesn't lock out existing filesystems.
 //
-// Defaults: time=3, memory=64 MiB, threads=4. OWASP's 2024 baseline.
-// Peak RAM at derivation = memory * threads = 256 MiB; users on
-// memory-constrained machines may want to dial this down at
-// `encrypt init` time.
+// Defaults (format 1): time=3, memory=64 MiB, threads=4 — RFC 9106's
+// low-memory option (33 ms on S9). Memory is the TOTAL in KiB; the
+// threads split it into lanes, so peak RAM is 64 MiB, not 256 MiB (an
+// earlier comment here said memory × threads; that was wrong). Format 2
+// uses DefaultArgonParamsV2 (1 pass over 2 GiB).
 type ArgonParams struct {
 	Time    uint32 `json:"time"`
 	Memory  uint32 `json:"memory"` // in KiB

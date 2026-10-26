@@ -32,22 +32,31 @@ type Client struct {
 	cfg       *config.Config
 	tracker   *Tracker
 	rateLimit *RateLimiter
+	// storage holds the MTProto session. Since P1 it is always the
+	// encrypted session.enc (internal/sessionstore); the caller opens
+	// it with the profile's secret and passes it in.
+	storage session.Storage
 }
 
 // ErrNotAuthorized is returned by RunSession when no valid local session
 // file exists. Callers should invoke Login first.
 var ErrNotAuthorized = errors.New("not authorized — run 'telfs login' first")
 
-// New constructs a Client. Returns an error if the config is missing the
-// Telegram API credentials.
-func New(cfg *config.Config) (*Client, error) {
+// New constructs a Client over the given session storage (the profile's
+// session.enc, opened with its secret). Returns an error if the config
+// is missing the Telegram API credentials or no storage is given.
+func New(cfg *config.Config, storage session.Storage) (*Client, error) {
 	if err := cfg.RequireAPI(); err != nil {
 		return nil, err
+	}
+	if storage == nil {
+		return nil, errors.New("tg: no session storage (open session.enc with the profile's secret first)")
 	}
 	return &Client{
 		cfg:       cfg,
 		tracker:   NewTracker(128),
 		rateLimit: NewRateLimiter(0, 0),
+		storage:   storage,
 	}, nil
 }
 
@@ -68,7 +77,7 @@ func (c *Client) RateLimiter() *RateLimiter { return c.rateLimit }
 // up to MaxFloodWait (30 min) and logs progress so a long sleep is
 // visible in the daemon log instead of looking wedged.
 func (c *Client) newTG() *telegram.Client {
-	storage := &session.FileStorage{Path: c.cfg.SessionPath()}
+	storage := c.storage
 	// Middleware order is bottom-up: the LAST entry in the slice
 	// wraps the lowest level. TrackingMiddleware sits BELOW
 	// FloodWaiter so it records the raw FLOOD_WAIT response (before

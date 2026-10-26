@@ -15,9 +15,9 @@
   <label>Mountpoint (absolute path to an existing empty dir)
     <input type="text" name="mountpoint" placeholder="/home/you/External" required>
   </label>
-  <label>Passphrase (only if this FS is encrypted)
-    <input type="password" name="passphrase">
-    <small>Pass-through via <code>TELFS_PASSPHRASE</code>. Skipped for plaintext FSes.</small>
+  <label>Secret (only for a profile whose secret is typed in)
+    <input type="password" name="passphrase" autocomplete="current-password">
+    <small>Handed to the mount daemon through a pipe, never its environment. Profiles reading the secret from a file or KeePassXC ignore this field — the daemon reads its own source.</small>
   </label>
   <fieldset>
     <legend>Flags</legend>

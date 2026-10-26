@@ -21,6 +21,7 @@ package meta
 //     nlink hits 0; chunks/xattrs cascade)
 //   - rename: Rename      — moves a dirent
 //   - setsize: SetSize    — explicit truncate (size change)
+//   - ref:    a format-2 dedup hit referencing an existing chunk
 //
 // Not journaled (yet): xattr ops, generic SetAttrs, chunk_map updates.
 // Chunks are independently recoverable from the channel itself; xattrs
@@ -52,6 +53,18 @@ type JournalOp struct {
 	// Sparse travels with `create` and `setsparse` so replayed sparse
 	// files keep hole-reads-as-zeros semantics instead of EIO.
 	Sparse bool `json:"sparse,omitempty"`
+
+	// ref: a dedup hit made slot (Ino, Idx) reference an EXISTING
+	// chunk message (format 2, decision N2). Without this op the slot
+	// would exist only in snapshots — a file whose content was entirely
+	// deduplicated posts no message of its own, so neither a journal
+	// replay nor a rebuild from captions could restore it.
+	Idx        int32  `json:"idx,omitempty"`
+	MsgID      int64  `json:"msg,omitempty"`
+	PackOffset int64  `json:"poff,omitempty"`
+	PackSize   int32  `json:"psize,omitempty"`
+	ChunkLen   int32  `json:"clen,omitempty"`
+	Hash       []byte `json:"h,omitempty"`
 }
 
 // Journal op type tags. Kept short to minimize per-op payload size on
@@ -63,4 +76,5 @@ const (
 	OpRename      = "rename"
 	OpSetSize     = "setsize"
 	OpSetSparse   = "setsparse"
+	OpRef         = "ref"
 )

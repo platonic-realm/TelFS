@@ -1,5 +1,11 @@
 # 10 — Crypto and compression
 
+> **Since P1 (October 2026) this chapter describes format 1** — the
+> filesystems created up to v0.22. New filesystems use format 2, which is
+> always encrypted, binds chunks to a keyed content hash instead of
+> `(ino, idx)`, and encrypts captions and the journal too: see
+> [chapter 17](17-format2-security-base.md).
+
 Both are optional; the FS works without either. Both have to be
 chosen at first mount and can never change afterward, because every
 chunk on the channel is encoded with the current settings. A reader

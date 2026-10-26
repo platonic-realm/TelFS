@@ -19,18 +19,63 @@ import (
 func (s *Store) PutChunk(ctx context.Context, c Chunk) error {
 	packOff, packSize := nullablePackFields(c)
 	_, err := s.execWithRetry(ctx,
-		`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size)
-		   VALUES (?,?,?,?,?,?)
+		`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size, hash)
+		   VALUES (?,?,?,?,?,?,?)
 		 ON CONFLICT(ino, idx) DO UPDATE SET
 		   tg_message_id = excluded.tg_message_id,
 		   size          = excluded.size,
 		   pack_offset   = excluded.pack_offset,
-		   pack_size     = excluded.pack_size`,
-		c.Ino, c.Idx, c.TGMessageID, c.Size, packOff, packSize)
+		   pack_size     = excluded.pack_size,
+		   hash          = excluded.hash`,
+		c.Ino, c.Idx, c.TGMessageID, c.Size, packOff, packSize, nullableHash(c.Hash))
 	if err != nil {
 		return fmt.Errorf("put chunk %d/%d: %w", c.Ino, c.Idx, err)
 	}
 	return nil
+}
+
+// chunkCols is the column list every chunk_map read uses; scanChunk
+// matches it.
+const chunkCols = `ino, idx, tg_message_id, size, pack_offset, pack_size, hash`
+
+type rowScanner interface{ Scan(dest ...any) error }
+
+func scanChunk(r rowScanner) (Chunk, error) {
+	var c Chunk
+	var packOff, packSize sql.NullInt64
+	var hash []byte
+	if err := r.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize, &hash); err != nil {
+		return Chunk{}, err
+	}
+	if packSize.Valid {
+		c.PackOffset = packOff.Int64
+		c.PackSize = int32(packSize.Int64)
+	}
+	if len(hash) > 0 {
+		c.Hash = hash
+	}
+	return c, nil
+}
+
+func scanChunks(rows *sql.Rows) ([]Chunk, error) {
+	defer rows.Close()
+	var out []Chunk
+	for rows.Next() {
+		c, err := scanChunk(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// nullableHash stores an empty hash (format 1) as NULL.
+func nullableHash(h []byte) any {
+	if len(h) == 0 {
+		return nil
+	}
+	return h
 }
 
 // nullablePackFields returns SQL NULL placeholders when the chunk is
@@ -46,21 +91,13 @@ func nullablePackFields(c Chunk) (any, any) {
 
 // GetChunk returns the chunk_map entry for (ino, idx), or ErrNotFound.
 func (s *Store) GetChunk(ctx context.Context, ino int64, idx int32) (Chunk, error) {
-	var c Chunk
-	var packOff sql.NullInt64
-	var packSize sql.NullInt64
-	err := s.db.QueryRowContext(ctx,
-		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size FROM chunk_map WHERE ino = ? AND idx = ?`,
-		ino, idx).Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize)
+	c, err := scanChunk(s.db.QueryRowContext(ctx,
+		`SELECT `+chunkCols+` FROM chunk_map WHERE ino = ? AND idx = ?`, ino, idx))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Chunk{}, ErrNotFound
 	}
 	if err != nil {
 		return Chunk{}, fmt.Errorf("get chunk %d/%d: %w", ino, idx, err)
-	}
-	if packSize.Valid {
-		c.PackOffset = packOff.Int64
-		c.PackSize = int32(packSize.Int64)
 	}
 	return c, nil
 }
@@ -73,7 +110,7 @@ func (s *Store) GetChunk(ctx context.Context, ino int64, idx int32) (Chunk, erro
 // files most likely to be read next.
 func (s *Store) PackedExtentsFrom(ctx context.Context, tgMessageID int64, fromOffset int64, limit int) ([]Chunk, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size
+		`SELECT `+chunkCols+`
 		   FROM chunk_map
 		  WHERE tg_message_id = ? AND pack_size IS NOT NULL AND pack_offset >= ?
 		  ORDER BY pack_offset
@@ -82,46 +119,21 @@ func (s *Store) PackedExtentsFrom(ctx context.Context, tgMessageID int64, fromOf
 	if err != nil {
 		return nil, fmt.Errorf("packed extents msg %d: %w", tgMessageID, err)
 	}
-	defer rows.Close()
-	var out []Chunk
-	for rows.Next() {
-		var c Chunk
-		var packOff, packSize sql.NullInt64
-		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize); err != nil {
-			return nil, fmt.Errorf("packed extents msg %d: scan: %w", tgMessageID, err)
-		}
-		if packSize.Valid {
-			c.PackOffset = packOff.Int64
-			c.PackSize = int32(packSize.Int64)
-		}
-		out = append(out, c)
+	out, err := scanChunks(rows)
+	if err != nil {
+		return nil, fmt.Errorf("packed extents msg %d: scan: %w", tgMessageID, err)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ListChunks returns all chunks for an inode in ascending idx order.
 func (s *Store) ListChunks(ctx context.Context, ino int64) ([]Chunk, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size FROM chunk_map WHERE ino = ? ORDER BY idx`, ino)
+		`SELECT `+chunkCols+` FROM chunk_map WHERE ino = ? ORDER BY idx`, ino)
 	if err != nil {
 		return nil, fmt.Errorf("list chunks %d: %w", ino, err)
 	}
-	defer rows.Close()
-	var out []Chunk
-	for rows.Next() {
-		var c Chunk
-		var packOff sql.NullInt64
-		var packSize sql.NullInt64
-		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize); err != nil {
-			return nil, err
-		}
-		if packSize.Valid {
-			c.PackOffset = packOff.Int64
-			c.PackSize = int32(packSize.Int64)
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return scanChunks(rows)
 }
 
 // GetChunksRange returns chunk_map entries for (ino) where idx is in
@@ -139,7 +151,7 @@ func (s *Store) GetChunksRange(ctx context.Context, ino int64, fromIdx int32, co
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size
+		`SELECT `+chunkCols+`
 		   FROM chunk_map
 		  WHERE ino = ? AND idx >= ? AND idx < ?
 		  ORDER BY idx`,
@@ -147,22 +159,7 @@ func (s *Store) GetChunksRange(ctx context.Context, ino int64, fromIdx int32, co
 	if err != nil {
 		return nil, fmt.Errorf("get chunks range %d [%d,%d): %w", ino, fromIdx, int64(fromIdx)+int64(count), err)
 	}
-	defer rows.Close()
-	out := make([]Chunk, 0, count)
-	for rows.Next() {
-		var c Chunk
-		var packOff sql.NullInt64
-		var packSize sql.NullInt64
-		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize); err != nil {
-			return nil, err
-		}
-		if packSize.Valid {
-			c.PackOffset = packOff.Int64
-			c.PackSize = int32(packSize.Int64)
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return scanChunks(rows)
 }
 
 // DeleteChunk removes a single chunk_map entry. Returns ErrNotFound if
@@ -189,26 +186,11 @@ func (s *Store) DeleteChunk(ctx context.Context, ino int64, idx int32) error {
 // for multi-GB filesystems.
 func (s *Store) AllChunks(ctx context.Context) ([]Chunk, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ino, idx, tg_message_id, size, pack_offset, pack_size FROM chunk_map ORDER BY ino, idx`)
+		`SELECT `+chunkCols+` FROM chunk_map ORDER BY ino, idx`)
 	if err != nil {
 		return nil, fmt.Errorf("all chunks: %w", err)
 	}
-	defer rows.Close()
-	var out []Chunk
-	for rows.Next() {
-		var c Chunk
-		var packOff sql.NullInt64
-		var packSize sql.NullInt64
-		if err := rows.Scan(&c.Ino, &c.Idx, &c.TGMessageID, &c.Size, &packOff, &packSize); err != nil {
-			return nil, err
-		}
-		if packSize.Valid {
-			c.PackOffset = packOff.Int64
-			c.PackSize = int32(packSize.Int64)
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return scanChunks(rows)
 }
 
 // HasAnyChunks reports whether chunk_map has at least one row. Use
@@ -317,16 +299,25 @@ func (s *Store) ReuseChunkByHash(ctx context.Context, ino int64, idx int32, hash
 		// we're now reusing a NON-packed message via dedup, leaving
 		// the old pack fields in place would point the Reader at a
 		// stale offset in the wrong message.
+		// hash is stored too: on format 2 it is the chunk's AAD, so the
+		// new slot must carry it to be readable.
 		if _, ierr := tx.ExecContext(ctx,
-			`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size)
-			   VALUES (?,?,?,?,NULL,NULL)
+			`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size, hash)
+			   VALUES (?,?,?,?,NULL,NULL,?)
 			 ON CONFLICT(ino, idx) DO UPDATE SET
 			   tg_message_id = excluded.tg_message_id,
 			   size          = excluded.size,
 			   pack_offset   = NULL,
-			   pack_size     = NULL`,
-			ino, idx, blobMsgID, blobSize); ierr != nil {
+			   pack_size     = NULL,
+			   hash          = excluded.hash`,
+			ino, idx, blobMsgID, blobSize, hash); ierr != nil {
 			return fmt.Errorf("reuse put chunk: %w", ierr)
+		}
+		if s.journalRefs.Load() {
+			if _, jerr := s.appendJournalTx(ctx, tx, JournalOp{Op: OpRef, Ino: ino, Idx: idx,
+				MsgID: blobMsgID, ChunkLen: blobSize, Hash: hash}); jerr != nil {
+				return jerr
+			}
 		}
 		outReused = true
 		outMsgID = blobMsgID

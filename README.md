@@ -5,17 +5,19 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A POSIX filesystem that stores its data in a private Telegram channel.
-Files are chunked, optionally encrypted with AES-256-GCM, and uploaded
-as channel messages; a local SQLite database holds the metadata and is
-periodically snapshotted back to the same channel so a fresh machine
-with the right credentials and passphrase can mount and read every
-byte. Pure-Go, single static binary.
+Files are chunked, encrypted with AES-256-GCM, and uploaded as channel
+messages; a local SQLite database holds the metadata and is
+periodically snapshotted — encrypted — back to the same channel, so a
+fresh machine with the account and the profile's secret can mount and
+read every byte. On the channel nothing is readable without the secret
+but message sizes and times. Pure-Go, single static binary.
 
 ```sh
 telfs profile create main && telfs profile use main
-telfs login                                  # phone + code + 2FA
+telfs login                                  # sets the secret; phone + code + 2FA
 telfs channel set <id>
-telfs encrypt init                           # optional: AES-256-GCM
+telfs init                                   # new filesystem (always encrypted)
+telfs key export                             # keep this with the secret
 telfs trash enable --ttl 7d                  # optional: rm safety-net
 telfs mount ~/External
 ```
@@ -34,13 +36,15 @@ End-to-end verified on a real Telegram account + private channel:
 | `telfs gc` — orphan chunks + stale snapshots | ✓ |
 | `telfs fsck` — channel-side integrity check | ✓ |
 | `telfs status` / `telfs doctor` — one-screen state / local invariant lint | ✓ |
-| AES-256-GCM chunks **and** snapshot metadata (TFSE envelope), Argon2id KDF | ✓ |
-| Passphrase rotation (KEK-wrapped DEK), opt-in convergent mode for encrypted dedup | ✓ |
+| Format 2 (new filesystems): everything encrypted — chunks, captions, snapshots, journal; sizes Padmé-padded; Argon2id over 2 GiB | ✓ |
+| One secret per profile from a prompt, a secret file, or KeePassXC; encrypted `session.enc`; non-dumpable processes | ✓ |
+| Key header pinned in the channel + a text export for the break-glass kit; `telfs secret change` | ✓ |
+| Self-describing chunks: rebuild the metadata from captions alone (`telfs recover --from-captions`) | ✓ |
 | Profiles + portable tar.gz export/import bundles | ✓ |
 | Web management UI: dashboard, login wizard, mount supervisor, file browser | ✓ (`telfs web`) |
 | `telfs trash` — `rm` reroutes to `/.trash`, TTL GC | ✓ |
 | Snapshot history + point-in-time restore (last 12 by default) | ✓ |
-| Content-addressed chunk dedup (plaintext + convergent-encrypted FSes) | ✓ |
+| Content-addressed chunk dedup, keyed hash (format 2; format 1: plaintext + convergent) | ✓ |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
 ## Telegram API credentials (API ID + hash)
@@ -133,12 +137,16 @@ every step is an inline form on that one page:
 2. **API ID + hash** — paste the pair from
    [my.telegram.org/apps](https://my.telegram.org/apps) (see
    [Telegram API credentials](#telegram-api-credentials-api-id--hash)).
-3. **Phone login** — number → the code Telegram sends → 2FA if set.
-4. **Pick a channel** — your channels are listed; one click binds.
+3. **Secret** — where the profile's secret comes from: typed in,
+   a secret file, or KeePassXC (see [Secrets](#secrets)).
+4. **Phone login** — number → the code Telegram sends → 2FA if set.
+   The first login sets the secret: the session is stored encrypted.
+5. **Pick a channel** — your channels are listed; one click binds.
    (Create a private channel in the Telegram app first.)
-5. **Encryption / compression** — optional, skippable; one-way once
-   data lands.
-6. **Mount** — type a mountpoint (existing empty dir) and hit Mount.
+6. **Create the filesystem** — chunk size and compression; always
+   encrypted. Skip it if the channel already holds a TelFS
+   filesystem: mounting recovers it.
+7. **Mount** — type a mountpoint (existing empty dir) and hit Mount.
    You land on the mount's page with a live log.
 
 That's it — the daemon runs detached (it survives closing `telfs
@@ -153,20 +161,22 @@ service (see [Running unattended](#running-unattended)).
 The same flow, scriptable:
 
 ```sh
-# Optional: pick a non-default chunk size BEFORE first mount.
-# 4 MiB default; 64 KiB..1.5 GiB, power of two; immutable once any chunk lands.
-telfs init --chunk-size $((16*1024*1024))
-
 # Profile = isolated FS instance at ~/.config/telfs/profiles/<name>/.
 telfs profile create main && telfs profile use main
 
-# Credentials — either edit config.toml or use env.
-export TELFS_API_ID=12345678 TELFS_API_HASH=...
+# Where the secret comes from (default: typed in). See "Secrets".
+#   [secret] source = "keepassxc", entry = "Services/TelFS/main"   in config.toml
 
-telfs login                                  # interactive
+telfs login                                  # asks for the API pair if missing,
+                                             # sets the secret, phone + code + 2FA
 telfs channel list                           # find the channel id
 telfs channel set <id>
 telfs channel ping                           # smoke test
+
+# A NEW filesystem (always encrypted). 4 MiB chunks by default; 64 KiB..1.5 GiB,
+# power of two; chunk size and compression are fixed from here on.
+telfs init [--chunk-size $((16*1024*1024))] [--compression zstd]
+telfs key export > ~/telfs-main-key.txt      # → KeePassXC entry / break-glass kit
 
 mkdir mnt && telfs mount ./mnt               # foreground; ^C to unmount
 # background daemons: `telfs unmount <mountpoint|profile>` stops any
@@ -212,7 +222,25 @@ telfs mount ./mnt
 # Mounted at ./mnt.
 ```
 
-No snapshot on the channel → fresh empty FS.
+A channel with no TelFS filesystem is an error ("run `telfs init`") —
+a filesystem is created only by `telfs init`, never implicitly.
+
+On a format-2 filesystem the mount first reads the **pinned key
+message**, unlocks it with the profile's secret, then finds the newest
+snapshot. If the key message is gone, recover with the export:
+
+```sh
+telfs mount --key-header ~/telfs-main-key.txt ./mnt   # re-posts + pins it
+```
+
+**Every snapshot gone?** `telfs recover --from-captions` rebuilds the
+metadata from the chunk captions, the packs' encrypted indexes and any
+journal batches still on the channel, and writes a per-file report of
+what came back under which name. With the journal present the tree
+comes back exactly; from captions alone, files come back under the name
+they had when last uploaded (rsync's temporary names are mapped back),
+while empty files, symlinks, extra hard-link names, deduplicated copies
+and later renames are lost.
 
 ### Time travel: rolling back to a historical snapshot
 
@@ -232,78 +260,102 @@ it lets you manually roll forward again.
 
 ## Encryption
 
-AES-256-GCM protects chunk contents AND the metadata snapshot envelope:
+A new filesystem (`telfs init`, **format 2**) is always encrypted, and
+nothing TelFS posts is readable without the profile's secret except
+the key header (salt, Argon2id parameters, the wrapped key), message
+sizes and times:
 
-- Every chunk is AES-GCM ciphertext, AAD-bound to `(ino, idx)`.
-- Every snapshot is a TFSE envelope —
-  `["TFSE"][ver][hdr_len][hdr_json][ciphertext]` — so SQLite metadata
-  (filenames, tree, sizes, times) lands as ciphertext too.
-
-The channel still leaks: chunk count, approximate chunk sizes (4 MiB
-buckets), mutation cadence, snapshot rhythm.
-
-Enable on a **fresh** FS (refuses if any chunk exists; migrate via
-`cp -r` to a new encrypted instance):
-
-```sh
-telfs encrypt init                            # interactive
-TELFS_PASSPHRASE='secret' telfs encrypt init  # unattended
-telfs encrypt status
-TELFS_PASSPHRASE='secret' telfs mount ./mnt   # skip the prompt
-```
-
-A canary in `meta_kv` is decrypted at mount time so a wrong passphrase
-fails fast (no cryptic EIOs).
-
-### Passphrase rotation
-
-FSes initialized on v0.14+ use `aes-gcm-v2`: passphrase → KEK wraps a
-per-FS DEK; chunks and snapshots use the DEK; the wrapped DEK lives
-in `meta_kv` and inside every snapshot envelope. Rotation rewraps the
-DEK only — chunks are untouched:
-
-```sh
-telfs encrypt rotate                          # old passphrase, then new
-```
-
-Notes:
-
-- Old snapshots still need the *old* passphrase; they age out of
-  retention. To invalidate now: `telfs gc --yes` + trigger a fresh
-  snapshot (remount briefly).
-- `aes-gcm-v1` (pre-v0.14) has no rotation path; `telfs encrypt
-  status` shows your mode.
-
-### What encryption protects against
-
-| Threat | Protected? |
+| On the channel | Format 2 |
 |---|---|
-| Telegram operator reading file contents | ✓ |
-| Telegram operator reading file *names* / tree structure | ✓ (TFSE envelope) |
-| Channel members reading contents or metadata | ✓ |
-| Splicing ciphertexts between files | ✓ (AAD binds to `(ino, idx)`) |
-| Tampering with chunk bytes | ✓ (GCM tag fails) |
-| Channel-WRITE attacker replaying an old ciphertext on the same `(ino, idx)` | ✗ (single-mounter assumption) |
-| Local-disk theft on a host mounting unattended via `TELFS_PASSPHRASE` env | partial (key never persists; passphrase lives in env) |
+| Chunk and pack bodies | AES-256-GCM, random nonce, bound to the chunk's keyed content hash; the reader re-checks the hash |
+| Snapshots, journal batches | AES-256-GCM under the metadata key — names, folders, sizes never in clear |
+| Captions | every caption exactly 1024 characters: `tfs2` + base64 ciphertext (identity, size, mode, mtime, path hint) |
+| Document names | every document is `blob` |
+| Sizes | Padmé-padded (≤ 3.1 %; a full 4 MiB chunk pays nothing) |
+| Key header | one pinned text message `tfs2k …` — useless without the secret |
 
-### Crypto parameters
+Keys: the secret → Argon2id (1 pass, 2 GiB — RFC 9106's first choice)
+→ key-encrypting key → wraps a random 32-byte data key. Chunk, hash,
+metadata and caption keys derive from the data key by HKDF, one label
+each. The session (`session.enc`) has its own salt and opens with the
+secret alone.
 
-- Cipher: AES-256-GCM; 12-byte random nonce per chunk (v1/v2) or
-  `HMAC-SHA256(DEK, label‖plaintext)[:12]` (v3); 16-byte tag
-- AAD: `(ino, idx)` big-endian for v1/v2; nil for v3
-- KDF: Argon2id (time=3, memory=64 MiB, threads=4), 16-byte per-FS salt
-- Canary: encrypted `"telfs-canary-v1"` in `meta_kv`, verified at mount
-- v2 key hierarchy: passphrase + salt → Argon2id → KEK; random 32-byte
-  DEK wrapped under KEK in `meta_kv['crypto_wrapped_dek']` and inside
-  every snapshot envelope. Rotation rewraps the DEK only.
+AES-GCM with random nonces allows 2^32 encryptions per key; TelFS
+counts them (`telfs status`, `fsck`), warns at 2^31 and turns the
+filesystem read-only at 2^32 — about 3000 first full backups of a
+large home folder away.
 
-Argon2id parameters live in `meta_kv['crypto_argon_params']`, so a
-future TelFS with stronger defaults can still mount older FSes.
+### Secrets
+
+One secret per profile opens the session and the filesystem key. The
+`[secret]` table of `config.toml` says where it comes from — never the
+secret itself:
+
+```toml
+[secret]
+source = "keepassxc"             # "prompt" (default) | "file" | "keepassxc"
+entry  = "Services/TelFS/main"   # path inside KeePassXC's exposed Secret Service group
+# file = "/srv/services/<group>/<service>/secrets/telfs"   # for source = "file"
+```
+
+- **prompt** — typed in; `TELFS_PASSPHRASE` skips the prompt. TelFS
+  removes it from its own environment at start, so no process it
+  starts inherits it.
+- **file** — a regular file (no symlink), giving nothing to "others",
+  at most 4 KiB; one trailing newline is ignored. What boot mounts use.
+- **keepassxc** — `secret-tool lookup Path /<entry>` against the
+  running KeePassXC (unlock or confirm in its window; 2-minute limit).
+
+`--secret-from prompt|file|keepassxc` overrides the source for one
+command. `telfs secret test` checks it (exit 0 ok, 2 source failed,
+3 wrong secret). Every `telfs` process is non-dumpable: other
+processes of yours cannot read its environment, memory maps or file
+descriptors, and no core dump is written.
+
+The key header is readable on the channel, so a short secret can be
+guessed offline: use a KeePassXC-generated password of 32+ characters.
+
+### Key header export
+
+```sh
+telfs key export [--out FILE]
+```
+
+prints the key header as a text block with a check line (catches a
+mistyped copy). Keep it in the filesystem's KeePassXC entry and the
+break-glass kit: without the secret it opens nothing; with it, it is
+the whole key. `telfs status` and `telfs fsck` check that the channel's
+pinned key message exists and matches; `telfs fsck --fix` repairs it.
+
+### Changing the secret
+
+```sh
+telfs secret change --new-from-prompt | --new-file PATH | --new-entry ENTRY
+```
+
+re-wraps the data key and re-encrypts `session.enc` under the new
+secret, replaces the key message and prints a new export. **No data is
+re-encrypted** — the data key never changes for the life of a
+filesystem. So an OLD secret together with any OLD copy of the key
+header (an export, a snapshot from before the change) still opens the
+filesystem: destroy old exports. The only remedy for a leaked data key
+is a new filesystem and an rsync copy.
+
+### Format 1 (filesystems from v0.22 and earlier)
+
+Older filesystems keep working as before: optional AES-256-GCM chunks
+(`aes-gcm-v1`/`v2`/`v3`) and encrypted snapshots — but the journal
+reaches the channel in clear, chunk documents are named
+`ino<N>-idx<M>`, and on an unencrypted one the profile's secret
+protects only the Telegram session. They cannot be encrypted in place:
+rsync their files into a new filesystem.
 
 ## Content-addressed chunk dedup
 
-On plaintext FSes (and on convergent-encrypted FSes — see below), TelFS
-hashes every chunk's contents with SHA-256 and consults a `chunk_blob`
+Format 2 hashes every chunk with a key derived from the filesystem key
+(HMAC-SHA256, so equal content says nothing to anyone without it); on
+format 1, plaintext and convergent-encrypted FSes use SHA-256. TelFS
+consults a `chunk_blob`
 forward index (`hash → tg_message_id, size`) before uploading. A hit
 points the new `chunk_map` row at the existing message — no upload, no
 extra channel storage. `cp file copy.bin`, intra-file duplication, and
@@ -322,16 +374,17 @@ The index is a cache only; GC liveness derives from `chunk_map` alone:
 `telfs status` reports the distinct-blob count. `telfs gc` prunes
 stale index entries after each channel cleanup.
 
-**Encryption interaction.** Default-encrypted FSes (`aes-gcm-v1` /
-`v2`) use a random per-chunk nonce + `(ino, idx)` AAD, so identical
+**Format 2** binds each chunk to its keyed content hash, not to its
+slot, so an encrypted chunk is shared between files without identical
+ciphertext: dedup works on every new filesystem. Each dedup hit is also
+journaled (encrypted) as a `ref`, so a rebuild without snapshots can
+restore deduplicated files.
+
+**Format 1 encryption interaction** (older filesystems). `aes-gcm-v1` /
+`v2` use a random per-chunk nonce + `(ino, idx)` AAD, so identical
 plaintext produces different ciphertext per slot — dedup can't apply.
-Opt into **convergent mode** at init time:
-
-```sh
-telfs encrypt init --convergent               # aes-gcm-v3
-```
-
-v3 derives the chunk nonce as `HMAC-SHA256(DEK, label‖plaintext)[:12]`
+Format-1 filesystems created with `--convergent` (`aes-gcm-v3`; no
+longer offered for new filesystems) derive the chunk nonce as `HMAC-SHA256(DEK, label‖plaintext)[:12]`
 and uses nil AAD, so identical plaintext under the same DEK produces
 byte-identical ciphertext (which is what makes dedup work).
 
@@ -396,7 +449,7 @@ telfs doctor                     # exit 0 on clean / warnings, 1 on errors
 ```
 
 Read-only complement to `status` (state) and `fsck` (channel side).
-Checks `config.toml` / `session.json` permissions (warns above 0600),
+Checks `config.toml` / `session.enc` permissions (warns above 0600; flags a plaintext v0.22 `session.json`),
 `meta_kv` invariants (valid UUID, chunk_size power-of-two, crypto KV
 consistent), `chunk_map` health (positive sizes/msg_ids, dedup ratio),
 cache vs `chunk_map` (orphan cache files), snapshot + journal
@@ -433,7 +486,7 @@ Environment overrides:
 | `TELFS_API_ID` / `TELFS_API_HASH` | override config |
 | `TELFS_PHONE` | skip phone prompt at login |
 | `TELFS_DC` | override starting datacenter |
-| `TELFS_PASSPHRASE` | encryption passphrase (skip mount prompt) |
+| `TELFS_PASSPHRASE` | the secret of a prompt-source profile (skips the prompt); removed from TelFS's environment at start, never inherited by a child |
 
 ## Design choices
 
@@ -444,7 +497,7 @@ Environment overrides:
 | Metadata | Local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence. |
 | Chunk size | 4 MiB default, per-FS configurable via `telfs init --chunk-size`; immutable after first chunk; power of two ∈ [64 KiB, 1.5 GiB] | Throughput vs `chunk_map` row count. |
 | POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough for typical workloads. |
-| Encryption | AES-256-GCM (v1/v2/v3); Argon2id KDF; opt-in `telfs encrypt init` | Chunks AND snapshot metadata; AAD binds to `(ino, idx)` for v1/v2. |
+| Encryption | Format 2: always on — AES-256-GCM, Argon2id 2 GiB, HKDF subkeys, Padmé padding, encrypted captions/journal | Nothing on the channel but the key header, sizes and times. Format 1 (old): opt-in, journal in clear. |
 | Inline TG deletes | None for chunks; snapshot delete supersedes prior | Never destroys data inline; `gc` reclaims; trash layers on top. |
 | Snapshot / journal cadence | Snapshot every 5 min + clean unmount; journal poster every 5 s | Bounded recovery window without burning bandwidth. |
 
@@ -461,17 +514,18 @@ TELFS_PROFILE=work telfs channel set <id>
 telfs profile use work                      # sticky default
 telfs profile list                          # shows active marker
 
-telfs profile export bundle.tar.gz          # session + config + db
+telfs profile export bundle.tar.gz          # session.enc + config + db
 telfs profile import --profile work2 bundle.tar.gz
 ```
 
-A bundle holds MTProto session credentials + (if encryption is
-enabled) the salt and canary needed to derive the data key from your
-passphrase. Treat it like an SSH private key.
+A bundle holds the encrypted session (`session.enc`; a plaintext
+v0.22 `session.json` is never exported), the config (only the
+*location* of the secret) and the DB (with the wrapped key). Without
+the secret it opens nothing — but keep it private all the same.
 
 - **Same-machine roundtrip is verified.**
 - **Cross-device use is the design intent but unverified.** Telegram
-  may flag/invalidate a `session.json` reused from a different
+  may flag/invalidate a session reused from a different
   device/IP; the workaround on auth failure at the destination is to
   redo `telfs login` there. The bundle's `config.toml` and `db.sqlite`
   still apply.
@@ -532,19 +586,29 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=TELFS_PROFILE=%i
-EnvironmentFile=%h/.config/telfs/profiles/%i/passphrase.env
-ExecStart=%h/Projects/TelFS/bin/telfs mount %h/External-%i
+ExecStart=%h/.local/bin/telfs mount %h/External-%i
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 ```
 
+The profile reads its secret from a file — never from the unit's
+environment:
+
+```toml
+# ~/.config/telfs/profiles/work/config.toml
+[secret]
+source = "file"
+file   = "/home/you/.config/telfs/work.secret"   # chmod 0600 (or 0640 for a service group)
+```
+
 ```sh
-echo 'TELFS_PASSPHRASE=your-secret' > ~/.config/telfs/profiles/work/passphrase.env
-chmod 600 ~/.config/telfs/profiles/work/passphrase.env
 systemctl --user enable --now telfs@work.service
 ```
+
+(A service mode with `Type=notify`, network-wait and several mounts at
+once is the next phase.)
 
 For interactive use, at minimum: `nohup telfs mount ~/External &` —
 and verify the daemon survives a shell exit before trusting it with

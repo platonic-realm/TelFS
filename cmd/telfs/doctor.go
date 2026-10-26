@@ -142,17 +142,22 @@ func checkProfileDir(cfg *config.Config) []finding {
 		out = append(out, errorf("profile", "config.toml missing: %v", err))
 	}
 
-	// session.json: optional (e.g. on a freshly-created profile before
-	// login), but if present, mode must also be tight.
+	// session.enc: optional (e.g. on a freshly-created profile before
+	// login), but if present, mode must also be tight. A plaintext
+	// session.json from v0.22 is an error: it is a full login to the
+	// Telegram account lying in the clear.
+	if cfg.HasLegacySession() {
+		out = append(out, errorf("profile", "plaintext session.json from an older TelFS — run `telfs session encrypt` (it is a full login to the Telegram account, unencrypted)"))
+	}
 	if info, err := os.Stat(cfg.SessionPath()); err == nil {
 		mode := info.Mode().Perm()
 		if mode&0o077 != 0 {
-			out = append(out, warnf("profile", "session.json mode is %#o; consider chmod 600 (contains MTProto auth key)", mode))
+			out = append(out, warnf("profile", "session.enc mode is %#o; consider chmod 600", mode))
 		} else {
-			out = append(out, okf("profile", "session.json present, mode %#o", mode))
+			out = append(out, okf("profile", "session.enc present (encrypted), mode %#o", mode))
 		}
-	} else if os.IsNotExist(err) {
-		out = append(out, infof("profile", "session.json absent — `telfs login` first"))
+	} else if os.IsNotExist(err) && !cfg.HasLegacySession() {
+		out = append(out, infof("profile", "no session — `telfs login` first"))
 	} else {
 		out = append(out, errorf("profile", "session.json stat: %v", err))
 	}
@@ -200,9 +205,20 @@ func checkMetaKV(ctx context.Context, m *meta.Store) []finding {
 
 func checkCryptoState(ctx context.Context, m *meta.Store) []finding {
 	var out []finding
+	if f, _ := m.Format(ctx); f == 2 {
+		if h, _, err := keyHeaderOf(ctx, m); err != nil {
+			out = append(out, errorf("crypto", "format 2 without a usable local key header: %v", err))
+		} else {
+			out = append(out, okf("crypto", "format 2 (always encrypted), Argon2id %d pass %d MiB", h.T, h.M/1024))
+		}
+		if kc, ok := loadKeyCheck(ctx, m); ok && !kc.OK {
+			out = append(out, warnf("crypto", "last pinned-header check: %s (fsck --fix)", kc.Detail))
+		}
+		return out
+	}
 	mode, err := m.GetKV(ctx, crypto.KVMode)
 	if errors.Is(err, meta.ErrNotFound) {
-		out = append(out, infof("crypto", "encryption disabled (plaintext FS)"))
+		out = append(out, infof("crypto", "encryption disabled (format-1 plaintext FS — the profile's secret protects only the session)"))
 		return out
 	}
 	if err != nil {

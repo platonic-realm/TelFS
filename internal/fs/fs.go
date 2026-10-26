@@ -25,14 +25,17 @@ import (
 // only mounts can leave them zero (or set ReadOnly = true to explicitly
 // reject all mutations regardless).
 type Backend struct {
-	Meta      *meta.Store
-	Reader    *chunk.Reader
-	Cache     *chunk.Cache
-	Uploader  chunk.Uploader
-	Pool      *chunk.UploadPool // backend-global upload concurrency + per-ino R-A-W barrier
-	Packer    *chunk.Packer     // nil → no small-file packing
-	Cipher    crypto.Cipher     // nil → NoopCipher (plaintext mode)
-	Codec     compress.Codec    // nil → compress.None (no compression)
+	Meta     *meta.Store
+	Reader   *chunk.Reader
+	Cache    *chunk.Cache
+	Uploader chunk.Uploader
+	Pool     *chunk.UploadPool // backend-global upload concurrency + per-ino R-A-W barrier
+	Packer   *chunk.Packer     // nil → no small-file packing
+	Cipher   crypto.Cipher     // format 1: nil → NoopCipher (plaintext mode)
+	Codec    compress.Codec    // format 1: nil → compress.None (no compression)
+	// Wire, when set, is the chunk wire codec (format 2) and replaces
+	// Cipher + Codec.
+	Wire      chunk.WireCodec
 	ChunkSize int64
 	ReadOnly  bool
 
@@ -255,7 +258,7 @@ func (n *Node) truncate(ctx context.Context, size int64) syscall.Errno {
 	if !n.backend.canWrite() {
 		return syscall.EROFS
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriterWire(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.wire(), n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		log.Printf("fs.truncate.NewWriter(ino=%d): %v", n.ino, err)
 		return syscall.EIO
@@ -413,7 +416,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 		}
 		return h, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	w, err := chunk.NewWriter(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
+	w, err := chunk.NewWriterWire(ctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.wire(), n.backend.Pool, n.backend.Packer, n.ino, n.backend.chunkSize(), 0)
 	if err != nil {
 		log.Printf("fs.Open.NewWriter(ino=%d): %v", n.ino, err)
 		return nil, 0, syscall.EIO
@@ -499,7 +502,7 @@ func (n *Node) Create(ctx context.Context, name string, _ uint32, mode uint32, o
 		return nil, nil, 0, logMetaErr("Create.GetInode", ino, err)
 	}
 	childInode := n.newChildInode(ctx, child)
-	w, werr := chunk.NewWriter(mctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.Cipher, n.backend.Codec, n.backend.Pool, n.backend.Packer, ino, n.backend.chunkSize(), 0)
+	w, werr := chunk.NewWriterWire(mctx, n.backend.Meta, n.backend.Cache, n.backend.Uploader, n.backend.wire(), n.backend.Pool, n.backend.Packer, ino, n.backend.chunkSize(), 0)
 	if werr != nil {
 		log.Printf("fs.Create.NewWriter(ino=%d): %v", ino, werr)
 		return nil, nil, 0, syscall.EIO
@@ -809,6 +812,15 @@ func callerGID(ctx context.Context) uint32 {
 
 // chunkSize returns the configured chunk size, falling back to the
 // package default.
+// wire returns the chunk wire codec: Wire on format 2, else format 1
+// over Cipher + Codec.
+func (b *Backend) wire() chunk.WireCodec {
+	if b.Wire != nil {
+		return b.Wire
+	}
+	return chunk.NewFormat1Codec(b.Cipher, b.Codec)
+}
+
 func (b *Backend) chunkSize() int64 {
 	if b.ChunkSize > 0 {
 		return b.ChunkSize

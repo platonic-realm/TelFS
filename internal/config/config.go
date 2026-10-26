@@ -22,10 +22,11 @@ const (
 
 // File names within the data directory.
 const (
-	ConfigFile  = "config.toml"
-	SessionFile = "session.json"
-	DBFile      = "db.sqlite"
-	CacheDir    = "cache"
+	ConfigFile     = "config.toml"
+	SessionFile    = "session.json" // v0.22 plaintext; refused, converted by `telfs session encrypt`
+	SessionEncFile = "session.enc"
+	DBFile         = "db.sqlite"
+	CacheDir       = "cache"
 )
 
 // Profile-related paths.
@@ -63,6 +64,11 @@ type Config struct {
 	Identity *Identity `toml:"identity,omitempty"`
 
 	Channel ChannelConfig `toml:"channel"`
+
+	// Secret says where this profile's secret comes from. The one
+	// secret opens both session.enc and (on format-2 filesystems) the
+	// FS key. A missing table means source = "prompt".
+	Secret SecretConfig `toml:"secret"`
 
 	// CacheCap is the LRU disk-cache size cap for this mount. Empty
 	// (or unparseable) falls through to chunk.DefaultCacheCapBytes
@@ -109,9 +115,15 @@ func (id *Identity) Label() string {
 // profile IS that identity until `telfs profile reset-auth` wipes it
 // (session + channel binding; the channel access_hash is scoped to
 // the identity that resolved it and dies with it).
+//
+// A leftover plaintext session.json counts too: the identity lock is
+// about who the profile IS, and that file still authenticates as them
+// (it is refused for use, not ignored).
 func (c *Config) HasSession() bool {
-	_, err := os.Stat(c.SessionPath())
-	return err == nil
+	if _, err := os.Stat(c.SessionPath()); err == nil {
+		return true
+	}
+	return c.HasLegacySession()
 }
 
 // CacheCapBytes parses Config.CacheCap. Returns 0 (caller falls back
@@ -173,6 +185,57 @@ func ParseHumanBytes(s string) (int64, error) {
 	return int64(num * float64(mult)), nil
 }
 
+// Secret sources (see internal/secret).
+const (
+	SecretSourcePrompt    = "prompt"
+	SecretSourceFile      = "file"
+	SecretSourceKeePassXC = "keepassxc"
+)
+
+// SecretConfig is the [secret] table of config.toml. Only the LOCATION
+// of the secret lives here — never the secret itself.
+type SecretConfig struct {
+	// Source is "prompt" (default when empty), "file" or "keepassxc".
+	Source string `toml:"source,omitempty"`
+	// File is the secret file for source = "file" (e.g. the S9 service
+	// layout's secrets/<name>, written by svc-secret).
+	File string `toml:"file,omitempty"`
+	// Entry is the KeePassXC entry path inside the group exposed over
+	// the Secret Service, for source = "keepassxc".
+	Entry string `toml:"entry,omitempty"`
+}
+
+// EffectiveSource returns Source with the default applied.
+func (s SecretConfig) EffectiveSource() string {
+	if s.Source == "" {
+		return SecretSourcePrompt
+	}
+	return s.Source
+}
+
+// Validate checks that the source is known and has what it needs.
+func (s SecretConfig) Validate() error {
+	switch s.EffectiveSource() {
+	case SecretSourcePrompt:
+		return nil
+	case SecretSourceFile:
+		if s.File == "" {
+			return errors.New(`[secret] source = "file" needs file = "<path>"`)
+		}
+		if !filepath.IsAbs(s.File) {
+			return fmt.Errorf("[secret] file %q must be an absolute path", s.File)
+		}
+		return nil
+	case SecretSourceKeePassXC:
+		if strings.Trim(s.Entry, "/") == "" {
+			return errors.New(`[secret] source = "keepassxc" needs entry = "<path inside the exposed group>"`)
+		}
+		return nil
+	default:
+		return fmt.Errorf(`[secret] source %q is unknown (use "prompt", "file" or "keepassxc")`, s.Source)
+	}
+}
+
 // ChannelConfig stores the resolved peer reference for the backing channel.
 // AccessHash is required by MTProto on every call; we cache it here so we
 // don't re-scan dialogs every mount.
@@ -186,8 +249,34 @@ type ChannelConfig struct {
 // ConfigPath returns the path of the on-disk config file.
 func (c *Config) ConfigPath() string { return filepath.Join(c.DataDir, ConfigFile) }
 
-// SessionPath returns the path of the gotd session file.
-func (c *Config) SessionPath() string { return filepath.Join(c.DataDir, SessionFile) }
+// SessionPath returns the path of the encrypted session file
+// (session.enc). The plaintext session.json of v0.22 and earlier lives
+// at LegacySessionPath and is refused until converted.
+func (c *Config) SessionPath() string { return filepath.Join(c.DataDir, SessionEncFile) }
+
+// LegacySessionPath returns the path of a v0.22-era plaintext gotd
+// session file.
+func (c *Config) LegacySessionPath() string { return filepath.Join(c.DataDir, SessionFile) }
+
+// HasLegacySession reports whether a plaintext session.json is present.
+func (c *Config) HasLegacySession() bool {
+	_, err := os.Stat(c.LegacySessionPath())
+	return err == nil
+}
+
+// RemoveSessionFiles deletes the session in both its encrypted and its
+// legacy plaintext form (reset-auth, logout).
+func (c *Config) RemoveSessionFiles() error {
+	for _, p := range []string{c.SessionPath(), c.LegacySessionPath()} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// ProfileName is the profile's name (the data dir's base name).
+func (c *Config) ProfileName() string { return filepath.Base(c.DataDir) }
 
 // DBPath returns the path of the SQLite metadata DB.
 func (c *Config) DBPath() string { return filepath.Join(c.DataDir, DBFile) }

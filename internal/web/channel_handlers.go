@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"telfs/internal/config"
+	"telfs/internal/secret"
 	"telfs/internal/tg"
 )
 
@@ -45,8 +46,9 @@ func (s *Server) channelShow(w http.ResponseWriter, r *http.Request) {
 
 type channelListData struct {
 	pageBase
-	Channels []tg.ChannelInfo
-	Error    string
+	Channels   []tg.ChannelInfo
+	Error      string
+	NeedSecret bool
 }
 
 func (s *Server) channelList(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +59,18 @@ func (s *Server) channelList(w http.ResponseWriter, r *http.Request) {
 		s.renderTemplate(w, "channel/list.html", d)
 		return
 	}
-	client, err := tg.New(cfg)
+	d.NeedSecret = secretIsPrompt(cfg) && r.Method == http.MethodGet
+	if d.NeedSecret {
+		s.renderTemplate(w, "channel/list.html", d)
+		return
+	}
+	if r.Method == http.MethodPost {
+		if err := s.state.CheckCSRF(r); err != nil {
+			http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+			return
+		}
+	}
+	client, err := actionClient(r, cfg, secret.Unlock)
 	if err != nil {
 		d.Error = err.Error()
 		s.renderTemplate(w, "channel/list.html", d)
@@ -85,6 +98,10 @@ type setupChannelsData struct {
 	CSRF     string
 	Channels []tg.ChannelInfo
 	Error    string
+	// SecretPrompt: each "use this channel" form carries a secret field.
+	SecretPrompt bool
+	// NeedSecret: render the "scan my channels" form first.
+	NeedSecret bool
 }
 
 func (s *Server) setupChannels(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +112,19 @@ func (s *Server) setupChannels(w http.ResponseWriter, r *http.Request) {
 		s.renderPartial(w, "partials/setup_channels.html", d)
 		return
 	}
-	client, err := tg.New(cfg)
+	d.SecretPrompt = secretIsPrompt(cfg)
+	if d.SecretPrompt && r.Method == http.MethodGet {
+		d.NeedSecret = true
+		s.renderPartial(w, "partials/setup_channels.html", d)
+		return
+	}
+	if r.Method == http.MethodPost {
+		if err := s.state.CheckCSRF(r); err != nil {
+			http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+			return
+		}
+	}
+	client, err := actionClient(r, cfg, secret.Unlock)
 	if err != nil {
 		d.Error = err.Error()
 		s.renderPartial(w, "partials/setup_channels.html", d)
@@ -173,9 +202,9 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	client, err := tg.New(cfg)
+	client, err := actionClient(r, cfg, secret.Unlock)
 	if err != nil {
-		SetFlash(w, "error", "tg.New: "+err.Error())
+		SetFlash(w, "error", err.Error())
 		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}

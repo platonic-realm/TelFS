@@ -44,7 +44,7 @@ One subcommand per file. The structure:
 | `trash.go` | `telfs trash` | `enable`, `disable`, `status`, `list`, `empty` |
 | `ratelimit.go` | `telfs ratelimit` | `show`, `set N`, `clear` |
 | `doctor.go` | `telfs doctor` | Local invariant lint |
-| `debug.go` | `telfs debug` | `seed-file`, `dump-msg` — surface tools used while debugging |
+| `debug` (in `main.go`, `observe.go`) | `telfs debug` | `dump-msg`, `observe` (the observer test: what the channel shows without the key) |
 | `web.go` | `telfs web` | Start the web UI |
 
 The `cmd/telfs/main.go` file is bigger than the others because the mount

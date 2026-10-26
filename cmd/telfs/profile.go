@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"telfs/internal/config"
+	"telfs/internal/crypto"
 	"telfs/internal/meta"
 	"telfs/internal/mountctl"
 )
@@ -109,6 +110,40 @@ func cmdProfileShow(args []string) error {
 	if cfg.DC != 0 {
 		fmt.Printf("DC:             %d\n", cfg.DC)
 	}
+	src := cfg.Secret.EffectiveSource()
+	switch src {
+	case config.SecretSourceFile:
+		src += " (" + cfg.Secret.File + ")"
+	case config.SecretSourceKeePassXC:
+		src += " (entry " + cfg.Secret.Entry + ")"
+	}
+	fmt.Printf("Secret source:  %s\n", src)
+	switch {
+	case cfg.HasLegacySession():
+		fmt.Println("Session:        PLAINTEXT session.json from an older TelFS — run `telfs session encrypt`")
+	case cfg.HasSession():
+		fmt.Println("Session:        session.enc (encrypted)")
+	default:
+		fmt.Println("Session:        none (log in first)")
+	}
+	if _, err := os.Stat(cfg.DBPath()); err == nil {
+		if m, err := meta.Open(cfg.DBPath()); err == nil {
+			ctx := context.Background()
+			f, _ := m.Format(ctx)
+			_, encErr := m.GetKV(ctx, crypto.KVMode)
+			switch {
+			case f == 2:
+				fmt.Println("Filesystem:     format 2 (always encrypted)")
+			case errors.Is(encErr, meta.ErrNotFound):
+				fmt.Println("Filesystem:     format 1, UNENCRYPTED — this profile's secret protects only the Telegram session, not your files")
+			default:
+				fmt.Println("Filesystem:     format 1, encrypted chunks and snapshots (the journal goes to the channel in clear)")
+			}
+			m.Close()
+		}
+	} else {
+		fmt.Println("Filesystem:     no local DB (mount to recover it, or `telfs init` for a new one)")
+	}
 	return nil
 }
 
@@ -160,8 +195,10 @@ func cmdProfileDelete(args []string) error {
 	// Deleting under a live daemon leaves it writing to unlinked
 	// files; the next mount then recovers from the channel, losing
 	// everything after the last snapshot.
-	if pid, mp, ok := mountctl.FindByProfile(name); ok {
-		return fmt.Errorf("profile %q has a running mount daemon (pid %d at %s) — run `telfs unmount %s` first", name, pid, mp, name)
+	if pid, mp, ok, ferr := mountctl.FindByProfile(name); ferr != nil {
+		return fmt.Errorf("profile %q: %w", name, ferr) // fail closed
+	} else if ok {
+		return fmt.Errorf("profile %q is mounted at %s (daemon pid %d) — run `telfs unmount %s` first", name, mp, pid, name)
 	}
 	if !*force {
 		fmt.Fprintf(os.Stderr, "profile delete: refusing to delete %s without --yes (this removes the SQLite DB and session — channel data is unaffected).\n", dir)
@@ -185,7 +222,7 @@ func cmdProfileDelete(args []string) error {
 	return nil
 }
 
-// cmdProfileResetAuth wipes a profile's auth identity: session.json,
+// cmdProfileResetAuth wipes a profile's auth identity: session.enc,
 // phone / [identity], AND the channel binding — a channel access_hash
 // is scoped to the identity that resolved it and is garbage under any
 // other. This is the one sanctioned way to change a profile's account
@@ -208,8 +245,10 @@ func cmdProfileResetAuth(ctx context.Context, args []string) error {
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("profile %q not found", name)
 	}
-	if pid, mp, ok := mountctl.FindByProfile(name); ok {
-		return fmt.Errorf("profile %q has a running mount daemon (pid %d at %s) — run `telfs unmount %s` first", name, pid, mp, name)
+	if pid, mp, ok, ferr := mountctl.FindByProfile(name); ferr != nil {
+		return fmt.Errorf("profile %q: %w", name, ferr) // fail closed
+	} else if ok {
+		return fmt.Errorf("profile %q is mounted at %s (daemon pid %d) — run `telfs unmount %s` first", name, mp, pid, name)
 	}
 	cfg, err := config.LoadFromDir(dir)
 	if err != nil {
@@ -218,7 +257,7 @@ func cmdProfileResetAuth(ctx context.Context, args []string) error {
 	hadChannel := cfg.Channel.ID
 	if !*force {
 		fmt.Fprintf(os.Stderr, "profile reset-auth: this wipes %s's identity:\n", name)
-		fmt.Fprintln(os.Stderr, "  - deletes session.json (the Telegram authorization)")
+		fmt.Fprintln(os.Stderr, "  - deletes session.enc (the Telegram authorization)")
 		fmt.Fprintln(os.Stderr, "  - clears phone and [identity]")
 		fmt.Fprintln(os.Stderr, "  - clears the channel binding (its access_hash belongs to the old identity)")
 		if hadChannel != 0 && profileHasChunks(ctx, cfg) {
@@ -229,7 +268,7 @@ func cmdProfileResetAuth(ctx context.Context, args []string) error {
 		fmt.Fprintln(os.Stderr, "\nRe-run with --yes to proceed.")
 		return errors.New("aborted")
 	}
-	if err := os.Remove(cfg.SessionPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := cfg.RemoveSessionFiles(); err != nil {
 		return fmt.Errorf("remove session: %w", err)
 	}
 	cfg.Phone = ""
@@ -286,7 +325,7 @@ func cmdProfileUse(args []string) error {
 // state. Excludes cache/ (rebuildable) and any tempfiles.
 var bundleFiles = []string{
 	config.ConfigFile,
-	config.SessionFile,
+	config.SessionEncFile, // encrypted; a plaintext v0.22 session.json is never exported
 	config.DBFile,
 }
 

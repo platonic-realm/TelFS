@@ -8,6 +8,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"telfs/internal/chunk"
+	"telfs/internal/mountctl"
 )
 
 // MountOptions configures a TelFS mount.
@@ -15,6 +16,10 @@ type MountOptions struct {
 	MountPoint string
 	AllowOther bool
 	Debug      bool
+	// Profile names the mount in /proc/mounts (source "telfs:<profile>")
+	// so tools find a daemon's profile without reading its environ —
+	// which a non-dumpable daemon hides (decision D5, mountctl).
+	Profile string
 }
 
 // Mount creates and starts a FUSE server backed by b at opts.MountPoint.
@@ -36,6 +41,9 @@ func Mount(opts MountOptions, b *Backend) (*serverHandle, error) {
 	fuseOpts.MountOptions.AllowOther = opts.AllowOther
 	fuseOpts.MountOptions.Name = "telfs"
 	fuseOpts.MountOptions.FsName = "telfs"
+	if opts.Profile != "" {
+		fuseOpts.MountOptions.FsName = mountctl.SourceFor(opts.Profile)
+	}
 	// CAP_WRITEBACK_CACHE lets the kernel coalesce small writes into the
 	// MaxWrite-sized requests we already handle efficiently. For workloads
 	// that stream many small write()s into a single open file (logs,

@@ -47,6 +47,35 @@
 </section>
 
 <section class="card">
+  <h3>Secret</h3>
+  <p><small>One secret per profile encrypts the Telegram session (<code>session.enc</code>) and the filesystem key. TelFS stores only <em>where</em> it comes from — never the secret.</small></p>
+  <dl>
+    <dt>source</dt><dd><code>{{.SecretSource}}</code>{{if .SecretFile}} <code>{{.SecretFile}}</code>{{end}}{{if .SecretEntry}} entry <code>{{.SecretEntry}}</code>{{end}}</dd>
+    <dt>session</dt><dd>{{if .LegacySession}}<span class="pill bad">plaintext session.json</span> run <code>telfs session encrypt</code>{{else if .HasSession}}<span class="pill ok">encrypted</span>{{else}}none yet{{end}}</dd>
+  </dl>
+  <details>
+    <summary class="btn small">Change the source</summary>
+    <form method="post" action="/profiles/{{.Name}}/secret" autocomplete="off">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <fieldset>
+        <legend>Where the secret comes from</legend>
+        <label><input type="radio" name="source" value="prompt" {{if eq .SecretSource "prompt"}}checked{{end}}> prompt — typed in each time</label>
+        <label><input type="radio" name="source" value="file" {{if eq .SecretSource "file"}}checked{{end}}> file — readable by you and the service's group, not by others (boot mounts)</label>
+        <label><input type="radio" name="source" value="keepassxc" {{if eq .SecretSource "keepassxc"}}checked{{end}}> keepassxc — asked of the running KeePassXC (Secret Service)</label>
+      </fieldset>
+      <label>Secret file (absolute path)
+        <input type="text" name="file" value="{{.SecretFile}}" placeholder="/srv/services/&lt;group&gt;/&lt;service&gt;/secrets/telfs">
+      </label>
+      <label>KeePassXC entry (path inside the exposed group)
+        <input type="text" name="entry" value="{{.SecretEntry}}" placeholder="Services/TelFS/home">
+      </label>
+      <button type="submit">Save source</button>
+    </form>
+    <p><small>This changes only where the secret is read from. To change the secret itself, run <code>telfs secret change</code>.</small></p>
+  </details>
+</section>
+
+<section class="card">
   <h3>Channel</h3>
   {{if .Channel.Set}}
     <dl><dt>Title</dt><dd>{{.Channel.Title}}</dd><dt>ID</dt><dd><code>{{.Channel.ID}}</code></dd></dl>
@@ -59,9 +88,13 @@
 <section class="card">
   <h3>Filesystem</h3>
   <dl>
+    <dt>format</dt><dd>{{.Format}}</dd>
     {{if .ChunkSize}}<dt>chunk size</dt><dd>{{humanBytes .ChunkSize}}</dd>{{end}}
-    <dt>encryption</dt><dd>{{if .Crypto.Enabled}}{{.Crypto.Mode}}{{else}}disabled{{end}}</dd>
+    <dt>encryption</dt><dd>{{if eq .Format 2}}always (chunks, captions, snapshots, journal){{else if .Crypto.Enabled}}{{.Crypto.Mode}} (chunks and snapshots; the journal is in clear){{else}}disabled{{end}}</dd>
   </dl>
+  {{if and (ne .Format 2) (not .Crypto.Enabled)}}
+  <p><span class="pill warn">session only</span> This filesystem is unencrypted: the profile's secret protects only the Telegram session, not your files. A new filesystem (<code>telfs init</code>) is always encrypted.</p>
+  {{end}}
 </section>
 {{end}}
 

@@ -77,8 +77,7 @@ type Reader struct {
 	// pending dir, no cipher, no codec).
 	pendingDir   string
 	pendingIndex *PendingIndex // optional in-process accelerator over the dir scan
-	cipher       crypto.Cipher
-	codec        compress.Codec
+	pendingWC    WireCodec     // decodes staged wires (same codec the Writer used)
 
 	// blobPrefetch, when non-nil, is told about cache misses on
 	// PACKED extents so it can warm the neighboring extents of the
@@ -162,9 +161,15 @@ func (r *Reader) SetPrefetch(window, concurrency int) {
 // loop is the right place to call this, after it has resolved
 // crypto + compression and ensured the pending dir exists.
 func (r *Reader) SetPendingFallback(pendingDir string, cipher crypto.Cipher, codec compress.Codec) {
+	r.SetPendingFallbackWire(pendingDir, NewFormat1Codec(cipher, codec))
+}
+
+// SetPendingFallbackWire is SetPendingFallback with an explicit wire
+// codec (format 2: staged wires carry their content hash in the file
+// name, which Decode needs).
+func (r *Reader) SetPendingFallbackWire(pendingDir string, wc WireCodec) {
 	r.pendingDir = pendingDir
-	r.cipher = cipher
-	r.codec = codec
+	r.pendingWC = wc
 }
 
 // SetPendingIndex installs an in-process accelerator over the disk
@@ -447,12 +452,12 @@ func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, 
 	// packer between the batch fetch and now).
 	if c, ok := batch[idx]; ok {
 		r.noteBlobLocality(ino, idx, c)
-		return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
+		return r.cache.GetChunk(ctx, Key{Ino: ino, Idx: idx}, c)
 	}
 	c, err := r.meta.GetChunk(ctx, ino, idx)
 	if err == nil {
 		r.noteBlobLocality(ino, idx, c)
-		return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
+		return r.cache.GetChunk(ctx, Key{Ino: ino, Idx: idx}, c)
 	}
 	if !errors.Is(err, meta.ErrNotFound) {
 		return nil, fmt.Errorf("chunk lookup %d/%d: %w", ino, idx, err)
@@ -481,7 +486,7 @@ func (r *Reader) fetchOne(ctx context.Context, ino int64, idx int32, chunkSize, 
 		}
 		c, err := r.meta.GetChunk(ctx, ino, idx)
 		if err == nil {
-			return r.cache.Get(ctx, Key{Ino: ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
+			return r.cache.GetChunk(ctx, Key{Ino: ino, Idx: idx}, c)
 		}
 		if !errors.Is(err, meta.ErrNotFound) {
 			return nil, fmt.Errorf("chunk lookup %d/%d: %w", ino, idx, err)
@@ -570,21 +575,19 @@ func (r *Reader) tryPendingFallback(ino int64, idx int32) ([]byte, bool, error) 
 		}
 		return nil, false, fmt.Errorf("read pending %s: %w", path, err)
 	}
-	// Reverse the writer pipeline: decrypt → decompress.
-	plaintext := wire
-	if r.cipher != nil {
-		dec, derr := r.cipher.Open(ino, idx, plaintext)
-		if derr != nil {
-			return nil, false, fmt.Errorf("decrypt pending %d/%d: %w", ino, idx, derr)
-		}
-		plaintext = dec
+	// Reverse the writer pipeline through the same codec. Format 2
+	// needs the content hash, which the staged file's name carries.
+	wc := r.pendingWC
+	if wc == nil {
+		wc = NewFormat1Codec(nil, nil)
 	}
-	if r.codec != nil {
-		dec, derr := r.codec.Decompress(plaintext)
-		if derr != nil {
-			return nil, false, fmt.Errorf("decompress pending %d/%d: %w", ino, idx, derr)
-		}
-		plaintext = dec
+	var hash []byte
+	if e, ok := ParsePendingName(filepath.Base(path)); ok {
+		hash = e.Hash
+	}
+	plaintext, derr := wc.Decode(ino, idx, hash, wire)
+	if derr != nil {
+		return nil, false, fmt.Errorf("decode pending %d/%d: %w", ino, idx, derr)
 	}
 	return plaintext, true, nil
 }
@@ -638,5 +641,5 @@ func (r *Reader) prefetchOne(pctx context.Context, ino int64, key Key, c meta.Ch
 		return
 	}
 	defer func() { <-r.prefetchSem }()
-	_, _ = r.cache.Get(pctx, key, c.TGMessageID, c.PackOffset, c.PackSize)
+	_, _ = r.cache.GetChunk(pctx, key, c)
 }

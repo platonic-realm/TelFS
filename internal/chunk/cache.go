@@ -15,6 +15,7 @@ import (
 
 	"telfs/internal/compress"
 	"telfs/internal/crypto"
+	"telfs/internal/meta"
 	"telfs/internal/metrics"
 )
 
@@ -77,8 +78,7 @@ type Cache struct {
 	dir      string
 	capBytes int64
 	fetcher  Fetcher
-	cipher   crypto.Cipher  // never nil; defaults to NoopCipher
-	codec    compress.Codec // never nil; defaults to compress.None
+	wc       WireCodec // never nil; format 1 or 2
 
 	mu        sync.Mutex
 	entries   map[Key]*entry
@@ -132,14 +132,16 @@ func (c *Cache) MemCache() *MemCache {
 // decompresses before persisting plaintext, so cache hits skip both
 // costs.
 func NewCache(dir string, capBytes int64, fetcher Fetcher, cipher crypto.Cipher, codec compress.Codec) (*Cache, error) {
+	return NewCacheWire(dir, capBytes, fetcher, NewFormat1Codec(cipher, codec))
+}
+
+// NewCacheWire is NewCache with an explicit wire codec (format 2).
+func NewCacheWire(dir string, capBytes int64, fetcher Fetcher, wc WireCodec) (*Cache, error) {
 	if capBytes <= 0 {
 		capBytes = DefaultCacheCapBytes
 	}
-	if cipher == nil {
-		cipher = crypto.NoopCipher{}
-	}
-	if codec == nil {
-		codec = compress.None{}
+	if wc == nil {
+		wc = NewFormat1Codec(nil, nil)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("chunk: mkdir cache %s: %w", dir, err)
@@ -148,8 +150,7 @@ func NewCache(dir string, capBytes int64, fetcher Fetcher, cipher crypto.Cipher,
 		dir:      dir,
 		capBytes: capBytes,
 		fetcher:  fetcher,
-		cipher:   cipher,
-		codec:    codec,
+		wc:       wc,
 		entries:  make(map[Key]*entry),
 		order:    list.New(),
 	}
@@ -217,6 +218,13 @@ func (c *Cache) SizeBytes() int64 {
 // packOffset==0 && packSize==0 means "unpacked" — Get uses the full
 // fetched bytes (the historical behavior).
 func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset int64, packSize int32) ([]byte, error) {
+	return c.GetChunk(ctx, key, meta.Chunk{TGMessageID: tgMessageID, PackOffset: packOffset, PackSize: packSize})
+}
+
+// GetChunk is Get for a chunk_map row: it also passes the row's content
+// hash, which format 2 needs to decrypt.
+func (c *Cache) GetChunk(ctx context.Context, key Key, ref meta.Chunk) ([]byte, error) {
+	tgMessageID, packOffset, packSize := ref.TGMessageID, ref.PackOffset, ref.PackSize
 	// Tier 0: in-RAM hot cache, if enabled. One map lookup; no
 	// syscall on hit. Skipped if no mem tier is installed.
 	if data, ok := c.mem.Get(key); ok {
@@ -292,10 +300,10 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset 
 					c.totalSize -= e2.size
 				}
 				c.mu.Unlock()
-				return c.fetchAndStore(ctx, key, tgMessageID, packOffset, packSize)
+				return c.fetchAndStore(ctx, key, tgMessageID, packOffset, packSize, ref.Hash)
 			}
 			c.mu.Unlock()
-			return c.fetchAndStore(ctx, key, tgMessageID, packOffset, packSize)
+			return c.fetchAndStore(ctx, key, tgMessageID, packOffset, packSize, ref.Hash)
 		})
 		if err != nil {
 			if errors.Is(err, context.Canceled) && ctx.Err() == nil && attempt < 3 {
@@ -332,7 +340,7 @@ func (c *Cache) Get(ctx context.Context, key Key, tgMessageID int64, packOffset 
 // fetchAndStore is the actual miss path: download (range or whole),
 // slice if packed, decrypt, decompress, persist to disk, insert into
 // the LRU. Split out of Get so singleflight can wrap it cleanly.
-func (c *Cache) fetchAndStore(ctx context.Context, key Key, tgMessageID int64, packOffset int64, packSize int32) ([]byte, error) {
+func (c *Cache) fetchAndStore(ctx context.Context, key Key, tgMessageID int64, packOffset int64, packSize int32, hash []byte) ([]byte, error) {
 	// Fetch. For packed chunks we prefer a RangedFetcher (one
 	// upload.getFile per ~1 MiB) so we don't download the entire
 	// shared blob just to access one extent.
@@ -382,13 +390,9 @@ func (c *Cache) fetchAndStore(ctx context.Context, key Key, tgMessageID int64, p
 	} else {
 		ciphertext = fetched
 	}
-	compressed, err := c.cipher.Open(key.Ino, key.Idx, ciphertext)
+	data, err := c.wc.Decode(key.Ino, key.Idx, hash, ciphertext)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt chunk %d/%d: %w", key.Ino, key.Idx, err)
-	}
-	data, err := c.codec.Decompress(compressed)
-	if err != nil {
-		return nil, fmt.Errorf("decompress chunk %d/%d: %w", key.Ino, key.Idx, err)
+		return nil, err
 	}
 	// Persist to disk, then insert into the LRU.
 	path := filepath.Join(c.dir, key.fileName())

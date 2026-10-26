@@ -56,6 +56,9 @@ type Store struct {
 	// channel-recovered ops (which already exist on the channel).
 	replaying atomic.Bool
 
+	// journalRefs makes dedup hits journal a `ref` op (format 2).
+	journalRefs atomic.Bool
+
 	// onInodeDeleted, if non-nil, is invoked after a committed
 	// transaction has removed an inodes row (whether via Unlink that
 	// dropped nlink to 0, or a Rename that overwrote an existing
@@ -219,6 +222,8 @@ CREATE TABLE IF NOT EXISTS chunk_map (
   -- pack_offset, pack_size: see docs/architecture and meta.Chunk.
   pack_offset   INTEGER,
   pack_size     INTEGER,
+  -- hash: keyed content hash (format 2), NULL on format 1. See meta.Chunk.
+  hash          BLOB,
   PRIMARY KEY (ino, idx),
   FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
 );
@@ -348,6 +353,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 		`ALTER TABLE chunk_map ADD COLUMN pack_size INTEGER`,
 		`ALTER TABLE inodes ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 4194304`,
 		`ALTER TABLE inodes ADD COLUMN sparse INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE chunk_map ADD COLUMN hash BLOB`,
 	} {
 		if _, err := s.db.ExecContext(ctx, alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("migrate schema: %w", err)

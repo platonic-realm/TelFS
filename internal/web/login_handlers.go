@@ -1,16 +1,14 @@
 package web
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 
 	"telfs/internal/config"
 	"telfs/internal/mountctl"
-	"telfs/internal/tg"
+	"telfs/internal/secret"
 )
 
 // ── /login → phone flow (the only auth flow) ──────────────────────
@@ -53,9 +51,13 @@ func (s *Server) loginPhoneForm(w http.ResponseWriter, r *http.Request) {
 		if cfg.HasSession() && cfg.Identity != nil {
 			d.LoggedIn = true
 			d.Identity = cfg.Identity.Label()
-			if _, mp, ok := mountctl.FindByProfile(d.Profile); ok {
+			if _, mp, ok, ferr := mountctl.FindByProfile(d.Profile); ok {
 				d.Mounted = true
 				d.Mountpoint = mp
+			} else if ferr != nil {
+				// Unknown-profile mount: show as mounted (fail closed).
+				d.Mounted = true
+				d.Mountpoint = "(unknown — " + ferr.Error() + ")"
 			}
 		}
 	}
@@ -81,12 +83,16 @@ func (s *Server) loginLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	profile := config.ActiveProfile()
-	if pid, mp, ok := mountctl.FindByProfile(profile); ok {
+	if pid, mp, ok, ferr := mountctl.FindByProfile(profile); ferr != nil {
+		SetFlash(w, "error", fmt.Sprintf("profile %q: %v", profile, ferr))
+		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
+		return
+	} else if ok {
 		SetFlash(w, "error", fmt.Sprintf("profile %q is mounted at %s (pid %d) — stop the mount before logging out", profile, mp, pid))
 		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
 		return
 	}
-	if err := os.Remove(cfg.SessionPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := cfg.RemoveSessionFiles(); err != nil {
 		SetFlash(w, "error", "remove session: "+err.Error())
 		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
 		return
@@ -175,10 +181,17 @@ func (s *Server) loginPhoneStart(w http.ResponseWriter, r *http.Request) {
 
 	// Spawn the gotd login goroutine. It blocks inside LoginWith until
 	// the user supplies phone/code/(password), then exits.
-	client, err := tg.New(cfg)
+	// The first login SETS the profile's secret (session.enc is
+	// created with it); a re-login after logout opens the same secret.
+	purpose := secret.Unlock
+	if !cfg.HasSession() {
+		purpose = secret.SetNew
+	}
+	client, err := actionClient(r, cfg, purpose)
 	if err != nil {
-		SetFlash(w, "error", "tg.New: "+err.Error())
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		s.logins.Remove(sess.ID)
+		SetFlash(w, "error", err.Error())
+		http.Redirect(w, r, setupReturn(r, "/login/phone"), http.StatusSeeOther)
 		return
 	}
 	go func() {

@@ -48,3 +48,17 @@
 </body>
 </html>
 {{end}}
+
+{{define "secretfield"}}{{if .SecretPrompt}}{{if .NewSecret}}
+<label>Choose the secret for this profile
+  <input type="password" name="secret" required autocomplete="new-password">
+</label>
+<label>Repeat it
+  <input type="password" name="secret2" required autocomplete="new-password">
+</label>
+<p><small>It encrypts <code>session.enc</code> now and the filesystem key later. The key header is readable on the channel, so a short secret can be guessed offline: a KeePassXC-generated password of 32+ characters is the safe choice.</small></p>
+{{else}}
+<label>Secret for this profile
+  <input type="password" name="secret" required autocomplete="current-password">
+</label>
+{{end}}{{end}}{{end}}

@@ -31,23 +31,94 @@ func FusermountBin() string {
 	return "fusermount"
 }
 
-// ScanProcMounts returns every fuse.telfs mountpoint currently in
-// /proc/mounts.
-func ScanProcMounts() []string {
+// SourcePrefix starts the mount source of a TelFS mount made by a P1 or
+// newer daemon: "telfs:<profile>". /proc/mounts is readable by every
+// process, so the profile is known even when the daemon is non-dumpable
+// (its environ is hidden) or dead (an orphaned mount).
+const SourcePrefix = "telfs:"
+
+// SourceFor returns the mount source for a profile.
+func SourceFor(profile string) string { return SourcePrefix + profile }
+
+// Mount is one fuse.telfs entry of /proc/mounts.
+type Mount struct {
+	Source string
+	Point  string
+}
+
+// ScanMounts returns every fuse.telfs entry currently in /proc/mounts.
+func ScanMounts() []Mount {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
-	var out []string
+	var out []Mount
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		if len(fields) >= 3 && fields[2] == "fuse.telfs" {
-			out = append(out, fields[1])
+			out = append(out, Mount{Source: unescapeMount(fields[0]), Point: unescapeMount(fields[1])})
 		}
 	}
 	return out
+}
+
+// ScanProcMounts returns every fuse.telfs mountpoint currently in
+// /proc/mounts.
+func ScanProcMounts() []string {
+	var out []string
+	for _, m := range ScanMounts() {
+		out = append(out, m.Point)
+	}
+	return out
+}
+
+// unescapeMount undoes /proc/mounts' octal escapes (\040 for a space).
+func unescapeMount(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			var v int
+			if _, err := fmt.Sscanf(s[i+1:i+4], "%o", &v); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// ProfileOf returns the profile serving a TelFS mount: from its source
+// ("telfs:<profile>"), else — for mounts made by v0.22 daemons, whose
+// source is plain "telfs" and whose environ is still readable — from the
+// daemon's TELFS_PROFILE. ("", false) when it cannot be determined.
+func ProfileOf(m Mount) (string, bool) {
+	if strings.HasPrefix(m.Source, SourcePrefix) {
+		if p := strings.TrimPrefix(m.Source, SourcePrefix); p != "" {
+			return p, true
+		}
+	}
+	if pid, ok := FindDaemonPid(m.Point); ok {
+		if p := ReadEnvVar(pid, "TELFS_PROFILE"); p != "" {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// ErrUnknownMount: some TelFS mount's profile cannot be determined, so a
+// check of the form "is profile X mounted?" cannot answer "no" safely.
+type ErrUnknownMount struct{ Mountpoints []string }
+
+func (e *ErrUnknownMount) Error() string {
+	return fmt.Sprintf("cannot tell which profile serves the TelFS mount(s) at %s — unmount them first (telfs unmount <mountpoint>)",
+		strings.Join(e.Mountpoints, ", "))
 }
 
 // IsMounted reports whether mountpoint is currently a fuse.telfs entry.
@@ -129,23 +200,31 @@ func FindDaemonPid(mountpoint string) (int, bool) {
 	return 0, false
 }
 
-// FindByProfile locates a running telfs mount daemon whose
-// TELFS_PROFILE matches. Returns the pid and mountpoint of the first
-// match.
-func FindByProfile(profile string) (pid int, mountpoint string, found bool) {
+// FindByProfile locates the TelFS mount of a profile and its daemon
+// (pid 0 when the mount is orphaned). It FAILS CLOSED: when no mount
+// matches but some mount's profile is unknown, it returns
+// *ErrUnknownMount — the caller is a safety check (delete, reset-auth,
+// logout) and must refuse rather than assume "not mounted".
+func FindByProfile(profile string) (pid int, mountpoint string, found bool, err error) {
 	if profile == "" {
-		return 0, "", false
+		return 0, "", false, nil
 	}
-	for _, mp := range ScanProcMounts() {
-		p, ok := FindDaemonPid(mp)
+	var unknown []string
+	for _, m := range ScanMounts() {
+		p, ok := ProfileOf(m)
 		if !ok {
+			unknown = append(unknown, m.Point)
 			continue
 		}
-		if ReadEnvVar(p, "TELFS_PROFILE") == profile {
-			return p, mp, true
+		if p == profile {
+			pid, _ := FindDaemonPid(m.Point)
+			return pid, m.Point, true, nil
 		}
 	}
-	return 0, "", false
+	if len(unknown) > 0 {
+		return 0, "", false, &ErrUnknownMount{Mountpoints: unknown}
+	}
+	return 0, "", false, nil
 }
 
 // ReadEnvVar pulls a single environment variable's value from

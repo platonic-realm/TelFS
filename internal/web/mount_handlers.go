@@ -113,10 +113,23 @@ func (s *Server) mountStart(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
+	// Only a prompt-source profile takes a typed secret from the form;
+	// the others read their own source in the daemon.
+	passphrase := ""
+	if dir, derr := config.ProfileDir(profile); derr == nil {
+		if pcfg, lerr := config.LoadFromDir(dir); lerr == nil && secretIsPrompt(pcfg) {
+			passphrase = r.FormValue("passphrase")
+			if passphrase == "" {
+				SetFlash(w, "error", "this profile's secret is typed in — enter it in the form")
+				http.Redirect(w, r, errBack, http.StatusSeeOther)
+				return
+			}
+		}
+	}
 	opts := StartOpts{
 		Profile:    profile,
 		Mountpoint: mountpoint,
-		Passphrase: r.FormValue("passphrase"),
+		Passphrase: passphrase,
 		Readonly:   r.FormValue("readonly") == "on",
 		AllowOther: r.FormValue("allow_other") == "on",
 		Debug:      r.FormValue("debug") == "on",

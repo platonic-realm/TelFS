@@ -1,7 +1,6 @@
 package web
 
 import (
-	"fmt"
 	"net/http"
 	"os"
 
@@ -80,54 +79,10 @@ func (s *Server) compressInitSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
-	errBack := setupReturn(r, "/compression/init")
-	codec := r.FormValue("codec")
-	if _, err := compress.New(codec); err != nil {
-		SetFlash(w, "error", "codec: "+err.Error())
-		http.Redirect(w, r, errBack, http.StatusSeeOther)
-		return
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		SetFlash(w, "error", "config: "+err.Error())
-		http.Redirect(w, r, errBack, http.StatusSeeOther)
-		return
-	}
-	mstore, err := meta.Open(cfg.DBPath())
-	if err != nil {
-		SetFlash(w, "error", "meta.Open: "+err.Error())
-		http.Redirect(w, r, errBack, http.StatusSeeOther)
-		return
-	}
-	defer mstore.Close()
-	ctx := r.Context()
-	current, err := mstore.CompressionCodec(ctx)
-	if err != nil {
-		SetFlash(w, "error", "read current codec: "+err.Error())
-		http.Redirect(w, r, errBack, http.StatusSeeOther)
-		return
-	}
-	if current == codec {
-		SetFlash(w, "ok", fmt.Sprintf("compression already set to %q. No change.", codec))
-		http.Redirect(w, r, setupReturn(r, "/compression"), http.StatusSeeOther)
-		return
-	}
-	has, err := mstore.HasAnyChunks(ctx)
-	if err != nil {
-		SetFlash(w, "error", "scan chunk_map: "+err.Error())
-		http.Redirect(w, r, errBack, http.StatusSeeOther)
-		return
-	}
-	if has {
-		SetFlash(w, "error", fmt.Sprintf("refuses to change codec from %q to %q while chunks exist. Start a fresh TelFS with `cp -r` your data.", current, codec))
-		http.Redirect(w, r, errBack, http.StatusSeeOther)
-		return
-	}
-	if err := mstore.SetCompressionCodec(ctx, codec); err != nil {
-		SetFlash(w, "error", "persist codec: "+err.Error())
-		http.Redirect(w, r, errBack, http.StatusSeeOther)
-		return
-	}
-	SetFlash(w, "ok", fmt.Sprintf("compression set to %q. Remount for the change to take effect.", codec))
-	http.Redirect(w, r, setupReturn(r, "/compression"), http.StatusSeeOther)
+	// The codec is chosen when the filesystem is CREATED (the wizard's
+	// "Create the filesystem" step / `telfs init --compression`) and is
+	// immutable afterwards. This handler used to write it into a DB it
+	// could mint by opening a missing file — which foreclosed recovery.
+	SetFlash(w, "error", "compression is chosen when the filesystem is created (setup wizard or `telfs init --compression zstd`) and cannot change afterwards")
+	http.Redirect(w, r, "/setup", http.StatusSeeOther)
 }

@@ -36,9 +36,9 @@ func TestValidateProfileNameAcceptsReasonable(t *testing.T) {
 
 // TestDefaultDirResolutionOrder verifies the documented precedence:
 //
-//	1. $TELFS_PROFILE → profile dir
-//	2. ~/.config/telfs/active file → profile dir
-//	none of the above → ErrNoActiveProfile
+//  1. $TELFS_PROFILE → profile dir
+//  2. ~/.config/telfs/active file → profile dir
+//     none of the above → ErrNoActiveProfile
 func TestDefaultDirResolutionOrder(t *testing.T) {
 	// Isolate from the real user's environment.
 	xdg := t.TempDir()
@@ -209,5 +209,48 @@ func TestIdentityLabelNil(t *testing.T) {
 	noName := &Identity{UserID: 9}
 	if got := noName.Label(); got != "id=9 (user)" {
 		t.Fatalf("no-username Label = %q", got)
+	}
+}
+
+func TestSecretConfigValidate(t *testing.T) {
+	cases := []struct {
+		c  SecretConfig
+		ok bool
+	}{
+		{SecretConfig{}, true},
+		{SecretConfig{Source: "prompt"}, true},
+		{SecretConfig{Source: "file", File: "/srv/x/secrets/telfs"}, true},
+		{SecretConfig{Source: "file"}, false},
+		{SecretConfig{Source: "file", File: "relative/path"}, false},
+		{SecretConfig{Source: "keepassxc", Entry: "Services/TelFS/home"}, true},
+		{SecretConfig{Source: "keepassxc", Entry: "/"}, false},
+		{SecretConfig{Source: "env"}, false},
+	}
+	for _, c := range cases {
+		if err := c.c.Validate(); (err == nil) != c.ok {
+			t.Errorf("%+v: err=%v, want ok=%v", c.c, err, c.ok)
+		}
+	}
+	if (SecretConfig{}).EffectiveSource() != SecretSourcePrompt {
+		t.Error("missing source must default to prompt")
+	}
+}
+
+func TestLegacySessionAndRemove(t *testing.T) {
+	dir := t.TempDir()
+	c := &Config{DataDir: dir}
+	if c.HasSession() {
+		t.Fatal("empty profile has no session")
+	}
+	os.WriteFile(c.LegacySessionPath(), []byte("{}"), 0o600)
+	if !c.HasSession() || !c.HasLegacySession() {
+		t.Fatal("a leftover session.json still counts as the profile's identity")
+	}
+	os.WriteFile(c.SessionPath(), []byte("x"), 0o600)
+	if err := c.RemoveSessionFiles(); err != nil {
+		t.Fatal(err)
+	}
+	if c.HasSession() {
+		t.Fatal("RemoveSessionFiles must remove both")
 	}
 }

@@ -8,20 +8,17 @@
 //	telfs channel info                show the configured channel
 //	telfs channel ping                smoke-test post + read-back round trip
 //	telfs mount <mountpoint>          mount the filesystem (read-only in M3)
-//	telfs debug seed-file <name> <n>  create a test file of n bytes for read-path verification
 //
 // See docs/architecture.md for the design.
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"context"
-	"crypto/md5"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -33,17 +30,21 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"telfs/internal/chunk"
-	"telfs/internal/compress"
 	"telfs/internal/config"
 	"telfs/internal/crypto"
 	telfsfs "telfs/internal/fs"
 	"telfs/internal/meta"
 	"telfs/internal/metrics"
 	"telfs/internal/mountctl"
+	"telfs/internal/secret"
+	"telfs/internal/sessionstore"
 	"telfs/internal/snapshot"
 	"telfs/internal/tg"
 	"telfs/internal/trash"
+	"telfs/internal/wire"
 )
 
 // Build-time metadata. Overridden via -ldflags at release:
@@ -59,7 +60,9 @@ const usage = `telfs — FUSE filesystem backed by a Telegram channel
 
 Usage:
   telfs login                       Authenticate against Telegram (interactive
-                                      MTProto phone → code → 2FA).
+                                      MTProto phone → code → 2FA). The first
+                                      login SETS the profile's secret: the
+                                      session is stored encrypted (session.enc).
   telfs channel list                List your channels (id, title, post permission).
   telfs channel set [--access-hash N] <id>
                                     Configure the backing channel.
@@ -67,21 +70,32 @@ Usage:
                                       dialog-list discovery when needed.
   telfs channel info                Show the currently configured channel.
   telfs channel ping                Round-trip a test message (smoke test).
-  telfs mount [flags] <mountpoint>  Mount the filesystem.
-                                      Flags: --readonly --allow-other --debug --no-recover
+  telfs mount [flags] <mountpoint>  Mount the filesystem. A missing local DB is
+                                      recovered from the channel.
+                                      Flags: --readonly --allow-other --debug
+                                      --key-header FILE (recover with an export)
   telfs unmount <mountpoint|profile>
                                     Stop the mount daemon (however it was
                                       started) and detach the mountpoint.
                                       SIGTERM → orderly shutdown → verify;
                                       escalates to SIGKILL + lazy unmount.
-  telfs init [--chunk-size N]       Initialize FS settings before first mount.
+  telfs init [--chunk-size N] [--compression none|zstd] [--kdf-memory SIZE]
+                                    Create a NEW filesystem (format 2: always
+                                      encrypted) on the bound channel; posts and
+                                      pins its key message, prints the export.
+  telfs secret test                 Check the profile's secret (exit 0 ok,
+                                      2 source failed, 3 wrong secret).
+  telfs secret change --new-from-prompt | --new-file PATH | --new-entry ENTRY
+                                    Re-wrap the FS key + re-encrypt the session
+                                      under a new secret (no data re-encrypted).
+  telfs session encrypt             Convert a v0.22 plaintext session.json.
+  telfs key export [--out FILE]     Print the key header export (keep it with
+                                      the secret: KeePassXC entry, break-glass kit).
+  telfs recover --from-captions [--journal use|ignore] [--report FILE] [--key-header FILE]
+                                    Rebuild the local DB from captions, pack
+                                      indexes and journal — no snapshot needed.
   telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
-  telfs encrypt init [--convergent] Enable AES-256-GCM for this filesystem.
-                                      --convergent picks aes-gcm-v3 so encrypted
-                                      chunks also dedup (trade-off: equality
-                                      detection visible on the channel).
-  telfs encrypt status              Show whether encryption is enabled.
-  telfs encrypt rotate              Change passphrase without re-encrypting chunks (v2/v3 FSes).
+  telfs encrypt status              Show the filesystem's encryption state.
   telfs profile {list,show,create,delete,use,reset-auth,export,import}
                                     Manage multiple profiles (accounts/channels).
                                       Each profile is ONE identity; reset-auth
@@ -91,7 +105,8 @@ Usage:
   telfs web [--listen ADDR] [--token TOKEN]
                                     HTTP management UI (default 127.0.0.1:8080).
   telfs fsck [--fix] [--stop-after N]
-                                    Verify every chunk_map row against the channel.
+                                    Verify every chunk_map row against the channel;
+                                      format 2: also the pinned key header.
   telfs snapshot {list, restore [--yes] <msg-id>}
                                     Inspect / roll back to a historical snapshot.
   telfs trash {enable [--ttl D], disable, status, list, empty}
@@ -105,7 +120,11 @@ Usage:
                                       against a directory — a TelFS mountpoint,
                                       or any local dir for a baseline. See
                                       telfs bench --help for the scenario list.
-  telfs debug seed-file <name> <n>  Upload a deterministic n-byte test file.
+
+Global flags (anywhere on the line):
+  --secret-from prompt|file|keepassxc
+                   Read the secret from this source for one command
+                   (the [secret] table of config.toml names the default).
 
 Environment:
   TELFS_PROFILE    Active profile name (overrides ~/.config/telfs/active)
@@ -113,17 +132,24 @@ Environment:
   TELFS_API_HASH   Telegram API hash
   TELFS_PHONE      Phone number for login (prompted if unset)
   TELFS_DC         Starting datacenter override (default: gotd's DC 2)
-  TELFS_PASSPHRASE FS encryption passphrase (skip the prompt)
+  TELFS_PASSPHRASE The secret of a prompt-source profile (skips the prompt).
+                   Removed from TelFS's environment at start: no process
+                   TelFS starts ever inherits it. Prefer a file or KeePassXC.
 `
 
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "telfs:", err)
-		os.Exit(1)
+		os.Exit(exitCode(err))
 	}
 }
 
 func run() error {
+	args, err := extractGlobalFlags(os.Args)
+	if err != nil {
+		return err
+	}
+	os.Args = args
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -173,6 +199,14 @@ func run() error {
 		return cmdRateLimit(ctx, os.Args[2:])
 	case "bench":
 		return cmdBench(ctx, os.Args[2:])
+	case "secret":
+		return cmdSecret(ctx, os.Args[2:])
+	case "session":
+		return cmdSession(ctx, os.Args[2:])
+	case "key":
+		return cmdKey(ctx, os.Args[2:])
+	case "recover":
+		return cmdRecover(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n%s", os.Args[1], usage)
 		os.Exit(2)
@@ -189,13 +223,65 @@ func cmdLogin(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	client, err := tg.New(cfg)
+	if cfg.RequireAPI() != nil {
+		// Ask for the app credentials once (they identify the
+		// application, not the account: my.telegram.org/apps).
+		if err := promptAPI(cfg); err != nil {
+			return err
+		}
+	}
+	if cfg.HasLegacySession() {
+		return sessionstore.ErrLegacy
+	}
+	// The first login of a profile SETS its secret (session.enc is
+	// created with it): ask twice for a typed one and warn if short.
+	purpose := secret.Unlock
+	if !cfg.HasSession() {
+		purpose = secret.SetNew
+	}
+	sec, err := readSecret(ctx, cfg, purpose)
+	if err != nil {
+		return err
+	}
+	defer sec.Zero()
+	if purpose == secret.SetNew {
+		secret.WarnIfWeak(os.Stderr, sec)
+	}
+	client, err := newClientWith(cfg, sec)
 	if err != nil {
 		return err
 	}
 	// Login records the authenticated identity into cfg and saves it
 	// on success.
 	return client.Login(ctx)
+}
+
+// promptAPI asks for api_id and api_hash on the terminal and saves them
+// to the profile's config.toml.
+func promptAPI(cfg *config.Config) error {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return cfg.RequireAPI()
+	}
+	fmt.Println("This profile has no Telegram API credentials yet — get the pair once at https://my.telegram.org/apps.")
+	r := bufio.NewReader(os.Stdin)
+	fmt.Print("api_id: ")
+	idLine, _ := r.ReadString('\n')
+	id, err := strconv.Atoi(strings.TrimSpace(idLine))
+	if err != nil || id <= 0 {
+		return errors.New("api_id must be a positive number")
+	}
+	fmt.Print("api_hash: ")
+	hash, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil || len(strings.TrimSpace(string(hash))) == 0 {
+		return errors.New("api_hash is required")
+	}
+	cfg.APIID, cfg.APIHash = id, strings.TrimSpace(string(hash))
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("Saved to %s.\n", cfg.ConfigPath())
+	return nil
 }
 
 func cmdChannel(ctx context.Context, args []string) error {
@@ -222,7 +308,7 @@ func cmdChannel(ctx context.Context, args []string) error {
 }
 
 func cmdChannelList(ctx context.Context, cfg *config.Config) error {
-	client, err := tg.New(cfg)
+	client, err := newClient(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -288,7 +374,7 @@ func cmdChannelSet(ctx context.Context, cfg *config.Config, args []string) error
 			}
 		}
 	}
-	client, err := tg.New(cfg)
+	client, err := newClient(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -314,7 +400,7 @@ func cmdChannelInfo(cfg *config.Config) error {
 }
 
 func cmdChannelPing(ctx context.Context, cfg *config.Config) error {
-	client, err := tg.New(cfg)
+	client, err := newClient(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -348,9 +434,12 @@ func cmdChannelPing(ctx context.Context, cfg *config.Config) error {
 func cmdInit(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	chunkSize := fs.Int64("chunk-size", meta.DefaultChunkSize, "chunk size in bytes (power of 2, 64KiB..1.5GiB)")
-	compression := fs.String("compression", "", "chunk-payload compression codec: none, zstd. Empty leaves existing setting unchanged.")
+	compression := fs.String("compression", "", "chunk-payload compression codec: none (default), zstd")
+	kdfMemory := fs.String("kdf-memory", "", "Argon2id memory for the filesystem key (default 2GiB, RFC 9106's first choice); lower only for machines without the RAM")
+	kdfTime := fs.Uint("kdf-time", 0, "Argon2id passes (default 1 with 2 GiB)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: telfs init [--chunk-size BYTES] [--compression CODEC]")
+		fmt.Fprintln(os.Stderr, "usage: telfs init [--chunk-size BYTES] [--compression none|zstd] [--kdf-memory SIZE] [--kdf-time N]")
+		fmt.Fprintln(os.Stderr, "Creates a NEW filesystem (format 2: always encrypted) on the profile's bound channel.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -359,62 +448,64 @@ func cmdInit(ctx context.Context, args []string) error {
 	if err := meta.ValidateChunkSize(*chunkSize); err != nil {
 		return err
 	}
+	params := crypto.DefaultArgonParamsV2()
+	if *kdfMemory != "" {
+		n, err := config.ParseHumanBytes(*kdfMemory)
+		if err != nil || n < 64<<20 {
+			return fmt.Errorf("--kdf-memory %q: want a size of at least 64MiB", *kdfMemory)
+		}
+		params.Memory = uint32(n >> 10)
+		if *kdfTime == 0 && n < 1<<30 {
+			params.Time = 3 // RFC 9106's low-memory option uses 3 passes
+		}
+	}
+	if *kdfTime > 0 {
+		params.Time = uint32(*kdfTime)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	metaStore, err := meta.Open(cfg.DBPath())
+	if err := cfg.RequireChannel(); err != nil {
+		return err
+	}
+	if !cfg.HasSession() {
+		return errors.New("init: log in first (`telfs login`)")
+	}
+	// Setting up a filesystem SETS what its key is wrapped under: the
+	// profile's secret (the same one that opens session.enc).
+	sec, err := readSecret(ctx, cfg, secret.Unlock)
 	if err != nil {
 		return err
 	}
-	defer metaStore.Close()
-
-	hasChunks, err := metaStore.HasAnyChunks(ctx)
+	defer sec.Zero()
+	secret.WarnIfWeak(os.Stderr, sec)
+	client, err := newClientWith(cfg, sec)
 	if err != nil {
 		return err
 	}
-
-	current, err := metaStore.ChunkSize(ctx)
+	err = client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
+		return init2(ctx, cfg, sec, sess, *chunkSize, *compression, params)
+	})
 	if err != nil {
 		return err
 	}
-	if current != *chunkSize {
-		if hasChunks {
-			return fmt.Errorf("init: refuses to change chunk_size from %d to %d while chunks exist; "+
-				"start a fresh TelFS instance with a new channel to use a different chunk size",
-				current, *chunkSize)
-		}
-		if err := metaStore.SetChunkSize(ctx, *chunkSize); err != nil {
-			return err
-		}
-		fmt.Printf("chunk_size set to %d bytes (%s)\n", *chunkSize, humanBytes(*chunkSize))
-	} else {
-		fmt.Printf("chunk_size already set to %d bytes (%s). No change.\n", current, humanBytes(current))
+	m, err := meta.Open(cfg.DBPath())
+	if err != nil {
+		return err
 	}
-
-	if *compression != "" {
-		if _, err := compress.New(*compression); err != nil {
-			return err
-		}
-		currentCodec, err := metaStore.CompressionCodec(ctx)
-		if err != nil {
-			return err
-		}
-		if currentCodec == *compression {
-			fmt.Printf("compression already set to %q. No change.\n", currentCodec)
-		} else {
-			if hasChunks {
-				return fmt.Errorf("init: refuses to change compression from %q to %q while chunks exist; "+
-					"start a fresh TelFS instance with a new channel to use a different codec",
-					currentCodec, *compression)
-			}
-			if err := metaStore.SetCompressionCodec(ctx, *compression); err != nil {
-				return err
-			}
-			fmt.Printf("compression set to %q\n", *compression)
-		}
+	defer m.Close()
+	h, _, err := keyHeaderOf(ctx, m)
+	if err != nil {
+		return err
 	}
+	fmt.Println()
+	fmt.Println("Store this key header export with the filesystem's secret (its KeePassXC entry")
+	fmt.Println("and your break-glass kit). Without the secret it opens nothing; with it, it is")
+	fmt.Println("the whole key. `telfs key export` prints it again.")
+	fmt.Println()
+	fmt.Print(wire.Export(h, exportInfo(ctx, cfg, m)))
 	return nil
 }
 
@@ -455,15 +546,17 @@ func cmdUnmount(_ context.Context, args []string) error {
 	target := fs.Arg(0)
 
 	// Resolve to (pid, mountpoint): try as a mountpoint path first,
-	// then as a profile name (matched against the daemon's
-	// TELFS_PROFILE).
+	// then as a profile name (the mount source "telfs:<profile>", or a
+	// v0.22 daemon's TELFS_PROFILE).
 	var mountpoint string
 	var pid int
 	if abs, err := filepath.Abs(target); err == nil && mountctl.IsMounted(abs) {
 		mountpoint = abs
 		pid, _ = mountctl.FindDaemonPid(abs)
-	} else if p, mp, ok := mountctl.FindByProfile(target); ok {
+	} else if p, mp, ok, ferr := mountctl.FindByProfile(target); ok {
 		pid, mountpoint = p, mp
+	} else if ferr != nil && config.ValidateProfileName(target) == nil {
+		return fmt.Errorf("unmount: %q: %w", target, ferr)
 	} else {
 		mounts := mountctl.ScanProcMounts()
 		if len(mounts) == 0 {
@@ -507,6 +600,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	prefetchConcurrency := fs.Int("prefetch-concurrency", 0, "max prefetchOne goroutines (0 = default 4). Each one can issue 4 concurrent upload.getFile RPCs through the parallel ranged fetcher.")
 	memCacheCap := fs.String("mem-cache-cap", "", "in-RAM hot-tier cache size (e.g. 128MiB, 1GiB, 0 to disable). Empty falls through to 128 MiB. Reads hit the mem tier first, skipping os.ReadFile on hot chunks.")
 	blobPrefetch := fs.String("blob-prefetch", "", "packed-blob locality prefetch span (e.g. 4MiB): a cold read of one packed small file warms its blob neighbors in one ranged download. Empty = default 4 MiB; 0 disables.")
+	keyHeader := fs.String("key-header", "", "recover a format-2 filesystem with this key header export (telfs key export) instead of the channel's pinned key message; only used when the local DB is missing")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] [--cache-cap SIZE] <mountpoint>")
 		fs.PrintDefaults()
@@ -536,6 +630,13 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	if abs, err := filepath.Abs(mountpoint); err == nil {
 		mountpoint = abs
 	}
+	if os.Args[len(os.Args)-1] != mountpoint {
+		// The command line must name the mountpoint exactly (see
+		// reexecAbsoluteMount); does not return on success.
+		if err := reexecAbsoluteMount(mountpoint); err != nil {
+			return err
+		}
+	}
 	checkFusermount()
 
 	cfg, err := config.Load()
@@ -546,14 +647,28 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return err
 	}
 
-	// Cold-mount recovery: if the local DB is missing, try to pull the
-	// latest snapshot from the backing channel before opening meta.
-	// If there's no snapshot in the channel either, we'll proceed with
-	// a fresh empty DB (first-ever mount).
+	// The profile's secret, read ONCE: it opens session.enc (Argon2id
+	// #1) and, below, the filesystem key (Argon2id #2 on format 2, the
+	// passphrase of an encrypted format-1 FS). Zeroed as soon as both
+	// are done.
+	sec, err := readSecret(signalCtx, cfg, secret.Unlock)
+	if err != nil {
+		return err
+	}
+	defer sec.Zero()
+	client, err := newClientWith(cfg, sec)
+	if err != nil {
+		return err
+	}
+
+	// Cold-mount recovery: if the local DB is missing, restore it from
+	// the channel. A channel with no TelFS filesystem is an ERROR now
+	// (decision N3): a filesystem is created only by `telfs init`.
 	if _, err := os.Stat(cfg.DBPath()); errors.Is(err, os.ErrNotExist) {
 		if *noRecover {
-			fmt.Println("--no-recover: skipping channel snapshot recovery; starting with an empty DB.")
-		} else if err := tryRecover(signalCtx, cfg); err != nil {
+			return errors.New("--no-recover: there is no local DB to mount — run `telfs init` to create a filesystem, or mount without --no-recover to restore one from the channel")
+		}
+		if err := tryRecover(signalCtx, cfg, client, sec, *keyHeader); err != nil {
 			return fmt.Errorf("recovery: %w", err)
 		}
 	}
@@ -595,11 +710,6 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}
 	}
 
-	client, err := tg.New(cfg)
-	if err != nil {
-		return err
-	}
-
 	// Seed lifetime Telegram stats from the profile's DB so /telegram
 	// totals continue across restarts instead of resetting to zero.
 	// Persisted back periodically (and at shutdown) below.
@@ -608,7 +718,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			fmt.Fprintln(os.Stderr, "[stats] seed lifetime stats:", serr)
 		}
 	}
+	var pipeCounters *wire.Counters // set once the pipeline is open
 	persistStats := func(ctx context.Context) {
+		persistUses(ctx, metaStore, pipeCounters)
 		if b, err := client.Tracker().MarshalState(); err == nil {
 			// Uncounted: this fires every 60 s and is telemetry, not FS
 			// content — routing it through PutKV made the snapshot
@@ -628,9 +740,19 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// FS was set up with `telfs encrypt init` (crypto_mode set in
 	// meta_kv). For the encrypted case we prompt for the passphrase
 	// here and refuse to mount if the canary doesn't decrypt.
-	cipher, err := loadCipher(signalCtx, metaStore)
+	pipe, err := openPipeline(signalCtx, metaStore, sec)
 	if err != nil {
 		return err
+	}
+	sec.Zero() // both derivations are done
+	pipeCounters = pipe.counters
+	cipher := pipe.cipher
+	if pipe.format == 2 {
+		fmt.Fprintln(os.Stderr, "filesystem format: 2 (encrypted chunks, captions, snapshots and journal)")
+	} else if cipher == nil || isNoop(cipher) {
+		fmt.Fprintln(os.Stderr, "filesystem format: 1 — UNENCRYPTED: this profile's secret protects only the Telegram session, not your files")
+	} else {
+		fmt.Fprintln(os.Stderr, "filesystem format: 1 (encrypted chunks and snapshots; journal and names on the channel in clear)")
 	}
 
 	// Per-FS chunk size — was committed at first init (or defaulted to
@@ -645,14 +767,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// support. compress.New errors on an unknown name, so a binary
 	// older than the FS can't silently feed a no-op decompressor a
 	// zstd frame.
-	codecName, err := metaStore.CompressionCodec(signalCtx)
-	if err != nil {
-		return err
-	}
-	codec, err := compress.New(codecName)
-	if err != nil {
-		return err
-	}
+	codec := pipe.codec
 
 	// Trash safety-net. Bootstrap /.trash if enabled; the inode is
 	// passed to the FUSE backend so Unlink/Rmdir reroute into it. The
@@ -754,7 +869,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			capBytes = n
 		}
 		fmt.Fprintf(os.Stderr, "cache cap: %s (%d bytes)\n", humanBytes(capBytes), capBytes)
-		cache, err := chunk.NewCache(cfg.CachePath(), capBytes, fetcher, cipher, codec)
+		cache, err := chunk.NewCacheWire(cfg.CachePath(), capBytes, fetcher, pipe.wc)
 		if err != nil {
 			return err
 		}
@@ -806,7 +921,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// chunks succeed even when chunk_map hasn't seen its row yet
 		// (the wire is on disk, encoded the same way the Writer's
 		// dispatch encoded it — same cipher, same codec).
-		reader.SetPendingFallback(pendingDir, cipher, codec)
+		reader.SetPendingFallbackWire(pendingDir, pipe.wc)
 		reader.SetPendingIndex(pendingIndex)
 		// Prefetch knobs: CLI flag wins (forced override), otherwise
 		// the defaults from chunk.DefaultPrefetch* take effect inside
@@ -832,7 +947,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			blobBudget = n // 0 disables below
 		}
 		if blobBudget > 0 {
-			blobPF = chunk.NewBlobPrefetcher(metaStore, cache, fetcher, cipher, codec, blobBudget)
+			blobPF = chunk.NewBlobPrefetcherWire(metaStore, cache, fetcher, pipe.wc, blobBudget)
 			reader.SetBlobPrefetcher(blobPF)
 		}
 		// Small-file packer: aggregates chunks smaller than
@@ -840,6 +955,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// the per-message RTT. Nil-safe — Writer falls back to
 		// direct upload when no packer is wired.
 		packer := chunk.NewPacker(metaStore, sess, 0, 0, 0)
+		packer.SetWire(pipe.wc)
 		packer.SetPendingIndex(pendingIndex)
 		// Cancel pending wires on unlink. When a file is deleted while
 		// some of its chunks are still buffered in the packer (tar
@@ -866,6 +982,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			Packer:    packer,
 			Cipher:    cipher,
 			Codec:     codec,
+			Wire:      pipe.wc,
 			ChunkSize: chunkSize,
 			ReadOnly:  *readonly,
 			TrashIno:  trashIno,
@@ -909,7 +1026,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// Created here (started further down) so the /telegram handler
 		// can report snapshot-coverage state from day one of the
 		// process; the sync indicator keys off it.
-		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher, QuiesceCheck: queueDrained}
+		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher, Keys: pipe.keys, QuiesceCheck: queueDrained}
 
 		// Metrics endpoint (opt-in). Gauges are registered AFTER the
 		// pool & cache exist so they read the live values, not the
@@ -936,6 +1053,10 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// cache panel without having to know about the metrics
 			// scrape format. Cheap: in-memory atomic loads.
 			metricsSrv.RegisterHandler("/cache", cacheJSONHandler(cache))
+			// /status: who this daemon is. A non-dumpable daemon hides
+			// its environ and fd/1 from other processes, so the web's
+			// adopted-mount view asks the daemon itself (P1, point 1).
+			metricsSrv.RegisterHandler("/status", daemonStatusHandler(cfg.ProfileName(), mountpoint, pipe.format))
 			if err := metricsSrv.Start(); err != nil {
 				if metricsExplicit {
 					return err
@@ -955,6 +1076,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			MountPoint: mountpoint,
 			AllowOther: *allowOther,
 			Debug:      *debug,
+			Profile:    cfg.ProfileName(),
 		}, backend)
 		if err != nil {
 			return err
@@ -977,7 +1099,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// recovery can replay mutations made between snapshot
 		// cadences — narrowing the crash data-loss window from
 		// 5 min (snapshot interval) to ~5 s (poster interval).
-		journalPoster := &snapshot.Poster{Meta: metaStore, Session: sess}
+		journalPoster := &snapshot.Poster{Meta: metaStore, Session: sess, Keys: pipe.keys}
 		journalCtx, stopJournal := context.WithCancel(signalCtx)
 		journalDone := make(chan struct{})
 		go func() {
@@ -1132,6 +1254,33 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// connection auto-recovers without manual restart.
 		go stallWatchdog(signalCtx, pool, mgr, client.Tracker())
 
+		// Format 2: check that the channel's pinned key message exists
+		// and matches the local key header — at mount and every 6 h.
+		// Warn only; repairs are `fsck --fix` / `--key-header`.
+		if pipe.format == 2 {
+			go func() {
+				check := func() {
+					kc := checkPinnedHeader(signalCtx, sess, metaStore)
+					storeKeyCheck(signalCtx, metaStore, kc)
+					if !kc.OK {
+						fmt.Fprintf(os.Stderr, "[key] WARNING: %s\n", kc.Detail)
+					}
+				}
+				deleteOldKeyMessages(signalCtx, sess, metaStore) // left by an interrupted secret change
+				check()
+				t := time.NewTicker(6 * time.Hour)
+				defer t.Stop()
+				for {
+					select {
+					case <-signalCtx.Done():
+						return
+					case <-t.C:
+						check()
+					}
+				}
+			}()
+		}
+
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		<-signalCtx.Done()
 
@@ -1248,6 +1397,25 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return nil
 	}
 	return err
+}
+
+// daemonStatusHandler serves the daemon's identity as JSON. The log
+// path is this process's own stdout when that is a regular file (a
+// non-dumpable process may still read its own /proc/self/fd).
+func daemonStatusHandler(profile, mountpoint string, format int) http.HandlerFunc {
+	logPath := ""
+	if target, err := os.Readlink("/proc/self/fd/1"); err == nil && strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "/dev/") {
+		if st, err := os.Stat(target); err == nil && st.Mode().IsRegular() {
+			logPath = target
+		}
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"profile": profile, "pid": os.Getpid(), "mountpoint": mountpoint,
+			"log_path": logPath, "format": format,
+		})
+	}
 }
 
 // stallWatchdog periodically samples RPC-level progress and triggers a
@@ -1636,7 +1804,9 @@ func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstor
 		// recovery and the packer already logs flush errors to
 		// stderr; a failed retry leaves the pending file in place
 		// for the NEXT startup scan to retry again.
-		ch := packer.Submit(e.Ino, e.Idx, e.PlaintextSize, wire, e.Path)
+		// Format 2 keeps the content hash (the wire's AAD) in the
+		// staged file's name; it must reach chunk_map with the row.
+		ch := packer.SubmitHashed(e.Ino, e.Idx, e.PlaintextSize, wire, e.Path, e.Hash, "")
 		go func() { <-ch }()
 	}
 }
@@ -1664,18 +1834,20 @@ func armForceExit(mountpoint string) {
 	}()
 }
 
-// tryRecover opens a transient MTProto session, scans the channel for
-// the most recent snapshot message, and restores it to cfg.DBPath().
-// If the snapshot is encrypted, it prompts for the passphrase (or
-// reads TELFS_PASSPHRASE), derives the key from the salt embedded in
-// the envelope header, decrypts, and restores.
-func tryRecover(ctx context.Context, cfg *config.Config) error {
-	client, err := tg.New(cfg)
-	if err != nil {
-		return err
-	}
+// tryRecover restores a missing local DB from the channel. Format 2
+// first (pinned key message, or the --key-header export → secret →
+// newest snapshot → encrypted journal); else format 1 (newest snapshot
+// caption, envelope decrypted with the profile's secret → journal).
+func tryRecover(ctx context.Context, cfg *config.Config, client *tg.Client, sec *secret.Secret, keyHeaderPath string) error {
 	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
-		fmt.Println("Local DB missing — scanning channel for snapshot…")
+		fmt.Println("Local DB missing — looking for the filesystem on the channel…")
+		found2, err := recover2(ctx, cfg, sess, sec, keyHeaderPath)
+		if found2 || err != nil {
+			return err
+		}
+		if keyHeaderPath != "" {
+			return errors.New("--key-header given, but the export does not open with this secret")
+		}
 		latest, err := sess.FindLatestSnapshot(ctx, "", 200)
 		if err != nil {
 			return err
@@ -1694,12 +1866,10 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 				return tg.ErrStopWalk
 			})
 			if hasMessages {
-				return fmt.Errorf("no snapshot found within the scan window, but the channel is NOT empty — refusing to start with an empty DB (that would poison recovery and make gc destructive).\n" +
-					"If the channel genuinely holds no TelFS state you want, pass --no-recover to force an empty start.\n" +
-					"Otherwise inspect the channel (telfs snapshot list) — the newest snapshot may be buried more than 20000 messages deep")
+				return fmt.Errorf("no snapshot or key message found within the scan window, but the channel is NOT empty — refusing to start with an empty DB (that would poison recovery and make gc destructive).\n" +
+					"Inspect the channel (telfs snapshot list); for a format-2 filesystem whose key message is gone, mount with --key-header <export>")
 			}
-			fmt.Println("Channel is empty; starting with an empty DB.")
-			return nil
+			return errors.New("this channel holds no TelFS filesystem — run `telfs init` to create one")
 		}
 		fmt.Printf("Found snapshot msg=%d (ts %s, fs_uuid=%s)\n",
 			latest.MessageID,
@@ -1711,9 +1881,9 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 		}
 
 		// Encrypted envelope? Detect via magic, derive a key from the
-		// embedded KDF state + passphrase, decrypt to the plaintext
-		// gzipped DB.
-		plaintext, err := maybeUnwrapEncrypted(data)
+		// embedded KDF state + the profile's secret, decrypt to the
+		// plaintext gzipped DB.
+		plaintext, err := maybeUnwrapEncrypted(data, sec)
 		if err != nil {
 			return fmt.Errorf("decrypt snapshot: %w", err)
 		}
@@ -1743,6 +1913,12 @@ func tryRecover(ctx context.Context, cfg *config.Config) error {
 		}
 		return nil
 	})
+}
+
+// isNoop reports a plaintext format-1 cipher.
+func isNoop(c crypto.Cipher) bool {
+	_, ok := c.(crypto.NoopCipher)
+	return ok
 }
 
 // replayJournalSince loads journal-op messages from the channel whose
@@ -1801,7 +1977,7 @@ func replayJournalSince(ctx context.Context, sess *tg.Session, cfg *config.Confi
 //     DEK → cipher → open(body). Cold recovery is fully self-
 //     contained — the envelope carries the wrapped DEK alongside the
 //     KDF state, so no local meta_kv is needed.
-func maybeUnwrapEncrypted(data []byte) ([]byte, error) {
+func maybeUnwrapEncrypted(data []byte, sec *secret.Secret) ([]byte, error) {
 	if !snapshot.IsWrapped(data) {
 		return data, nil
 	}
@@ -1813,12 +1989,10 @@ func maybeUnwrapEncrypted(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	pass, err := readPassphrase("Encrypted snapshot — passphrase: ")
-	if err != nil {
-		return nil, err
+	if sec == nil {
+		return nil, errors.New("encrypted snapshot: the profile's secret is needed")
 	}
-	defer zero(pass)
-	derived := crypto.DeriveKey(pass, hdr.Salt, params)
+	derived := crypto.DeriveKey(sec.Bytes(), hdr.Salt, params)
 	defer zero(derived)
 
 	var cipher crypto.Cipher
@@ -1857,6 +2031,32 @@ func maybeUnwrapEncrypted(data []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
+// classify2 maps a format-2 message onto gc's kinds by decrypting its
+// caption. Anything that doesn't open under OUR caption key — text
+// messages (the key message), format-1 leftovers, foreign documents — is
+// KindUnknown, which gc never touches.
+func classify2(cm tg.ChannelMessage, keys *wire.Keys) tg.ChannelMessage {
+	out := tg.ChannelMessage{ID: cm.ID, Date: cm.Date, HasDoc: cm.HasDoc, RawCaption: cm.RawCaption}
+	if !cm.HasDoc || !wire.LooksLikeCaption(cm.RawCaption) {
+		return out
+	}
+	c, err := keys.OpenCaption(cm.RawCaption)
+	if err != nil {
+		return out
+	}
+	switch c.K {
+	case wire.KindChunk, wire.KindPack:
+		out.Kind = tg.KindChunk
+	case wire.KindSnapshot:
+		out.Kind = tg.KindSnapshot
+		out.SnapCap = tg.SnapshotCaption{Kind: "snap", Seq: c.Seq, TSUnix: c.TS, FSUUID: c.FS}
+	case wire.KindJournal:
+		out.Kind = tg.KindJournal
+		out.JnlCap = tg.JournalCaption{Kind: tg.MessageKindJournal, FSUUID: c.FS, FirstSeq: c.First, LastSeq: c.Last, Count: c.N}
+	}
+	return out
+}
+
 // cmdGC walks the channel and removes messages that are no longer
 // referenced by the local meta DB. Identifies two classes of garbage:
 //
@@ -1892,8 +2092,13 @@ func cmdGC(ctx context.Context, args []string) error {
 	// batching, FLOOD_WAIT backoff) where a chunk's message exists on
 	// the channel but its chunk_map row doesn't. gc would classify it
 	// as an orphan and delete freshly-written data.
-	if isProfileMounted(cfg) {
-		return fmt.Errorf("gc: the profile's mount daemon is running — unmount first (gc scans chunk_map at a point in time and would delete chunks whose rows haven't landed yet)")
+	if _, mp, ok, ferr := mountctl.FindByProfile(cfg.ProfileName()); ferr != nil {
+		return fmt.Errorf("gc: %w", ferr) // fail closed
+	} else if ok {
+		return fmt.Errorf("gc: profile %s is mounted at %s — unmount first (gc scans chunk_map at a point in time and would delete chunks whose rows haven't landed yet)", cfg.ProfileName(), mp)
+	}
+	if _, err := os.Stat(cfg.DBPath()); err != nil {
+		return fmt.Errorf("gc: no local DB at %s", cfg.DBPath())
 	}
 	metaStore, err := meta.Open(cfg.DBPath())
 	if err != nil {
@@ -1916,10 +2121,23 @@ func cmdGC(ctx context.Context, args []string) error {
 		}
 	}
 
-	client, err := tg.New(cfg)
+	sec, err := readSecret(ctx, cfg, secret.Unlock)
 	if err != nil {
 		return err
 	}
+	defer sec.Zero()
+	client, err := newClientWith(cfg, sec)
+	if err != nil {
+		return err
+	}
+	// Format 2: a message's kind is known only by decrypting its caption.
+	var keys2 *wire.Keys
+	if f, _ := metaStore.Format(ctx); f == 2 {
+		if keys2, _, err = unlock2(ctx, metaStore, sec); err != nil {
+			return err
+		}
+	}
+	sec.Zero()
 	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
 		var orphanChunks, staleSnaps []int
 		var totalChunks, totalSnaps, tooYoung, foreignSnaps, keptRetention int
@@ -1937,6 +2155,9 @@ func cmdGC(ctx context.Context, args []string) error {
 		ageCutoff := time.Now().Add(-*minAge).Unix()
 		fmt.Printf("Scanning channel (up to %d pages of 100 messages)…\n", *pages)
 		if err := sess.WalkChannelMessages(ctx, *pages, func(cm tg.ChannelMessage) error {
+			if keys2 != nil {
+				cm = classify2(cm, keys2)
+			}
 			switch cm.Kind {
 			case tg.KindJournal:
 				if cm.JnlCap.FSUUID != localUUID {
@@ -2104,18 +2325,11 @@ func cmdGC(ctx context.Context, args []string) error {
 
 func cmdDebug(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("debug: missing subcommand (seed-file, dump-msg)")
+		return errors.New("debug: missing subcommand (dump-msg, observe)")
 	}
 	switch args[0] {
-	case "seed-file":
-		if len(args) < 3 {
-			return errors.New("debug seed-file: usage: seed-file <name> <length-bytes>")
-		}
-		n, err := strconv.ParseInt(args[2], 10, 64)
-		if err != nil || n <= 0 {
-			return fmt.Errorf("debug seed-file: invalid length %q", args[2])
-		}
-		return cmdDebugSeedFile(ctx, args[1], n)
+	case "observe":
+		return cmdDebugObserve(ctx, args[1:])
 	case "dump-msg":
 		if len(args) < 2 {
 			return errors.New("debug dump-msg: usage: dump-msg <message-id>")
@@ -2142,7 +2356,7 @@ func cmdDebugDumpMsg(ctx context.Context, msgID int) error {
 	if err := cfg.RequireChannel(); err != nil {
 		return err
 	}
-	client, err := tg.New(cfg)
+	client, err := newClient(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -2150,96 +2364,4 @@ func cmdDebugDumpMsg(ctx context.Context, msgID int) error {
 		_, err := sess.DownloadDocument(ctx, msgID, os.Stdout)
 		return err
 	})
-}
-
-// cmdDebugSeedFile generates a deterministic-pattern file of n bytes,
-// uploads it as one or more chunks to the backing channel, and records
-// the inode + chunk_map entries in the local SQLite store. Fails loudly
-// if `name` is already present in the root directory.
-func cmdDebugSeedFile(ctx context.Context, name string, n int64) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	if err := cfg.RequireChannel(); err != nil {
-		return err
-	}
-	metaStore, err := meta.Open(cfg.DBPath())
-	if err != nil {
-		return err
-	}
-	defer metaStore.Close()
-
-	if _, err := metaStore.Lookup(ctx, meta.RootIno, name); err == nil {
-		return fmt.Errorf("seed-file: %q already exists (rename / unlink first)", name)
-	} else if !errors.Is(err, meta.ErrNotFound) {
-		return err
-	}
-
-	client, err := tg.New(cfg)
-	if err != nil {
-		return err
-	}
-
-	data := generatePattern(n)
-	sum := md5.Sum(data)
-
-	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
-		ino, err := metaStore.CreateChild(ctx, meta.RootIno, name, meta.Inode{
-			Kind: meta.KindFile,
-			Mode: 0o100644,
-			Size: n,
-		})
-		if err != nil {
-			return fmt.Errorf("create inode: %w", err)
-		}
-
-		chunkSize, err := metaStore.ChunkSize(ctx)
-		if err != nil {
-			return err
-		}
-		chunker := chunk.NewChunker(bytes.NewReader(data), int(chunkSize))
-		var idx int32
-		var uploaded int64
-		for {
-			piece, err := chunker.Next()
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("chunker: %w", err)
-			}
-			cname := fmt.Sprintf("%s.part%d", name, idx)
-			fmt.Printf("Uploading chunk %d (%d bytes)...\n", idx, len(piece))
-			msgID, err := sess.UploadDocument(ctx, bytes.NewReader(piece), cname, "")
-			if err != nil {
-				return fmt.Errorf("upload chunk %d: %w", idx, err)
-			}
-			if err := metaStore.PutChunk(ctx, meta.Chunk{
-				Ino: ino, Idx: idx, TGMessageID: int64(msgID), Size: int32(len(piece)),
-			}); err != nil {
-				return fmt.Errorf("put chunk: %w", err)
-			}
-			uploaded += int64(len(piece))
-			idx++
-		}
-
-		fmt.Printf("\nSeeded %s\n", name)
-		fmt.Printf("  ino:        %d\n", ino)
-		fmt.Printf("  size:       %d bytes\n", uploaded)
-		fmt.Printf("  chunks:     %d\n", idx)
-		fmt.Printf("  expect md5: %s\n", hex.EncodeToString(sum[:]))
-		return nil
-	})
-}
-
-// generatePattern produces n bytes of repeating alphabet, useful for
-// reproducible test files. Byte i is alphabet[i % len(alphabet)].
-func generatePattern(n int64) []byte {
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, n)
-	for i := int64(0); i < n; i++ {
-		b[i] = alphabet[i%int64(len(alphabet))]
-	}
-	return b
 }

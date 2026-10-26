@@ -1,9 +1,12 @@
 package chunk
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -110,12 +113,43 @@ const PendingDirName = "pending"
 // bytes (post-compress, post-encrypt); metadata travels in the
 // filename so a scan doesn't need to open every file.
 //
-// Filename format: <ino>-<idx>-<plaintextSize>.bin
+// Filename format: <ino>-<idx>-<plaintextSize>.bin (format 1), or
+// <ino>-<idx>-<plaintextSize>-<hash hex>.bin (format 2: the content
+// hash is the wire's AAD, so a staged wire must keep it to stay
+// readable and re-submittable after a crash).
 type PendingEntry struct {
 	Ino           int64
 	Idx           int32
 	PlaintextSize int32
+	Hash          []byte // format 2 only
 	Path          string
+}
+
+// ParsePendingName parses a staged wire's file name.
+func ParsePendingName(name string) (PendingEntry, bool) {
+	var e PendingEntry
+	if !endsWith(name, ".bin") {
+		return e, false
+	}
+	parts := strings.Split(name[:len(name)-len(".bin")], "-")
+	if len(parts) != 3 && len(parts) != 4 {
+		return e, false
+	}
+	ino, err1 := strconv.ParseInt(parts[0], 10, 64)
+	idx, err2 := strconv.ParseInt(parts[1], 10, 32)
+	sz, err3 := strconv.ParseInt(parts[2], 10, 32)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return e, false
+	}
+	e.Ino, e.Idx, e.PlaintextSize = ino, int32(idx), int32(sz)
+	if len(parts) == 4 {
+		h, err := hex.DecodeString(parts[3])
+		if err != nil || len(h) == 0 {
+			return e, false
+		}
+		e.Hash = h
+	}
+	return e, true
 }
 
 // EnsurePendingDir creates the pending directory under cacheDir if
@@ -138,7 +172,16 @@ func EnsurePendingDir(cacheDir string) (string, error) {
 // hadn't reached disk before the crash is lost (same as a sync
 // daemon's in-flight buffer would be).
 func PersistPending(dir string, ino int64, idx int32, plaintextSize int32, wire []byte) (string, error) {
+	return PersistPendingHashed(dir, ino, idx, plaintextSize, nil, wire)
+}
+
+// PersistPendingHashed is PersistPending with the format-2 content hash
+// kept in the file name.
+func PersistPendingHashed(dir string, ino int64, idx int32, plaintextSize int32, hash []byte, wire []byte) (string, error) {
 	name := fmt.Sprintf("%d-%d-%d.bin", ino, idx, plaintextSize)
+	if len(hash) > 0 {
+		name = fmt.Sprintf("%d-%d-%d-%s.bin", ino, idx, plaintextSize, hex.EncodeToString(hash))
+	}
 	path := filepath.Join(dir, name)
 	// Write-then-rename so a partial write never appears as a valid
 	// pending entry to ScanPending. Tmp filename includes a process-
@@ -185,24 +228,14 @@ func ScanPending(dir string) ([]PendingEntry, error) {
 			continue
 		}
 		name := e.Name()
-		// Strict suffix check: Sscanf("%d-%d-%d.bin", ...) accepts
-		// trailing garbage like ".tmp-N", so we'd otherwise rescan
-		// half-written files. Insist on exactly ".bin" at the end.
-		if !endsWith(name, ".bin") {
+		// Strict parse: half-written ".tmp-N" files and anything else
+		// that isn't exactly a staged-wire name are skipped.
+		pe, ok := ParsePendingName(name)
+		if !ok {
 			continue
 		}
-		stem := name[:len(name)-len(".bin")]
-		var ino, idx, plaintextSize int64
-		n, err := fmt.Sscanf(stem, "%d-%d-%d", &ino, &idx, &plaintextSize)
-		if err != nil || n != 3 {
-			continue
-		}
-		out = append(out, PendingEntry{
-			Ino:           ino,
-			Idx:           int32(idx),
-			PlaintextSize: int32(plaintextSize),
-			Path:          filepath.Join(dir, name),
-		})
+		pe.Path = filepath.Join(dir, name)
+		out = append(out, pe)
 	}
 	return out, nil
 }

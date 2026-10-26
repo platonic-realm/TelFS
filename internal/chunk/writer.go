@@ -2,7 +2,6 @@ package chunk
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -73,8 +72,7 @@ type Writer struct {
 	meta     *meta.Store
 	cache    *Cache
 	uploader Uploader
-	cipher   crypto.Cipher  // never nil; defaults to NoopCipher
-	codec    compress.Codec // never nil; defaults to None
+	wc       WireCodec // never nil; format 1 or 2
 	pool     *UploadPool
 	packer   *Packer // nil disables packing; small chunks upload directly
 	chunkSz  int64
@@ -129,17 +127,19 @@ type dirtyChunk struct {
 // previously-detached writers committed via SetSize even if their
 // chunk uploads are still in flight.
 func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher crypto.Cipher, codec compress.Codec, pool *UploadPool, packer *Packer, ino int64, chunkSize, dirtyCap int64) (*Writer, error) {
+	return NewWriterWire(ctx, m, c, u, NewFormat1Codec(cipher, codec), pool, packer, ino, chunkSize, dirtyCap)
+}
+
+// NewWriterWire is NewWriter with an explicit wire codec (format 2).
+func NewWriterWire(ctx context.Context, m *meta.Store, c *Cache, u Uploader, wc WireCodec, pool *UploadPool, packer *Packer, ino int64, chunkSize, dirtyCap int64) (*Writer, error) {
 	if chunkSize <= 0 {
 		chunkSize = ChunkSize
 	}
 	if dirtyCap <= 0 {
 		dirtyCap = DefaultDirtyCapBytes
 	}
-	if cipher == nil {
-		cipher = crypto.NoopCipher{}
-	}
-	if codec == nil {
-		codec = compress.None{}
+	if wc == nil {
+		wc = NewFormat1Codec(nil, nil)
 	}
 	if pool == nil {
 		pool = NewUploadPool(DefaultUploadConcurrency)
@@ -172,8 +172,7 @@ func NewWriter(ctx context.Context, m *meta.Store, c *Cache, u Uploader, cipher 
 		meta:          m,
 		cache:         c,
 		uploader:      u,
-		cipher:        cipher,
-		codec:         codec,
+		wc:            wc,
 		pool:          pool,
 		packer:        packer,
 		chunkSz:       chunkSize,
@@ -356,7 +355,7 @@ func (w *Writer) loadForWrite(ctx context.Context, idx int32) (*dirtyChunk, erro
 	// Try to pull existing chunk content (cache hit or TG download).
 	c, err := w.meta.GetChunk(ctx, w.ino, idx)
 	if err == nil {
-		existing, fetchErr := w.cache.Get(ctx, Key{Ino: w.ino, Idx: idx}, c.TGMessageID, c.PackOffset, c.PackSize)
+		existing, fetchErr := w.cache.GetChunk(ctx, Key{Ino: w.ino, Idx: idx}, c)
 		if fetchErr != nil {
 			return nil, fmt.Errorf("preload chunk %d: %w", idx, fetchErr)
 		}
@@ -889,22 +888,19 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		w.mu.Unlock()
 	}()
 
-	// Content-addressed dedup (plaintext FSes only): hash the chunk
-	// bytes and ask meta whether an existing channel message holds the
-	// same content. The reuse path inserts the chunk_map row in the
-	// same transaction as the aliveness check, so GC can never delete
-	// the shared message between the check and our reference.
-	//
-	// Why plaintext only: encrypted chunks use random per-chunk nonces
-	// and (ino, idx)-bound AAD, so the same plaintext yields a
-	// different ciphertext for every slot. Sharing the ciphertext
-	// across slots would require either convergent encryption or
-	// rebinding the AAD — both are wire-format changes that need their
-	// own opt-in. Encrypted FSes get the existing upload-every-time
-	// behavior.
-	if w.dedupEnabled() {
-		sum := sha256.Sum256(dc.data)
-		reused, blobMsgID, _, derr := w.meta.ReuseChunkByHash(context.Background(), w.ino, idx, sum[:])
+	// Content-addressed dedup. The codec decides: format 1 hashes
+	// (sha256) only when the cipher is deterministic (plaintext /
+	// aes-gcm-v3); format 2 always hashes (HMAC under the FS hash key —
+	// the hash is also the wire's AAD). The reuse path inserts the
+	// chunk_map row in the same transaction as the aliveness check, so
+	// GC can never delete the shared message between the check and our
+	// reference. As in v0.22 every chunk is looked up, but only direct
+	// uploads are INDEXED (RecordChunkBlob below), so a small chunk only
+	// dedups against a direct one; indexing packed files is P3.
+	hash := w.wc.Hash(dc.data)
+	packRoute := w.packer != nil && int32(len(dc.data)) < w.packer.Threshold()
+	if hash != nil {
+		reused, _, _, derr := w.meta.ReuseChunkByHash(context.Background(), w.ino, idx, hash)
 		if derr != nil {
 			restore = true
 			lastErr = fmt.Errorf("dedup lookup %d: %w", idx, derr)
@@ -913,31 +909,29 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		}
 		if reused {
 			w.cache.Invalidate(Key{Ino: w.ino, Idx: idx})
-			_ = blobMsgID
 			metrics.DedupHits.Inc()
 			return
 		}
 	}
 
-	// Pipeline: plaintext → compress → encrypt → wire. Compress before
-	// encrypt because (a) ciphertext is high-entropy and would defeat
-	// the compressor, (b) modern zstd is faster than AES-GCM so the
-	// order saves wall-clock too. The chunk_blob dedup hash is over
-	// PLAINTEXT (above), so switching codecs in a fresh FS doesn't
-	// fragment the dedup index.
-	compressed, err := w.codec.Compress(dc.data)
+	// Pipeline: plaintext → compress → encrypt → wire (inside the
+	// codec). Compress before encrypt because ciphertext is high-
+	// entropy and would defeat the compressor.
+	w.mu.Lock()
+	fileSize := w.size
+	w.mu.Unlock()
+	wire, codecUsed, err := w.wc.Encode(w.ino, idx, dc.data, hash)
 	if err != nil {
 		restore = true
-		lastErr = fmt.Errorf("compress chunk %d: %w", idx, err)
+		lastErr = err
 		w.recordTransient(lastErr)
 		return
 	}
-	wire, err := w.cipher.Seal(w.ino, idx, compressed)
-	if err != nil {
-		restore = true
-		lastErr = fmt.Errorf("encrypt chunk %d: %w", idx, err)
-		w.recordTransient(lastErr)
-		return
+	// chunk_map stores the hash only on format 2 (it is the AAD there);
+	// format 1 rows stay exactly as v0.22 wrote them.
+	var rowHash []byte
+	if w.wc.Format() == 2 {
+		rowHash = hash
 	}
 	// Route: pack small chunks, direct-upload everything else. Packing
 	// trades per-file dedup (skipped for packed chunks in v1) for a
@@ -945,14 +939,14 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	// dedup decision above is BYPASSED whenever the chunk would
 	// qualify for packing. Larger chunks still flow through the
 	// dedup + direct-upload path unchanged.
-	if w.packer != nil && int32(len(dc.data)) < w.packer.Threshold() {
+	if packRoute {
 		// Persist wire to disk BEFORE submitting to packer so a
 		// hard daemon kill (or panic) between here and the
 		// packer's chunk_map write doesn't lose the bytes. The
 		// pending dir lives under the cache root; restart scans
 		// it and re-submits via Backend.RecoverPending.
 		if dir := w.pool.PendingDir; dir != "" {
-			p, perr := PersistPending(dir, w.ino, idx, int32(len(dc.data)), wire)
+			p, perr := PersistPendingHashed(dir, w.ino, idx, int32(len(dc.data)), rowHash, wire)
 			if perr != nil {
 				restore = true
 				lastErr = fmt.Errorf("persist pending chunk %d: %w", idx, perr)
@@ -976,7 +970,7 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		// Pending + wg (via Register) stay held until res.Release()
 		// at the bottom of this function, so the reader-side R-A-W
 		// barrier remains honored.
-		resultCh := w.packer.Submit(w.ino, idx, int32(len(dc.data)), wire, pendingPath)
+		resultCh := w.packer.SubmitFrom(w.ino, idx, int32(len(dc.data)), wire, pendingPath, rowHash, codecUsed, fileSize)
 		select {
 		case packRes := <-resultCh:
 			if packRes.err != nil {
@@ -1008,7 +1002,7 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 	// (b) the next daemon startup re-submits it via recoverPending,
 	// and (c) recordLost stops being a data-loss event.
 	if dir := w.pool.PendingDir; dir != "" {
-		p, perr := PersistPending(dir, w.ino, idx, int32(len(dc.data)), wire)
+		p, perr := PersistPendingHashed(dir, w.ino, idx, int32(len(dc.data)), rowHash, wire)
 		if perr != nil {
 			restore = true
 			lastErr = fmt.Errorf("persist pending chunk %d: %w", idx, perr)
@@ -1036,8 +1030,14 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		w.recordTransient(lastErr)
 		return
 	}
-	name := fmt.Sprintf("ino%d-idx%d", w.ino, idx)
-	msgID, err := uploadWithRetry(ctx, w.uploader, wire, name, "")
+	name, caption, err := w.wc.ChunkDoc(ctx, ChunkDocInfo{Ino: w.ino, Idx: idx, Hash: rowHash, Len: int64(len(dc.data)), Codec: codecUsed, FileSize: fileSize})
+	if err != nil {
+		restore = true
+		lastErr = fmt.Errorf("caption chunk %d: %w", idx, err)
+		w.recordTransient(lastErr)
+		return
+	}
+	msgID, err := uploadWithRetry(ctx, w.uploader, wire, name, caption)
 	if err != nil {
 		restore = true
 		metrics.UploadErrors.Inc()
@@ -1059,6 +1059,7 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		Idx:         idx,
 		TGMessageID: int64(msgID),
 		Size:        int32(len(dc.data)),
+		Hash:        rowHash,
 	}); err != nil {
 		// FK violation = the inode was unlinked while this upload was
 		// in flight. The row isn't wanted anymore; retrying would fail
@@ -1088,40 +1089,28 @@ func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneC
 		_ = DeletePending(pendingPath)
 		w.pool.PendingIndex.UnrecordPersist(w.ino, idx)
 	}
-	if w.dedupEnabled() {
+	if hash != nil {
 		// Best-effort index update. A failure here doesn't lose data —
 		// the chunk is on the channel, chunk_map points at it — it just
 		// means future identical writes won't dedup. Surface via stderr
 		// rather than restoring the upload (which would re-upload and
 		// orphan the just-landed message).
-		sum := sha256.Sum256(dc.data)
-		if err := w.meta.RecordChunkBlob(context.Background(), sum[:], int64(msgID), int32(len(dc.data))); err != nil {
+		if err := w.meta.RecordChunkBlob(context.Background(), hash, int64(msgID), int32(len(dc.data))); err != nil {
 			fmt.Fprintf(os.Stderr, "[writer] record blob index ino=%d idx=%d: %v\n", w.ino, idx, err)
 		}
 	}
 	w.cache.Invalidate(Key{Ino: w.ino, Idx: idx})
 }
 
-// dedupEnabled reports whether this writer should attempt content-
-// addressed reuse for outgoing chunks. True for any cipher that
-// declares itself deterministic — NoopCipher (plaintext FS) and
-// AESGCMConvergent (aes-gcm-v3 FS) qualify; the random-nonce AESGCM
-// used by v1/v2 does not. The marker interface lives in
-// internal/crypto so a future cipher type can opt in by implementing
-// it; the writer doesn't have to learn new concrete types.
-//
-// Why an interface rather than a Cipher-level method: a missing
-// Deterministic() on the random-nonce AESGCM is a compile-checked
-// guarantee that it cannot be silently flipped into dedup-eligible
-// state. Adding a method that returns false would put the safety in
-// a runtime bool.
+// dedupSafe marks a format-1 cipher as deterministic (NoopCipher,
+// AESGCMConvergent): only then may format 1 deduplicate, because a
+// reused message must decrypt the same for every slot. Format 1's codec
+// checks it; the random-nonce AESGCM deliberately lacks the method, so
+// it cannot be flipped into dedup-eligible state by accident. Format 2
+// needs no such marker: its chunks are bound to their content hash, not
+// their slot.
 type dedupSafe interface {
 	Deterministic() bool
-}
-
-func (w *Writer) dedupEnabled() bool {
-	d, ok := w.cipher.(dedupSafe)
-	return ok && d.Deterministic()
 }
 
 // recordTransient logs a transient upload failure but does NOT set

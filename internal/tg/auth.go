@@ -53,7 +53,7 @@ func (c *Client) LoginWith(ctx context.Context, ua auth.UserAuthenticator) error
 		// A leftover bot session from the removed bot-auth feature
 		// must be rejected, not silently used as the wrong actor.
 		if self.Bot {
-			return fmt.Errorf("auth: session.json holds a BOT identity (@%s, id=%d) — bot auth is no longer supported; run `telfs profile reset-auth` and log in with your phone", self.Username, self.ID)
+			return fmt.Errorf("auth: the session holds a BOT identity (@%s, id=%d) — bot auth is no longer supported; run `telfs profile reset-auth` and log in with your phone", self.Username, self.ID)
 		}
 		if err := c.recordIdentity(self); err != nil {
 			return err

@@ -1,22 +1,26 @@
 {{define "content"}}
 <h2>Encryption</h2>
 {{if not .HasMeta}}
-<p><em>No metadata DB yet for this profile.</em></p>
+<p><em>No metadata DB yet for this profile.</em> A new filesystem — created in the <a href="/setup">setup wizard</a> or with <code>telfs init</code> — is always encrypted.</p>
+{{else if eq .Format 2}}
+<section class="card">
+  <h3><span class="pill ok">always on</span> Format 2</h3>
+  <p>Chunks, captions, snapshots and the journal are encrypted with keys derived from one random data key, wrapped under the profile's secret. Only message sizes (rounded) and times stay visible on the channel, plus the key header in the pinned message — useless without the secret.</p>
+  <p><small>Change the secret with <code>telfs secret change</code>; print the key header export with <code>telfs key export</code>.</small></p>
+</section>
 {{else if .Enabled}}
 <section class="card">
-  <h3>Enabled</h3>
+  <h3>Format 1, encrypted</h3>
   <dl>
     <dt>Mode</dt><dd><code>{{.Mode}}</code></dd>
     <dt>KDF</dt><dd><code>{{.Argon}}</code></dd>
   </dl>
-  <p>Chunks are AES-GCM ciphertext; snapshots are wrapped in a TFSE envelope.</p>
+  <p>Chunks are AES-GCM ciphertext and snapshots are wrapped in a TFSE envelope — but the journal (names, folders, sizes) reaches the channel in clear. A new filesystem (format 2) encrypts everything.</p>
 </section>
-<p><small>The choice is one-way. To rotate the passphrase, set up a new profile with `cp -r` from old to new.</small></p>
 {{else}}
 <section class="card">
-  <h3>Disabled</h3>
-  <p>Chunks upload as plaintext. Anyone with channel access sees file content.</p>
-  <p><a href="/encrypt/init" class="btn">Enable encryption</a></p>
+  <h3><span class="pill warn">session only</span> Format 1, unencrypted</h3>
+  <p>Chunks upload as plaintext: anyone with channel access sees file content. This profile's secret protects only the Telegram session. An existing filesystem cannot be encrypted in place — rsync its files into a new one (always encrypted).</p>
 </section>
 {{end}}
 {{end}}
