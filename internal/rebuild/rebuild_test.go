@@ -140,7 +140,7 @@ func newFS(t *testing.T) *fs {
 	packer := chunk.NewPacker(m, ch, 1024, 0, 0)
 	packer.SetWire(wc)
 	t.Cleanup(packer.Close)
-	m.SetJournalRefs(true)
+	m.SetJournalV2(true)
 	return &fs{t: t, m: m, keys: keys, wc: wc, ch: ch, cache: cache, pool: chunk.NewUploadPool(4), packer: packer}
 }
 
@@ -174,6 +174,27 @@ func (f *fs) write(parent int64, name string, data []byte) int64 {
 	return ino
 }
 
+// writeDated is write with the inode's mtime set BEFORE the data is
+// written, so the upload's caption carries a known mtime.
+func (f *fs) writeDated(parent int64, name string, data []byte, mtime int64) int64 {
+	ctx := context.Background()
+	ino, err := f.m.CreateChild(ctx, parent, name, meta.Inode{Kind: meta.KindFile, Mode: 0o100644, ChunkSize: cs})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.m.SetAttrs(ctx, ino, meta.SetAttrsPatch{Mtime: &mtime})
+	w, err := chunk.NewWriterWire(ctx, f.m, f.cache, f.ch, f.wc, f.pool, f.packer, ino, cs, 0)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	w.WriteAt(ctx, data, 0)
+	if err := w.Sync(ctx); err != nil {
+		f.t.Fatal(err)
+	}
+	w.Close()
+	return ino
+}
+
 // postJournal posts the pending journal rows as one format-2 batch,
 // exactly as snapshot.UploadJournal2 does.
 func (f *fs) postJournal() {
@@ -191,7 +212,8 @@ func (f *fs) postJournal() {
 	js, _ := json.Marshal(struct {
 		Ops []tg.JournalBatchEntry `json:"ops"`
 	}{ops})
-	body, _ := f.keys.SealMeta("journal", js)
+	packed, _ := wire.PackJournal(js)
+	body, _ := f.keys.SealMeta("journal", packed)
 	capt, _ := f.keys.SealCaption(wire.Caption{K: wire.KindJournal, First: ops[0].Seq, Last: ops[len(ops)-1].Seq, N: len(ops)})
 	f.ch.UploadDocument(ctx, bytes.NewReader(body), wire.DocName, capt)
 	f.m.BatchMarkJournalPosted(ctx, seqs, 1)
@@ -257,11 +279,26 @@ func TestRebuildArashCases(t *testing.T) {
 	f.write(docs, "deleted.txt", rnd(5000))
 	f.m.Unlink(ctx, docs, "deleted.txt") // messages stay until gc
 	f.write(docs, "empty.txt", nil)
+	f.writeDated(docs, "dated.txt", rnd(5000), 1600000000)
 	f.m.CreateChild(ctx, docs, "link", meta.Inode{Kind: meta.KindSymlink, Mode: 0o120777, SymlinkTarget: "a.txt"})
 	tmp := f.mkdir(docs, ".~tmp~")
 	f.write(tmp, "delayed.txt", rnd(4500)) // rsync --delay-updates
 	f.m.Rename(ctx, tmp, "delayed.txt", docs, "delayed.txt")
 	f.m.Unlink(ctx, docs, ".~tmp~")
+	// What rsync does last: the real mode, owner and mtime, plus xattrs
+	// (the live test found these were not journaled).
+	for _, name := range []string{"a.txt", "inplace.txt", "report.pdf", "small.txt"} {
+		in := mustLookup(t, f.m, docs, name)
+		mode, mt := uint32(0o100640), int64(1700000000)
+		if err := f.m.SetAttrs(ctx, in.Ino, meta.SetAttrsPatch{Mode: &mode, Mtime: &mt}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dmode := uint32(0o40750)
+	f.m.SetAttrs(ctx, docs, meta.SetAttrsPatch{Mode: &dmode})
+	f.m.SetXattr(ctx, mustLookup(t, f.m, docs, "a.txt").Ino, "user.tag", []byte("kept"))
+	f.m.SetXattr(ctx, mustLookup(t, f.m, docs, "small.txt").Ino, "user.gone", []byte("x"))
+	f.m.RemoveXattr(ctx, mustLookup(t, f.m, docs, "small.txt").Ino, "user.gone")
 	f.postJournal()
 	_ = reportData
 
@@ -270,6 +307,8 @@ func TestRebuildArashCases(t *testing.T) {
 		t.Fatal("test setup: original tree reads wrong")
 	}
 
+	wantAttrs := attrTree(t, f.m)
+	var lastStore *meta.Store
 	run := func(useJournal bool) (map[string][]byte, *Result) {
 		m2, err := meta.Open(filepath.Join(t.TempDir(), "rebuilt.sqlite"))
 		if err != nil {
@@ -280,6 +319,7 @@ func TestRebuildArashCases(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		lastStore = m2
 		wc2, _ := chunk.NewFormat2Codec(f.keys, nil, m2)
 		return readTree(t, m2, wc2, f.ch), res
 	}
@@ -296,6 +336,14 @@ func TestRebuildArashCases(t *testing.T) {
 	for p := range got {
 		if _, ok := want[p]; !ok && !strings.HasPrefix(p, "/lost+found") {
 			t.Errorf("with journal: unexpected %s", p)
+		}
+	}
+	// Modes, mtimes and xattrs come back with the journal too.
+	m2 := lastStore
+	gotAttrs := attrTree(t, m2)
+	for p, w := range wantAttrs {
+		if gotAttrs[p] != w {
+			t.Errorf("with journal: attributes of %s = %q, want %q", p, gotAttrs[p], w)
 		}
 	}
 
@@ -321,6 +369,12 @@ func TestRebuildArashCases(t *testing.T) {
 	}
 	if !bytes.Equal(got["/docs/a.txt"], big) || !bytes.Equal(got["/docs/inplace.txt"], inplace) || !bytes.Equal(got["/docs/small.txt"], small) {
 		t.Error("captions only: content differs")
+	}
+	// Captions carry the mtime at upload time; the rebuild must keep it
+	// (SetSize's "mtime = now" used to overwrite it).
+	dd, _ := lastStore.Lookup(ctx, meta.RootIno, "docs")
+	if dated, err := lastStore.Lookup(ctx, dd.Ino, "dated.txt"); err != nil || dated.Mtime != 1600000000 {
+		t.Errorf("captions only: dated.txt mtime = %d (%v), want its upload-time 1600000000", dated.Mtime, err)
 	}
 	for _, lost := range []string{"/docs/copy.txt", "/docs/empty.txt", "/docs/link", "/docs/a-link.txt", "/docs/new-name.txt"} {
 		if _, ok := got[lost]; ok {
@@ -361,4 +415,36 @@ func TestMapRsync(t *testing.T) {
 			t.Errorf("MapRsync(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// attrTree maps every path to "mode mtime xattrs" (directories and files;
+// symlinks' mtime is not checked).
+func attrTree(t *testing.T, m *meta.Store) map[string]string {
+	t.Helper()
+	ctx := context.Background()
+	out := map[string]string{}
+	var walk func(dir int64, prefix string)
+	walk = func(dir int64, prefix string) {
+		ents, _ := m.Readdir(ctx, dir)
+		for _, e := range ents {
+			in, _ := m.GetInode(ctx, e.ChildIno)
+			p := prefix + "/" + e.Name
+			names, _ := m.ListXattrs(ctx, e.ChildIno)
+			var xs []string
+			for _, n := range names {
+				v, _ := m.GetXattr(ctx, e.ChildIno, n)
+				xs = append(xs, n+"="+string(v))
+			}
+			mt := in.Mtime
+			if in.Kind != meta.KindFile || in.Mode&0o777 != 0o640 {
+				mt = 0 // only the files whose mtime the test set
+			}
+			out[p] = fmt.Sprintf("%o %d %v", in.Mode, mt, xs)
+			if in.Kind == meta.KindDir {
+				walk(e.ChildIno, p)
+			}
+		}
+	}
+	walk(meta.RootIno, "")
+	return out
 }

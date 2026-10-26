@@ -72,8 +72,12 @@ func TestFindByProfileEmpty(t *testing.T) {
 }
 
 func TestProfileOfSource(t *testing.T) {
-	if p, ok := ProfileOf(Mount{Source: SourceFor("home"), Point: "/x"}); !ok || p != "home" {
+	if p, ok := ProfileOf(Mount{Source: SourceFor("home", ""), Point: "/x"}); !ok || p != "home" {
 		t.Fatalf("telfs:home → %q %v", p, ok)
+	}
+	m := Mount{Source: SourceFor("home", "8f14e45f-ceea"), Point: "/x"}
+	if p, ok := ProfileOf(m); !ok || p != "home" || FSUUIDOf(m) != "8f14e45f-ceea" {
+		t.Fatalf("telfs:home:<uuid> → %q %v %q", p, ok, FSUUIDOf(m))
 	}
 	// A v0.22-style source with no daemon behind it: unknown.
 	if _, ok := ProfileOf(Mount{Source: "telfs", Point: "/definitely/not/mounted"}); ok {
@@ -85,5 +89,37 @@ func TestProfileOfSource(t *testing.T) {
 	e := &ErrUnknownMount{Mountpoints: []string{"/m"}}
 	if !strings.Contains(e.Error(), "/m") {
 		t.Fatal(e.Error())
+	}
+}
+
+func TestWriterConflict(t *testing.T) {
+	const fs = "8f14e45f-0000"
+	home := Mount{Source: SourceFor("home", fs), Point: "/mnt/home"}
+	other := Mount{Source: SourceFor("drill", fs), Point: "/mnt/drill", ReadOnly: true}
+	foreign := Mount{Source: SourceFor("work", "aaaa-bbbb"), Point: "/mnt/work"}
+	old := Mount{Source: "telfs", Point: "/definitely/not/a/telfs/daemon"}
+	cases := []struct {
+		mounts  []Mount
+		profile string
+		fs      string
+		ro      bool
+		blocked bool
+	}{
+		{nil, "home", fs, false, false},
+		{[]Mount{home}, "home", "", false, true},     // same profile, rw
+		{[]Mount{home}, "home", "", true, true},      // same profile, even ro
+		{[]Mount{home}, "copy", fs, false, true},     // same filesystem, rw
+		{[]Mount{home}, "copy", fs, true, false},     // same filesystem, ro: allowed (drill)
+		{[]Mount{other}, "home", fs, false, true},    // a ro mount of it exists: still no rw
+		{[]Mount{foreign}, "home", fs, false, false}, // another filesystem
+		{[]Mount{old}, "home", fs, false, true},      // can't tell: fail closed for rw
+		{[]Mount{old}, "home", fs, true, false},      // a ro mount doesn't write
+		{[]Mount{old}, "home", "", false, true},      // pre-recovery check, rw
+	}
+	for i, c := range cases {
+		got := writerConflict(c.mounts, c.profile, c.fs, c.ro) != ""
+		if got != c.blocked {
+			t.Errorf("case %d: blocked=%v, want %v (%s)", i, got, c.blocked, writerConflict(c.mounts, c.profile, c.fs, c.ro))
+		}
 	}
 }

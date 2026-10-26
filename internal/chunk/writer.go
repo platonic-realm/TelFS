@@ -85,6 +85,12 @@ type Writer struct {
 	dirtyOrder []int32 // FIFO insertion order — eager-dispatch victims pop from front
 	size       int64
 	closed     bool
+	// modified: this handle wrote data since the last size commit. Flush
+	// and Sync commit the size (which stamps mtime = now) ONLY then — a
+	// `touch -d DATE` opens for writing, sets the date and closes without
+	// writing; committing anyway reset its date (found in the P1 live
+	// test).
+	modified bool
 	// sparse mirrors inodes.sparse: the file contains holes (chunk
 	// slots with no data that read as zeros). Set when a write skips
 	// past unwritten space across a chunk boundary, or by truncate-
@@ -285,6 +291,9 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 		if cur > w.size {
 			w.size = cur
 		}
+	}
+	if written > 0 {
+		w.modified = true
 	}
 
 	// Multi-tier: promote chunk_size to a bigger tier if the file
@@ -668,9 +677,16 @@ func (w *Writer) Flush(ctx context.Context) error {
 		}
 	}
 	finalSize := w.size
+	mod := w.modified
+	w.modified = false
 	w.mu.Unlock()
-	if err := w.meta.SetSize(ctx, w.ino, finalSize); err != nil {
-		return err
+	if mod {
+		if err := w.meta.SetSize(ctx, w.ino, finalSize); err != nil {
+			w.mu.Lock()
+			w.modified = true // retry the commit on the next Flush
+			w.mu.Unlock()
+			return err
+		}
 	}
 	// If there was a sticky error from before this Flush (e.g. an
 	// earlier WriteAt's dispatch failed and we never got a chance to
@@ -718,8 +734,15 @@ func (w *Writer) Sync(ctx context.Context) error {
 	stickyErr := w.uploadErr
 	restoredCount := len(w.dirty)
 	finalSize := w.size
+	mod := w.modified
+	w.modified = false
 	w.mu.Unlock()
 	if stickyErr != nil {
+		if mod {
+			w.mu.Lock()
+			w.modified = true
+			w.mu.Unlock()
+		}
 		return stickyErr
 	}
 	if restoredCount > 0 {
@@ -727,9 +750,23 @@ func (w *Writer) Sync(ctx context.Context) error {
 		// future retry. fsync semantics require us to surface that;
 		// the caller can retry Sync once the transient condition
 		// clears.
+		if mod {
+			w.mu.Lock()
+			w.modified = true
+			w.mu.Unlock()
+		}
 		return fmt.Errorf("sync: %d chunk(s) failed to upload and were restored for retry", restoredCount)
 	}
-	return w.meta.SetSize(ctx, w.ino, finalSize)
+	if !mod {
+		return nil // nothing written through this handle: leave size and mtime alone
+	}
+	if err := w.meta.SetSize(ctx, w.ino, finalSize); err != nil {
+		w.mu.Lock()
+		w.modified = true
+		w.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // dispatchFlushLocked pops the dirty chunk at idx, marks it as in-flight,

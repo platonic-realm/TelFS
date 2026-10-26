@@ -47,8 +47,9 @@ func (s *Store) Format(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// SetJournalRefs turns on `ref` journal ops for dedup hits (format 2).
-func (s *Store) SetJournalRefs(on bool) { s.journalRefs.Store(on) }
+// SetJournalV2 turns on the format-2 journal ops (ref, setattr,
+// setxattr, rmxattr). Format 1 journals stay exactly as in v0.22.
+func (s *Store) SetJournalV2(on bool) { s.journalV2.Store(on) }
 
 // PathOf returns one path of ino from the root (the name hint of chunk
 // captions, P1 §4.3): the first dirent by (parent, name) at each level,

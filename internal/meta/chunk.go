@@ -313,7 +313,7 @@ func (s *Store) ReuseChunkByHash(ctx context.Context, ino int64, idx int32, hash
 			ino, idx, blobMsgID, blobSize, hash); ierr != nil {
 			return fmt.Errorf("reuse put chunk: %w", ierr)
 		}
-		if s.journalRefs.Load() {
+		if s.journalV2.Load() {
 			if _, jerr := s.appendJournalTx(ctx, tx, JournalOp{Op: OpRef, Ino: ino, Idx: idx,
 				MsgID: blobMsgID, ChunkLen: blobSize, Hash: hash}); jerr != nil {
 				return jerr

@@ -186,9 +186,13 @@ func DownloadJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, ms
 	if _, err := sess.DownloadDocument(ctx, msgID, &buf); err != nil {
 		return nil, fmt.Errorf("download journal batch %d: %w", msgID, err)
 	}
-	plain, err := keys.OpenMeta("journal", buf.Bytes())
+	sealed, err := keys.OpenMeta("journal", buf.Bytes())
 	if err != nil {
 		return nil, err
+	}
+	plain, err := wire.UnpackJournal(sealed)
+	if err != nil {
+		return nil, fmt.Errorf("journal batch %d: %w", msgID, err)
 	}
 	var body journalBody2
 	if err := json.Unmarshal(plain, &body); err != nil {
@@ -206,7 +210,11 @@ func UploadJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, ops 
 	if err != nil {
 		return 0, err
 	}
-	body, err := keys.SealMeta("journal", js)
+	packed, err := wire.PackJournal(js)
+	if err != nil {
+		return 0, err
+	}
+	body, err := keys.SealMeta("journal", packed)
 	if err != nil {
 		return 0, err
 	}

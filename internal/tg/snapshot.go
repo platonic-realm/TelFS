@@ -169,6 +169,9 @@ func (s *Session) DeleteChannelMessages(ctx context.Context, ids ...int) error {
 	if len(ids) == 0 {
 		return nil
 	}
+	if s.readOnly.Load() {
+		return ErrReadOnly
+	}
 	_, inCh, err := s.channelPeer()
 	if err != nil {
 		return err

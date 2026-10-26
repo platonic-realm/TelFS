@@ -22,6 +22,9 @@ package meta
 //   - rename: Rename      — moves a dirent
 //   - setsize: SetSize    — explicit truncate (size change)
 //   - ref:    a format-2 dedup hit referencing an existing chunk
+//   - setattr / setxattr / rmxattr: format 2 only (chmod, chown,
+//     utimes, xattrs) — format 1 posts its journal in clear, so its
+//     ops stay as in v0.22
 //
 // Not journaled (yet): xattr ops, generic SetAttrs, chunk_map updates.
 // Chunks are independently recoverable from the channel itself; xattrs
@@ -65,16 +68,27 @@ type JournalOp struct {
 	PackSize   int32  `json:"psize,omitempty"`
 	ChunkLen   int32  `json:"clen,omitempty"`
 	Hash       []byte `json:"h,omitempty"`
+
+	// setattr (format 2): Set lists which of mode/uid/gid/mtime/size
+	// the op carries — zero is a real value (uid 0, mode 0).
+	Set []string `json:"set,omitempty"`
+	// setxattr / rmxattr (format 2).
+	XName  string `json:"xname,omitempty"`
+	XValue []byte `json:"xvalue,omitempty"`
 }
 
 // Journal op type tags. Kept short to minimize per-op payload size on
 // the channel.
 const (
-	OpCreateChild = "create"
-	OpLink        = "link"
-	OpUnlink      = "unlink"
-	OpRename      = "rename"
-	OpSetSize     = "setsize"
-	OpSetSparse   = "setsparse"
-	OpRef         = "ref"
+	OpCreateChild  = "create"
+	OpLink         = "link"
+	OpUnlink       = "unlink"
+	OpRename       = "rename"
+	OpSetSize      = "setsize"
+	OpSetSparse    = "setsparse"
+	OpRef          = "ref"
+	OpSetAttr      = "setattr"
+	OpSetXattr     = "setxattr"
+	OpRmXattr      = "rmxattr"
+	OpSetChunkSize = "setcs"
 )

@@ -63,7 +63,22 @@ type Session struct {
 	// docSweepAt is when the last docCache expiry sweep ran; gates
 	// maybeSweepDocCache to once per TTL window.
 	docSweepAt atomic.Pointer[time.Time]
+
+	// readOnly makes every channel-WRITING call fail with ErrReadOnly
+	// (`telfs mount --readonly`, e.g. a recovery drill on a second
+	// machine): uploads, posts, deletions, pins. Structural, so no code
+	// path can post a snapshot or journal batch by accident.
+	readOnly atomic.Bool
 }
+
+// ErrReadOnly: a channel write was attempted on a read-only session.
+var ErrReadOnly = errors.New("read-only mount: TelFS does not write to the channel")
+
+// SetReadOnly turns the channel-write guard on or off.
+func (s *Session) SetReadOnly(on bool) { s.readOnly.Store(on) }
+
+// ReadOnly reports whether channel writes are refused.
+func (s *Session) ReadOnly() bool { return s.readOnly.Load() }
 
 type docCacheEntry struct {
 	doc       *tg.Document
@@ -121,12 +136,12 @@ func (s *Session) channelPeer() (*tg.InputPeerChannel, *tg.InputChannel, error) 
 		return nil, nil, err
 	}
 	return &tg.InputPeerChannel{
-			ChannelID:  s.cfg.Channel.ID,
-			AccessHash: s.cfg.Channel.AccessHash,
-		}, &tg.InputChannel{
-			ChannelID:  s.cfg.Channel.ID,
-			AccessHash: s.cfg.Channel.AccessHash,
-		}, nil
+		ChannelID:  s.cfg.Channel.ID,
+		AccessHash: s.cfg.Channel.AccessHash,
+	}, &tg.InputChannel{
+		ChannelID:  s.cfg.Channel.ID,
+		AccessHash: s.cfg.Channel.AccessHash,
+	}, nil
 }
 
 // VerifyAccess confirms with two cheap RPCs that (1) the session
@@ -303,6 +318,9 @@ func (s *Session) SetChannel(ctx context.Context, id int64, accessHash int64) (C
 // PostMessage sends a plain text message to the configured channel and
 // returns the new message id.
 func (s *Session) PostMessage(ctx context.Context, text string) (int, error) {
+	if s.readOnly.Load() {
+		return 0, ErrReadOnly
+	}
 	peer, _, err := s.channelPeer()
 	if err != nil {
 		return 0, err
@@ -354,6 +372,9 @@ const uploadMaxAttempts = 4
 // honest cancellation. FLOOD_WAIT is handled before reaching us by
 // the gotd middleware.
 func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, caption string) (int, error) {
+	if s.readOnly.Load() {
+		return 0, ErrReadOnly
+	}
 	peer, _, err := s.channelPeer()
 	if err != nil {
 		return 0, err

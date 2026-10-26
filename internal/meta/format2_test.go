@@ -54,7 +54,7 @@ func TestRefOpJournaledAndReplayed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	s.SetJournalRefs(true)
+	s.SetJournalV2(true)
 	a, _ := s.CreateChild(ctx, RootIno, "a", Inode{Kind: KindFile, Mode: 0o100644})
 	b, _ := s.CreateChild(ctx, RootIno, "b", Inode{Kind: KindFile, Mode: 0o100644})
 	h := make([]byte, 32)
@@ -99,5 +99,72 @@ func TestRefOpJournaledAndReplayed(t *testing.T) {
 	}
 	if f, _ := s.Format(ctx); f != 1 {
 		t.Fatalf("a fresh DB is format 1 until init: %d", f)
+	}
+}
+
+func TestAdvanceJournalSeq(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// A fresh DB has no journal row in sqlite_sequence yet.
+	if err := s.AdvanceJournalSeq(ctx, 500); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.LastJournalSeq(ctx); n != 500 {
+		t.Fatalf("after advance: %d", n)
+	}
+	// Replayed ops don't journal; the next real change continues after 500.
+	s.ReplayOp(ctx, JournalOp{Op: OpCreateChild, Parent: RootIno, Name: "r", Ino: 50, Kind: KindFile, Mode: 0o100644})
+	if _, err := s.CreateChild(ctx, RootIno, "x", Inode{Kind: KindFile, Mode: 0o100644}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.LastJournalSeq(ctx); n != 501 {
+		t.Fatalf("next op seq = %d, want 501", n)
+	}
+	// Never moves backwards.
+	s.AdvanceJournalSeq(ctx, 10)
+	if n, _ := s.LastJournalSeq(ctx); n != 501 {
+		t.Fatalf("went backwards: %d", n)
+	}
+}
+
+func TestReplaySetSizeKeepsMtimeAndChunkSizeJournaled(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetJournalV2(true)
+	ino, _ := s.CreateChild(ctx, RootIno, "f", Inode{Kind: KindFile, Mode: 0o100644})
+	if err := s.ReplayOp(ctx, JournalOp{Op: OpSetSize, Ino: ino, Size: 99, Mtime: 1600000000}); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := s.GetInode(ctx, ino)
+	if in.Size != 99 || in.Mtime != 1600000000 {
+		t.Fatalf("replayed setsize: size %d mtime %d, want 99 / 1600000000 (not the replay time)", in.Size, in.Mtime)
+	}
+	if err := s.SetInodeChunkSize(ctx, ino, 16<<20); err != nil {
+		t.Fatal(err)
+	}
+	pend, _ := s.PendingJournal(ctx)
+	var found bool
+	for _, e := range pend {
+		if op, _ := DecodeOp(e.OpJSON); op.Op == OpSetChunkSize && op.Ino == ino && op.ChunkSize == 16<<20 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("a chunk-size promotion must be journaled on format 2")
+	}
+	s2, _ := Open(filepath.Join(t.TempDir(), "db2.sqlite"))
+	defer s2.Close()
+	s2.ReplayOp(ctx, JournalOp{Op: OpCreateChild, Parent: RootIno, Name: "f", Ino: ino, Kind: KindFile, Mode: 0o100644})
+	s2.ReplayOp(ctx, JournalOp{Op: OpSetChunkSize, Ino: ino, ChunkSize: 16 << 20})
+	if in, _ := s2.GetInode(ctx, ino); in.ChunkSize != 16<<20 {
+		t.Fatalf("replayed chunk size %d", in.ChunkSize)
 	}
 }

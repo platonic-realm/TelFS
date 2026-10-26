@@ -647,6 +647,20 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return err
 	}
 
+	// Single-writer guard (this machine): one daemon per profile, and no
+	// second read-write mount of a filesystem already mounted — checked
+	// by profile now, by fs_uuid once the DB is open. The profile lock
+	// closes the race of two mounts starting together (released by the
+	// kernel when this process ends, however it ends).
+	if c := mountctl.WriterConflict(cfg.ProfileName(), "", *readonly); c != "" {
+		return fmt.Errorf("mount: %s", c)
+	}
+	lock, err := lockProfile(cfg)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
 	// The profile's secret, read ONCE: it opens session.enc (Argon2id
 	// #1) and, below, the filesystem key (Argon2id #2 on format 2, the
 	// passphrase of an encrypted format-1 FS). Zeroed as soon as both
@@ -668,7 +682,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		if *noRecover {
 			return errors.New("--no-recover: there is no local DB to mount — run `telfs init` to create a filesystem, or mount without --no-recover to restore one from the channel")
 		}
-		if err := tryRecover(signalCtx, cfg, client, sec, *keyHeader); err != nil {
+		if err := tryRecover(signalCtx, cfg, client, sec, *keyHeader, *readonly); err != nil {
 			return fmt.Errorf("recovery: %w", err)
 		}
 	}
@@ -678,6 +692,13 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return err
 	}
 	defer metaStore.Close()
+	fsUUID, err := metaStore.FSUUID(signalCtx)
+	if err != nil {
+		return err
+	}
+	if c := mountctl.WriterConflict(cfg.ProfileName(), fsUUID, *readonly); c != "" {
+		return fmt.Errorf("mount: %s", c)
+	}
 
 	// Startup repair: a previous daemon may have died mid-upload
 	// (FLOOD_WAIT, kill, OOM, etc.) and left files whose chunk_map
@@ -793,6 +814,10 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// of waiting for the kernel's TCP timeout (~15 min).
 	mgr := client.NewSessionManager()
 	sess := mgr.Session()
+	// --readonly never writes to the channel: the session itself refuses
+	// every upload, post, deletion and pin (and below, the snapshot
+	// manager, journal poster and staged-upload recovery don't start).
+	sess.SetReadOnly(*readonly)
 	mgrCtx, stopMgr := context.WithCancel(context.Background())
 	firstConnect := make(chan error, 1)
 	mgrDone := make(chan error, 1)
@@ -1077,6 +1102,8 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			AllowOther: *allowOther,
 			Debug:      *debug,
 			Profile:    cfg.ProfileName(),
+			FSUUID:     fsUUID,
+			ReadOnly:   *readonly,
 		}, backend)
 		if err != nil {
 			return err
@@ -1089,7 +1116,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		snapCtx, stopSnap := context.WithCancel(signalCtx)
 		snapDone := make(chan struct{})
 		go func() {
-			_ = snapMgr.Run(snapCtx)
+			if !*readonly {
+				_ = snapMgr.Run(snapCtx)
+			}
 			close(snapDone)
 		}()
 
@@ -1103,7 +1132,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		journalCtx, stopJournal := context.WithCancel(signalCtx)
 		journalDone := make(chan struct{})
 		go func() {
-			_ = journalPoster.Run(journalCtx)
+			if !*readonly {
+				_ = journalPoster.Run(journalCtx)
+			}
 			close(journalDone)
 		}()
 
@@ -1245,7 +1276,11 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// delay the "Mounted at" line. Errors are logged but not
 		// fatal — they don't break the mount, just leave staged
 		// wires for the next attempt.
-		go recoverPending(signalCtx, pendingDir, packer, metaStore, pendingIndex)
+		if *readonly {
+			fmt.Fprintln(os.Stderr, "read-only: no snapshots, no journal, no uploads — nothing is written to the channel")
+		} else {
+			go recoverPending(signalCtx, pendingDir, packer, metaStore, pendingIndex)
+		}
 
 		// Stall watchdog: if there's chunk work pending but no
 		// successful RPC has registered for a while (and no server-
@@ -1266,7 +1301,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 						fmt.Fprintf(os.Stderr, "[key] WARNING: %s\n", kc.Detail)
 					}
 				}
-				deleteOldKeyMessages(signalCtx, sess, metaStore) // left by an interrupted secret change
+				if !*readonly {
+					deleteOldKeyMessages(signalCtx, sess, metaStore) // left by an interrupted secret change
+				}
 				check()
 				t := time.NewTicker(6 * time.Hour)
 				defer t.Stop()
@@ -1370,12 +1407,14 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// inside the callback. 10-second budget keeps the total
 			// (12 drain + 10 snapshot + slack) under the 30s
 			// watchdog below.
-			fmt.Println("Taking final snapshot…")
-			finalCtx, finalCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := snapMgr.Once(finalCtx); err != nil {
-				fmt.Fprintln(os.Stderr, "[snapshot] final failed:", err)
+			if !*readonly {
+				fmt.Println("Taking final snapshot…")
+				finalCtx, finalCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if err := snapMgr.Once(finalCtx); err != nil {
+					fmt.Fprintln(os.Stderr, "[snapshot] final failed:", err)
+				}
+				finalCancel()
 			}
-			finalCancel()
 		}()
 		select {
 		case <-done:
@@ -1838,8 +1877,9 @@ func armForceExit(mountpoint string) {
 // first (pinned key message, or the --key-header export → secret →
 // newest snapshot → encrypted journal); else format 1 (newest snapshot
 // caption, envelope decrypted with the profile's secret → journal).
-func tryRecover(ctx context.Context, cfg *config.Config, client *tg.Client, sec *secret.Secret, keyHeaderPath string) error {
+func tryRecover(ctx context.Context, cfg *config.Config, client *tg.Client, sec *secret.Secret, keyHeaderPath string, readOnly bool) error {
 	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
+		sess.SetReadOnly(readOnly) // a read-only drill restores locally, never writes the channel
 		fmt.Println("Local DB missing — looking for the filesystem on the channel…")
 		found2, err := recover2(ctx, cfg, sess, sec, keyHeaderPath)
 		if found2 || err != nil {
@@ -1959,6 +1999,10 @@ func replayJournalSince(ctx context.Context, sess *tg.Session, cfg *config.Confi
 		if err := mstore.ReplayOp(ctx, op); err != nil {
 			return fmt.Errorf("apply journal op seq=%d (%s): %w", m.Caption.Seq, op.Op, err)
 		}
+	}
+	// Continue the sequence after the replayed ops (see AdvanceJournalSeq).
+	if err := mstore.AdvanceJournalSeq(ctx, msgs[len(msgs)-1].Caption.Seq); err != nil {
+		return err
 	}
 	fmt.Printf("Replayed %d journal ops.\n", len(msgs))
 	return nil
@@ -2364,4 +2408,19 @@ func cmdDebugDumpMsg(ctx context.Context, msgID int) error {
 		_, err := sess.DownloadDocument(ctx, msgID, os.Stdout)
 		return err
 	})
+}
+
+// lockProfile takes an exclusive lock on <profile>/daemon.lock for the
+// life of the mount daemon (single-writer guard against two mounts of
+// one profile racing). The kernel drops it when the process ends.
+func lockProfile(cfg *config.Config) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(cfg.DataDir, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("profile lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("mount: another telfs daemon for profile %s is starting or running (profile lock held)", cfg.ProfileName())
+	}
+	return f, nil
 }

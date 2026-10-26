@@ -16,10 +16,15 @@ type MountOptions struct {
 	MountPoint string
 	AllowOther bool
 	Debug      bool
-	// Profile names the mount in /proc/mounts (source "telfs:<profile>")
-	// so tools find a daemon's profile without reading its environ —
-	// which a non-dumpable daemon hides (decision D5, mountctl).
+	// Profile and FSUUID name the mount in /proc/mounts (source
+	// "telfs:<profile>:<fs_uuid>") so tools find a daemon's profile and
+	// filesystem without reading its environ — which a non-dumpable
+	// daemon hides — and the single-writer guard can see them.
 	Profile string
+	FSUUID  string
+	// ReadOnly adds the kernel "ro" option (the backend refuses writes
+	// with EROFS too); visible in /proc/mounts.
+	ReadOnly bool
 }
 
 // Mount creates and starts a FUSE server backed by b at opts.MountPoint.
@@ -42,7 +47,10 @@ func Mount(opts MountOptions, b *Backend) (*serverHandle, error) {
 	fuseOpts.MountOptions.Name = "telfs"
 	fuseOpts.MountOptions.FsName = "telfs"
 	if opts.Profile != "" {
-		fuseOpts.MountOptions.FsName = mountctl.SourceFor(opts.Profile)
+		fuseOpts.MountOptions.FsName = mountctl.SourceFor(opts.Profile, opts.FSUUID)
+	}
+	if opts.ReadOnly {
+		fuseOpts.MountOptions.Options = append(fuseOpts.MountOptions.Options, "ro")
 	}
 	// CAP_WRITEBACK_CACHE lets the kernel coalesce small writes into the
 	// MaxWrite-sized requests we already handle efficiently. For workloads

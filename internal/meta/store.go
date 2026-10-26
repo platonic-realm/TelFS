@@ -56,8 +56,9 @@ type Store struct {
 	// channel-recovered ops (which already exist on the channel).
 	replaying atomic.Bool
 
-	// journalRefs makes dedup hits journal a `ref` op (format 2).
-	journalRefs atomic.Bool
+	// journalV2 turns on the format-2 journal ops: `ref` for dedup
+	// hits, `setattr` / `setxattr` / `rmxattr` for attribute changes.
+	journalV2 atomic.Bool
 
 	// onInodeDeleted, if non-nil, is invoked after a committed
 	// transaction has removed an inodes row (whether via Unlink that

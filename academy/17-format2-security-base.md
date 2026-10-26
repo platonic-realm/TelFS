@@ -282,11 +282,34 @@ the empty file, the symlink, the second link name, the later rename).
   still writing. Old bug, but non-dumpable sealed the escape hatch (a
   daemon's `cwd` is unreadable now). `telfs mount` now re-execs itself with
   the absolute path, so the command line always names the mount exactly.
-- **What the journal does not carry.** chmod/chown/utimes after creation
-  and xattr changes are not journal ops. A snapshot covers them; a rebuild
-  without snapshots cannot (rsync creates files `0600` and sets the real
+- **What the journal did not carry.** chmod/chown/utimes after creation
+  and xattr changes were not journal ops. A snapshot covers them; a rebuild
+  without snapshots could not (rsync creates files `0600` and sets the real
   mode and mtime last — the live test's rebuilt tree had the right names and
-  content but nearly every mode and mtime wrong).
+  content but nearly every mode and mtime wrong). Format 2 now journals
+  `setattr`, `setxattr`, `rmxattr` and chunk-size promotions, compressed.
+  Chasing the one mtime that still came back wrong uncovered three more
+  bugs, each older than P1:
+  1. `SetSize` wrote the size and its journal row in two transactions, so a
+     `touch` landing between them was journaled in the wrong order;
+  2. replaying a size change used the replay's clock as mtime;
+  3. and the real culprit: closing a handle that wrote nothing still
+     committed the size with mtime = now — `touch -d 2020-01-02 f` opens
+     the file for writing, sets the date, closes, and the close erased the
+     date. The kernel's 5-second attribute cache hid it: a `stat` right
+     after looked fine.
+  A fourth one surfaced in passing: replayed ops are not re-journaled, so
+  after a recovery the local journal sequence stayed at the snapshot's —
+  the next change reused sequence numbers already on the channel, and a
+  later recovery would apply old ops twice. Recovery now advances it.
+- **One writer, and drills that write nothing.** The mount source became
+  `telfs:<profile>:<fs_uuid>`, so `telfs mount` can refuse a second daemon
+  for a profile and a second writer for a filesystem on the same machine
+  (an flock on `<profile>/daemon.lock` closes the start-up race). A second
+  *machine* is not covered — nothing on Telegram is a compare-and-swap.
+  `--readonly` is enforced in the session: every channel-writing call
+  returns `ErrReadOnly`, so a recovery drill on another machine cannot post
+  a snapshot that would compete with the real writer's.
 - **`--no-recover` used to start an empty filesystem.** A filesystem is
   now created only by `telfs init`; a channel without one is an error.
 

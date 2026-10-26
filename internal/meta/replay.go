@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ReplayOp applies a single JournalOp to the store. Used by
@@ -92,7 +93,13 @@ func (s *Store) ReplayOp(ctx context.Context, op JournalOp) error {
 		}
 		return err
 	case OpSetSize:
-		err := s.SetSize(ctx, op.Ino, op.Size)
+		// The recorded mtime, not the replay's clock (older ops without
+		// one fall back to now).
+		mt := op.Mtime
+		if mt == 0 {
+			mt = time.Now().Unix()
+		}
+		err := s.setSizeAt(ctx, op.Ino, op.Size, mt)
 		if errors.Is(err, ErrNotFound) {
 			return nil // inode unlinked later in the journal
 		}
@@ -102,6 +109,47 @@ func (s *Store) ReplayOp(ctx context.Context, op JournalOp) error {
 			Size: op.ChunkLen, PackOffset: op.PackOffset, PackSize: op.PackSize, Hash: op.Hash})
 		if IsFKViolation(err) {
 			return nil // inode unlinked later in the journal
+		}
+		return err
+	case OpSetChunkSize:
+		_, err := s.db.ExecContext(ctx, `UPDATE inodes SET chunk_size = ? WHERE ino = ?`, op.ChunkSize, op.Ino)
+		return err
+	case OpSetAttr:
+		var p SetAttrsPatch
+		for _, f := range op.Set {
+			switch f {
+			case "mode":
+				v := op.Mode
+				p.Mode = &v
+			case "uid":
+				v := op.UID
+				p.UID = &v
+			case "gid":
+				v := op.GID
+				p.GID = &v
+			case "mtime":
+				v := op.Mtime
+				p.Mtime = &v
+			case "size":
+				v := op.Size
+				p.Size = &v
+			}
+		}
+		err := s.SetAttrs(ctx, op.Ino, p)
+		if errors.Is(err, ErrNotFound) {
+			return nil // inode unlinked later in the journal
+		}
+		return err
+	case OpSetXattr:
+		err := s.SetXattr(ctx, op.Ino, op.XName, op.XValue)
+		if IsFKViolation(err) {
+			return nil
+		}
+		return err
+	case OpRmXattr:
+		err := s.RemoveXattr(ctx, op.Ino, op.XName)
+		if errors.Is(err, ErrNotFound) {
+			return nil
 		}
 		return err
 	default:

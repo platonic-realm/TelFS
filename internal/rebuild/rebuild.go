@@ -193,6 +193,17 @@ func Run(ctx context.Context, src Source, keys *wire.Keys, m *meta.Store, opt Op
 		}
 	}
 
+	// The rebuilt journal continues after every sequence number already on
+	// the channel — replayed or ignored — so its new batches never clash
+	// with old ones (meta.AdvanceJournalSeq).
+	var maxSeq int64
+	for _, b := range batches {
+		if b.cap.Last > maxSeq {
+			maxSeq = b.cap.Last
+		}
+	}
+	defer func() { _ = m.AdvanceJournalSeq(ctx, maxSeq) }()
+
 	// New inode numbers (lost+found, folders made from hints) start
 	// above every original one, so originals can keep their numbers.
 	maxIno := meta.RootIno
@@ -217,7 +228,11 @@ func Run(ctx context.Context, src Source, keys *wire.Keys, m *meta.Store, opt Op
 			if err != nil {
 				return nil, fmt.Errorf("journal batch %d: %w", b.msgID, err)
 			}
-			plain, err := keys.OpenMeta("journal", raw)
+			sealed, err := keys.OpenMeta("journal", raw)
+			if err != nil {
+				return nil, fmt.Errorf("journal batch %d: %w", b.msgID, err)
+			}
+			plain, err := wire.UnpackJournal(sealed)
 			if err != nil {
 				return nil, fmt.Errorf("journal batch %d: %w", b.msgID, err)
 			}
@@ -307,11 +322,17 @@ func Run(ctx context.Context, src Source, keys *wire.Keys, m *meta.Store, opt Op
 			}
 		}
 		existing, gerr := m.GetInode(ctx, ino)
+		if gerr == nil && facts.cs > 0 && existing.ChunkSize != facts.cs {
+			// The chunks were written at the size their captions name.
+			if err := m.ReplayOp(ctx, meta.JournalOp{Op: meta.OpSetChunkSize, Ino: ino, ChunkSize: facts.cs}); err == nil {
+				existing.ChunkSize = facts.cs
+			}
+		}
 		if gerr == nil {
 			rep.NameSource = SrcJournal
 			if existing.Size > 0 || size == 0 {
 				size = existing.Size // the journal's setsize is newer than any caption
-			} else if err := m.ReplayOp(ctx, meta.JournalOp{Op: meta.OpSetSize, Ino: ino, Size: size}); err != nil {
+			} else if err := setSizeKeepMtime(ctx, m, ino, size, existing.Mtime); err != nil {
 				rep.Notes = append(rep.Notes, "size not set: "+err.Error())
 			}
 			if p, ok := m.PathOf(ctx, ino); ok {
@@ -523,5 +544,17 @@ func (b *builder) createFile(ino int64, p string, facts chunkObs, cs, size int64
 		Kind: meta.KindFile, Mode: mode, Mtime: facts.mtime, ChunkSize: cs, UID: uid(), GID: gid()}); err != nil {
 		return err
 	}
-	return b.m.ReplayOp(b.ctx, meta.JournalOp{Op: meta.OpSetSize, Ino: ino, Size: size})
+	return setSizeKeepMtime(b.ctx, b.m, ino, size, facts.mtime)
+}
+
+// setSizeKeepMtime sets a rebuilt file's size without letting SetSize's
+// "mtime = now" overwrite the mtime the rebuild just restored.
+func setSizeKeepMtime(ctx context.Context, m *meta.Store, ino, size, mtime int64) error {
+	if err := m.ReplayOp(ctx, meta.JournalOp{Op: meta.OpSetSize, Ino: ino, Size: size}); err != nil {
+		return err
+	}
+	if mtime == 0 {
+		return nil
+	}
+	return m.ReplayOp(ctx, meta.JournalOp{Op: meta.OpSetAttr, Ino: ino, Set: []string{"mtime"}, Mtime: mtime})
 }

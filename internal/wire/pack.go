@@ -119,3 +119,35 @@ func (k *Keys) OpenMeta(kind string, wire []byte) ([]byte, error) {
 	}
 	return plain[8 : 8+n], nil
 }
+
+// Journal batch plaintext: 'z' + zstd(JSON) (journal JSON compresses
+// about tenfold — rsync adds setattr ops for every file). Batches written
+// before compression was added start with '{' (plain JSON); both decode.
+
+// PackJournal compresses a journal batch's JSON for SealMeta.
+func PackJournal(js []byte) ([]byte, error) {
+	z, err := compress.NewZstd()
+	if err != nil {
+		return nil, err
+	}
+	comp, err := z.Compress(js)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte{'z'}, comp...), nil
+}
+
+// UnpackJournal reverses PackJournal (and passes plain JSON through).
+func UnpackJournal(plain []byte) ([]byte, error) {
+	if len(plain) == 0 || plain[0] == '{' {
+		return plain, nil
+	}
+	if plain[0] != 'z' {
+		return nil, errors.New("journal body: unknown encoding")
+	}
+	z, err := compress.NewZstd()
+	if err != nil {
+		return nil, err
+	}
+	return z.Decompress(plain[1:])
+}

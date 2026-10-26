@@ -107,7 +107,7 @@ func newF2Env(t *testing.T) *f2env {
 	packer := NewPacker(m, up, 1024, 0, 0)
 	packer.SetWire(wc)
 	t.Cleanup(packer.Close)
-	m.SetJournalRefs(true)
+	m.SetJournalV2(true)
 	return &f2env{m: m, keys: keys, wc: wc, up: up, cache: cache, pool: NewUploadPool(4), packer: packer}
 }
 
@@ -277,5 +277,31 @@ func TestFormat2PendingNamesKeepHash(t *testing.T) {
 	ents, _ = ScanPending(dir)
 	if len(ents) != 2 {
 		t.Fatalf("scan both: %+v", ents)
+	}
+}
+
+// A handle that writes nothing must not touch size or mtime on close —
+// `touch -d DATE f` opens for writing, sets the date, closes.
+func TestFlushWithoutWritesKeepsMtime(t *testing.T) {
+	ctx := context.Background()
+	e := newF2Env(t)
+	ino := e.write(t, meta.RootIno, "f", []byte("content"))
+	date := int64(1577930645)
+	if err := e.m.SetAttrs(ctx, ino, meta.SetAttrsPatch{Mtime: &date}); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWriterWire(ctx, e.m, e.cache, e.up, e.wc, e.pool, e.packer, ino, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	if in, _ := e.m.GetInode(ctx, ino); in.Mtime != date || in.Size != 7 {
+		t.Fatalf("after an open/close without writes: mtime %d size %d, want %d / 7", in.Mtime, in.Size, date)
 	}
 }

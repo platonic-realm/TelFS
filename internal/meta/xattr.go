@@ -16,6 +16,18 @@ import (
 // than the channel message text limit (~4 KiB), we'll need to promote
 // large values to chunks. Linux's xattr cap is 64 KiB per value.
 func (s *Store) SetXattr(ctx context.Context, ino int64, name string, value []byte) error {
+	if s.journalV2.Load() && !s.replaying.Load() {
+		return s.WithTx(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO xattrs(ino, name, value) VALUES (?,?,?)
+				 ON CONFLICT(ino, name) DO UPDATE SET value = excluded.value`,
+				ino, name, value); err != nil {
+				return fmt.Errorf("set xattr %d/%q: %w", ino, name, err)
+			}
+			_, err := s.appendJournalTx(ctx, tx, JournalOp{Op: OpSetXattr, Ino: ino, XName: name, XValue: value})
+			return err
+		})
+	}
 	_, err := s.execWithRetry(ctx,
 		`INSERT INTO xattrs(ino, name, value) VALUES (?,?,?)
 		 ON CONFLICT(ino, name) DO UPDATE SET value = excluded.value`,
@@ -62,6 +74,19 @@ func (s *Store) ListXattrs(ctx context.Context, ino int64) ([]string, error) {
 
 // RemoveXattr deletes an xattr. Returns ErrNotFound if it didn't exist.
 func (s *Store) RemoveXattr(ctx context.Context, ino int64, name string) error {
+	if s.journalV2.Load() && !s.replaying.Load() {
+		return s.WithTx(ctx, func(tx *sql.Tx) error {
+			res, err := tx.ExecContext(ctx, `DELETE FROM xattrs WHERE ino = ? AND name = ?`, ino, name)
+			if err != nil {
+				return fmt.Errorf("remove xattr %d/%q: %w", ino, name, err)
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return ErrNotFound
+			}
+			_, err = s.appendJournalTx(ctx, tx, JournalOp{Op: OpRmXattr, Ino: ino, XName: name})
+			return err
+		})
+	}
 	res, err := s.execWithRetry(ctx,
 		`DELETE FROM xattrs WHERE ino = ? AND name = ?`, ino, name)
 	if err != nil {

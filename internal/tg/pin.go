@@ -34,6 +34,9 @@ func (s *Session) PinnedMessageID(ctx context.Context) (int, error) {
 
 // PinMessage pins a message silently (no notification to members).
 func (s *Session) PinMessage(ctx context.Context, msgID int) error {
+	if s.readOnly.Load() {
+		return ErrReadOnly
+	}
 	peer, _, err := s.channelPeer()
 	if err != nil {
 		return err
@@ -54,6 +57,9 @@ func (s *Session) PinMessage(ctx context.Context, msgID int) error {
 
 // Unpin removes a message's pin (tests and repair tooling).
 func (s *Session) Unpin(ctx context.Context, msgID int) error {
+	if s.readOnly.Load() {
+		return ErrReadOnly
+	}
 	peer, _, err := s.channelPeer()
 	if err != nil {
 		return err

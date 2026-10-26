@@ -125,9 +125,17 @@ func (s *Store) SetInodeChunkSize(ctx context.Context, ino int64, size int64) er
 		if n > 0 {
 			return fmt.Errorf("set chunk_size: inode %d already has %d chunk(s)", ino, n)
 		}
-		_, err := tx.ExecContext(ctx,
-			`UPDATE inodes SET chunk_size = ? WHERE ino = ?`, size, ino)
-		return err
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE inodes SET chunk_size = ? WHERE ino = ?`, size, ino); err != nil {
+			return err
+		}
+		// Format 2: journal the promotion — a replay that kept the
+		// create op's chunk size would lay the file's chunks out wrong.
+		if s.journalV2.Load() {
+			_, err := s.appendJournalTx(ctx, tx, JournalOp{Op: OpSetChunkSize, Ino: ino, ChunkSize: size})
+			return err
+		}
+		return nil
 	})
 }
 
@@ -142,6 +150,81 @@ type SetAttrsPatch struct {
 }
 
 func (s *Store) SetAttrs(ctx context.Context, ino int64, p SetAttrsPatch) error {
+	return s.setAttrs(ctx, ino, p, true)
+}
+
+// setAttrs updates an inode's attributes; journal=true also records a
+// `setattr` op on format 2 (SetSize journals its own op instead).
+func (s *Store) setAttrs(ctx context.Context, ino int64, p SetAttrsPatch, journal bool) error {
+	if journal && s.journalV2.Load() && !s.replaying.Load() {
+		return s.WithTx(ctx, func(tx *sql.Tx) error {
+			if err := setAttrsTx(ctx, tx, ino, p); err != nil {
+				return err
+			}
+			op := JournalOp{Op: OpSetAttr, Ino: ino}
+			if p.Mode != nil {
+				op.Mode, op.Set = *p.Mode, append(op.Set, "mode")
+			}
+			if p.UID != nil {
+				op.UID, op.Set = *p.UID, append(op.Set, "uid")
+			}
+			if p.GID != nil {
+				op.GID, op.Set = *p.GID, append(op.Set, "gid")
+			}
+			if p.Mtime != nil {
+				op.Mtime, op.Set = *p.Mtime, append(op.Set, "mtime")
+			}
+			if p.Size != nil {
+				op.Size, op.Set = *p.Size, append(op.Set, "size")
+			}
+			_, err := s.appendJournalTx(ctx, tx, op)
+			return err
+		})
+	}
+	return s.setAttrsExec(ctx, ino, p)
+}
+
+// setAttrsTx is the UPDATE inside a transaction.
+func setAttrsTx(ctx context.Context, tx *sql.Tx, ino int64, p SetAttrsPatch) error {
+	cols, args := attrCols(p)
+	args = append(args, ino)
+	res, err := tx.ExecContext(ctx, `UPDATE inodes SET `+joinComma(cols)+` WHERE ino = ?`, args...)
+	if err != nil {
+		return fmt.Errorf("update inode %d: %w", ino, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func attrCols(p SetAttrsPatch) ([]string, []any) {
+	cols := []string{"ctime = ?"}
+	args := []any{time.Now().Unix()}
+	if p.Mode != nil {
+		cols = append(cols, "mode = ?")
+		args = append(args, *p.Mode)
+	}
+	if p.UID != nil {
+		cols = append(cols, "uid = ?")
+		args = append(args, *p.UID)
+	}
+	if p.GID != nil {
+		cols = append(cols, "gid = ?")
+		args = append(args, *p.GID)
+	}
+	if p.Size != nil {
+		cols = append(cols, "size = ?")
+		args = append(args, *p.Size)
+	}
+	if p.Mtime != nil {
+		cols = append(cols, "mtime = ?")
+		args = append(args, *p.Mtime)
+	}
+	return cols, args
+}
+
+func (s *Store) setAttrsExec(ctx context.Context, ino int64, p SetAttrsPatch) error {
 	now := time.Now().Unix()
 	// Build SET clause dynamically. ctime always bumps on any attr change.
 	cols := []string{"ctime = ?"}
@@ -187,14 +270,25 @@ func (s *Store) SetAttrs(ctx context.Context, ino int64, p SetAttrsPatch) error 
 // change for channel-side recovery (the file length is otherwise
 // inferable only from chunk_map, and chunks aren't journaled — the
 // channel messages themselves are the source of truth for chunks).
+//
+// The UPDATE and its journal row commit in ONE transaction, so the
+// journal's order is the order the changes were applied. (They used to
+// be two transactions: a `touch` landing in between was journaled
+// BEFORE the size change it followed, and a replay then overwrote the
+// touch's mtime — found in the P1 live test.)
 func (s *Store) SetSize(ctx context.Context, ino int64, size int64) error {
-	now := time.Now().Unix()
-	if err := s.SetAttrs(ctx, ino, SetAttrsPatch{Size: &size, Mtime: &now}); err != nil {
-		return err
-	}
+	return s.setSizeAt(ctx, ino, size, time.Now().Unix())
+}
+
+// setSizeAt is SetSize with an explicit mtime (replay passes the
+// recorded one).
+func (s *Store) setSizeAt(ctx context.Context, ino int64, size, mtime int64) error {
 	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := setAttrsTx(ctx, tx, ino, SetAttrsPatch{Size: &size, Mtime: &mtime}); err != nil {
+			return err
+		}
 		_, err := s.appendJournalTx(ctx, tx, JournalOp{
-			Op: OpSetSize, Ino: ino, Size: size, Mtime: now,
+			Op: OpSetSize, Ino: ino, Size: size, Mtime: mtime,
 		})
 		return err
 	})

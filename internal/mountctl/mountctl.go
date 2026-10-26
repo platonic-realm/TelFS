@@ -37,13 +37,33 @@ func FusermountBin() string {
 // (its environ is hidden) or dead (an orphaned mount).
 const SourcePrefix = "telfs:"
 
-// SourceFor returns the mount source for a profile.
-func SourceFor(profile string) string { return SourcePrefix + profile }
+// SourceFor returns the mount source for a profile and its filesystem:
+// "telfs:<profile>:<fs_uuid>" (profile names have no ':'). fsUUID may be
+// empty.
+func SourceFor(profile, fsUUID string) string {
+	if fsUUID == "" {
+		return SourcePrefix + profile
+	}
+	return SourcePrefix + profile + ":" + fsUUID
+}
 
 // Mount is one fuse.telfs entry of /proc/mounts.
 type Mount struct {
-	Source string
-	Point  string
+	Source   string
+	Point    string
+	ReadOnly bool // mounted with the "ro" option
+}
+
+// FSUUIDOf returns the fs_uuid in a P1+ mount source, or "".
+func FSUUIDOf(m Mount) string {
+	if !strings.HasPrefix(m.Source, SourcePrefix) {
+		return ""
+	}
+	parts := strings.SplitN(strings.TrimPrefix(m.Source, SourcePrefix), ":", 2)
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return ""
 }
 
 // ScanMounts returns every fuse.telfs entry currently in /proc/mounts.
@@ -58,7 +78,15 @@ func ScanMounts() []Mount {
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		if len(fields) >= 3 && fields[2] == "fuse.telfs" {
-			out = append(out, Mount{Source: unescapeMount(fields[0]), Point: unescapeMount(fields[1])})
+			m := Mount{Source: unescapeMount(fields[0]), Point: unescapeMount(fields[1])}
+			if len(fields) >= 4 {
+				for _, o := range strings.Split(fields[3], ",") {
+					if o == "ro" {
+						m.ReadOnly = true
+					}
+				}
+			}
+			out = append(out, m)
 		}
 	}
 	return out
@@ -100,7 +128,8 @@ func unescapeMount(s string) string {
 // daemon's TELFS_PROFILE. ("", false) when it cannot be determined.
 func ProfileOf(m Mount) (string, bool) {
 	if strings.HasPrefix(m.Source, SourcePrefix) {
-		if p := strings.TrimPrefix(m.Source, SourcePrefix); p != "" {
+		p, _, _ := strings.Cut(strings.TrimPrefix(m.Source, SourcePrefix), ":")
+		if p != "" {
 			return p, true
 		}
 	}
@@ -358,3 +387,42 @@ func waitPidGone(pid int, timeout time.Duration) bool {
 // ErrNoDaemon reports that no telfs daemon could be located for a
 // mountpoint that is (or was) mounted.
 var ErrNoDaemon = errors.New("no telfs mount daemon found")
+
+// WriterConflict reports why a new mount of profile/fsUUID must not
+// start on this machine (single-writer guard), or "" if it may:
+//   - any mount of the same PROFILE (read-only or not): two daemons
+//     would share one db.sqlite;
+//   - for a read-write mount, any mount of the same FILESYSTEM (fs_uuid),
+//     whatever its profile: two writers corrupt each other's snapshots
+//     and journal;
+//   - fail closed: a TelFS mount whose profile or filesystem cannot be
+//     told (made by an older telfs) blocks a read-write mount.
+//
+// fsUUID may be "" (not known yet, before recovery): then only the
+// profile is checked.
+func WriterConflict(profile, fsUUID string, readOnly bool) string {
+	return writerConflict(ScanMounts(), profile, fsUUID, readOnly)
+}
+
+func writerConflict(mounts []Mount, profile, fsUUID string, readOnly bool) string {
+	for _, m := range mounts {
+		p, known := ProfileOf(m)
+		if known && p == profile {
+			return fmt.Sprintf("profile %s is already mounted at %s — one daemon per profile (they would share db.sqlite)", profile, m.Point)
+		}
+		if readOnly || fsUUID == "" {
+			if !known && !readOnly {
+				return fmt.Sprintf("cannot tell which profile serves the TelFS mount at %s (an older telfs) — unmount it first", m.Point)
+			}
+			continue
+		}
+		other := FSUUIDOf(m)
+		switch {
+		case other == fsUUID:
+			return fmt.Sprintf("filesystem %s is already mounted at %s (profile %s) — a second writer would corrupt it; mount --readonly for a second view", fsUUID, m.Point, p)
+		case other == "":
+			return fmt.Sprintf("cannot tell which filesystem the TelFS mount at %s holds (an older telfs) — unmount it before a read-write mount", m.Point)
+		}
+	}
+	return ""
+}

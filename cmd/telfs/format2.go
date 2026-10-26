@@ -14,6 +14,7 @@ import (
 	"telfs/internal/config"
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
+	"telfs/internal/mountctl"
 	"telfs/internal/secret"
 	"telfs/internal/snapshot"
 	"telfs/internal/tg"
@@ -145,7 +146,7 @@ func openPipeline(ctx context.Context, m *meta.Store, sec *secret.Secret) (*pipe
 			return nil, err
 		}
 		p.keys, p.counters, p.wc = keys, counters, wc
-		m.SetJournalRefs(true)
+		m.SetJournalV2(true)
 	default:
 		return nil, fmt.Errorf("filesystem format %d is newer than this telfs — upgrade", format)
 	}
@@ -183,6 +184,11 @@ func recover2(ctx context.Context, cfg *config.Config, sess *tg.Session, sec *se
 		return true, err
 	}
 	defer zero(dek)
+	// Single-writer guard by fs_uuid, BEFORE anything is restored or
+	// written to the channel (a refused mount must not re-pin or re-post).
+	if c := mountctl.WriterConflict(cfg.ProfileName(), fsUUID, sess.ReadOnly()); c != "" {
+		return true, fmt.Errorf("mount: %s", c)
+	}
 	keys, err := wire.DeriveKeys(dek, fsUUID, nil)
 	if err != nil {
 		return true, err
@@ -235,11 +241,22 @@ func recover2(ctx context.Context, cfg *config.Config, sess *tg.Session, sec *se
 			return fail(fmt.Errorf("apply journal op seq=%d (%s): %w", e.Seq, op.Op, rerr))
 		}
 	}
+	if len(ops) > 0 {
+		if err := m.AdvanceJournalSeq(ctx, ops[len(ops)-1].Seq); err != nil {
+			return fail(err)
+		}
+	}
 	// The header that opened is the current one.
 	if err := m.PutKV(ctx, meta.KVKeyHeader, k.JSON); err != nil {
 		return fail(err)
 	}
 	switch {
+	case sess.ReadOnly():
+		// A read-only drill restores locally and never writes the
+		// channel: no re-pin, no re-post.
+		if k.MsgID > 0 {
+			_ = m.PutKV(ctx, meta.KVKeyMsgID, []byte(fmt.Sprint(k.MsgID)))
+		}
 	case k.MsgID > 0:
 		_ = m.PutKV(ctx, meta.KVKeyMsgID, []byte(fmt.Sprint(k.MsgID)))
 		if !k.Pinned {

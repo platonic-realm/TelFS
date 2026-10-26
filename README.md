@@ -205,6 +205,23 @@ telfs mount [--readonly] [--allow-other] [--debug] <mountpoint>
 `--allow-other` needs `user_allow_other` in `/etc/fuse.conf`.
 `--debug` logs every FUSE op (very chatty).
 
+**`--readonly` never writes to the channel** — no snapshots, no journal,
+no uploads, no deletions, no pins: the Telegram session itself refuses
+every channel write, and the kernel mount carries `ro`. That is the
+way to run a recovery drill from another machine while the real mount
+keeps running. (Local state — the restored DB, the cache — is still
+written.)
+
+**One writer per filesystem.** On one machine `telfs mount` refuses a
+second mount of the same profile (two daemons would share its
+database) and a read-write mount of a filesystem that is already
+mounted under any profile. The mount source in `/proc/mounts` is
+`telfs:<profile>:<fs_uuid>`, so every user and tool can see which
+filesystem is mounted where. **Nothing yet stops a second machine**
+from mounting the same channel read-write — two writers would silently
+lose each other's changes. Mount read-write in one place only; drill
+elsewhere with `--readonly`.
+
 ## Recovery
 
 Lose the local DB? The next `telfs mount` scans the channel for the
@@ -616,8 +633,9 @@ data.
 
 ## Known limits
 
-- **Single mounter per channel.** Two concurrent mounts race; no
-  locking. `meta_kv[lock_ts]` is reserved for future coordination.
+- **One read-write mounter per channel.** Enforced on one machine (see
+  [Mount options](#mount-options)); across machines it is your
+  discipline until a channel-side writer lease exists.
 - **≤5 s recovery window.** A background journal poster (v0.13) drains
   the local `journal` table every 5 s and posts each pending op to the
   channel; recovery restores the latest snapshot then replays journal
