@@ -223,9 +223,17 @@ func (p *BlobPrefetcher) fetchSpan(span blobSpan) {
 	// over (they're part of the contiguous range) but not re-decoded.
 	limit := span.offset + p.budget
 	var todo []meta.Chunk
+	// examinedEnd is the end of the last extent this span looked at
+	// inside the budget window. The row query stops at
+	// blobPrefetchMaxExtents, so on a blob of tiny extents it can lie
+	// far before `limit`: nothing past it was examined.
+	examinedEnd := span.offset
 	for _, c := range rows {
 		if c.PackSize <= 0 || c.PackOffset+int64(c.PackSize) > limit {
 			continue
+		}
+		if e := c.PackOffset + int64(c.PackSize); e > examinedEnd {
+			examinedEnd = e
 		}
 		if p.cache.Has(Key{Ino: c.Ino, Idx: c.Idx}) {
 			continue
@@ -234,9 +242,14 @@ func (p *BlobPrefetcher) fetchSpan(span blobSpan) {
 	}
 	// A single uncached extent isn't worth a span: the reader's own
 	// foreground fetch handles the one that triggered us, and there
-	// is no neighbor to warm. Keep the region marked covered — every
-	// extent in it is either cached or being fetched right now.
+	// is no neighbor to warm. Mark covered ONLY what was examined —
+	// every extent in it is either cached or being fetched right now.
+	// Keeping the provisional [offset, offset+budget) instead dropped
+	// every later miss in that window although no span ever looked at
+	// it (the stall of the 1M test's name-order reads: one download
+	// per file once a walk stepped back one extent).
 	if len(todo) < 2 {
+		p.replaceCovered(span.msgID, prov, interval{start: span.offset, end: examinedEnd})
 		return
 	}
 	start := todo[0].PackOffset

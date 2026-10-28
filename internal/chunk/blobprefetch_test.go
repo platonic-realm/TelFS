@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -275,5 +276,52 @@ func TestReaderTriggersBlobPrefetch(t *testing.T) {
 	}
 	if !waitCached(t, cache, keys, 2*time.Second) {
 		t.Fatal("reader-triggered prefetch did not warm blob neighbors")
+	}
+}
+
+// TestBlobPrefetchStallAfterSkippedSpan is the v1 regression for the
+// prefetch stall (reproduced in the P2 investigation, 2026-10-28): a
+// span that found fewer than two uncached extents kept its PROVISIONAL
+// [miss, miss+budget) coverage, although the row query had stopped at
+// blobPrefetchMaxExtents. Every later miss in that window was dropped —
+// one download per file for a walk over tiny packed files.
+func TestBlobPrefetchStallAfterSkippedSpan(t *testing.T) {
+	m := newTestMeta(t)
+	blob, rows := buildPackedBlob(t, m, 600, 6000, 100)
+	f := &blobFakeFetcher{blob: blob}
+	cache, err := NewCache(filepath.Join(t.TempDir(), "cache"), 64<<20, f, nil, nil) // no eviction in this test
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewBlobPrefetcher(m, cache, f, nil, nil, 1<<20) // budget covers the whole 600 KB blob
+	defer p.Close()
+
+	// 1. A miss at extent 10: one span warms 10..2057 (the 2,048-extent cap).
+	p.Note(600, rows[10].PackOffset)
+	last := 10 + blobPrefetchMaxExtents - 1
+	if !waitCached(t, cache, []Key{{Ino: rows[10].Ino}, {Ino: rows[last].Ino}}, 5*time.Second) {
+		t.Fatalf("span 1 did not warm extents 10..%d", last)
+	}
+	if cache.Has(Key{Ino: rows[last+1].Ino}) {
+		t.Fatalf("extent %d past the extent cap was warmed", last+1)
+	}
+	// 2. A name-order walk misses extent 9, just before that span: one
+	// uncached extent in its window, so no span.
+	p.Note(600, rows[9].PackOffset)
+	time.Sleep(200 * time.Millisecond)
+	if got := f.callCount(); got != 1 {
+		t.Fatalf("fetcher calls after the skipped span = %d, want 1", got)
+	}
+	// 3. A miss far past what was ever examined must start a span.
+	p.Note(600, rows[3000].PackOffset)
+	if !waitCached(t, cache, []Key{{Ino: rows[3000].Ino}, {Ino: rows[3001].Ino}}, 2*time.Second) {
+		t.Fatalf("miss at extent 3000 got no prefetch: dropped as 'covered' (fetcher calls %d)", f.callCount())
+	}
+	// 4. A miss inside what the skipped span DID examine stays deduped.
+	before := f.callCount()
+	p.Note(600, rows[500].PackOffset)
+	time.Sleep(100 * time.Millisecond)
+	if got := f.callCount(); got != before {
+		t.Fatalf("miss at an examined, warm extent started a span (calls %d -> %d)", before, got)
 	}
 }

@@ -93,6 +93,16 @@ Usage:
                                       syncs, then posts the version (through the
                                       running mount, no secret); 0 on the channel,
                                       4 timeout, 5 not mounted, 6 Telegram.
+  telfs restore [--version NAME] [--workers N] SRC DEST
+                                    Copy SRC (a path in the filesystem; a
+                                      directory's contents) into the local
+                                      directory DEST, from the live filesystem
+                                      or a version: each message downloaded
+                                      once, every file re-read and checked
+                                      against its keyed hashes; a re-run skips
+                                      what is already right. 0 ok, 4 data the
+                                      mount had not uploaded yet, 6 Telegram,
+                                      7 integrity (list: <profile>/restore-*.tsv).
   telfs init [--chunk-size N] [--compression none|zstd] [--kdf-memory SIZE]
                                     Create a NEW filesystem (format 2: always
                                       encrypted) on the bound channel; posts and
@@ -242,6 +252,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdKey(ctx, args[2:])
 	case "recover":
 		return cmdRecover(ctx, args[2:])
+	case "restore":
+		return cmdRestore(ctx, args[2:])
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return fmt.Errorf("unknown command %q (usage above)", args[1])

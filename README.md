@@ -46,6 +46,7 @@ End-to-end verified on a real Telegram account + private channel:
 | `telfs trash` — `rm` reroutes to `/.trash`, TTL GC | ✓ |
 | Snapshot history + point-in-time restore (last 12 by default) | ✓ |
 | Versions (format 2): named, immutable whole-filesystem versions, each mountable read-only next to the live mount | ✓ (`telfs versions`) |
+| Bulk restore (format 2): each channel message downloaded once, every restored file verified by its keyed hashes, resumable | ✓ (`telfs restore`) |
 | Content-addressed chunk dedup, keyed hash (format 2; format 1: plaintext + convergent) | ✓ |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
@@ -268,7 +269,8 @@ its name; exit 5 when it is not mounted).
 Exit codes, the same for every command: 0 ok · 1 usage or other error ·
 2 secret source unavailable · 3 wrong secret · 4 timeout / not synced
 yet · 5 not mounted · 6 Telegram or the channel unreachable or refused ·
-7 integrity problem (fsck findings, a recovery refused or incomplete).
+7 integrity problem (fsck findings, a recovery refused or incomplete,
+restored files that do not match their keyed hashes).
 
 The TCP endpoint of earlier versions (`127.0.0.1:9090`) is off now;
 `--metrics-addr 127.0.0.1:9090` still serves Prometheus `/metrics` (and
@@ -325,6 +327,55 @@ tree, and a chunk the tree no longer uses may be one a version needs. A
 version-aware reclamation comes later; until then nothing a version
 references is ever deleted. Each version costs one database snapshot on
 the channel (~55 MB at 0.5 M files).
+
+## Restore
+
+`telfs restore` copies a tree out of the filesystem — the live one or a
+version — onto a local directory, much faster than reading it through
+a mount when there are many small files (format 2):
+
+```sh
+telfs restore /home/arash /srv/restore/arash             # the live filesystem
+telfs restore --version daily-2026-10-28 / /srv/restore  # a version, all of it
+telfs restore [--workers 4] SRC DEST
+```
+
+- **SRC** is an absolute path inside the filesystem. A directory's
+  *contents* become DEST's (DEST takes the directory's mode and mtime);
+  a file or symlink is restored into DEST under its name. `/.trash`
+  (the rm safety net) is left out of a restore of `/`; name it to
+  restore it. **DEST** is a local directory (created if missing); it
+  may not be inside a TelFS mount, nor hold or lie inside the profile
+  directory.
+- It reads where every chunk lives from **one consistent read** of the
+  database (read-only; it runs beside the live mount), groups the
+  chunks by channel message and downloads **each message once**: a
+  pack of small files as one ranged read over the extents it needs, a
+  large file's chunk as its whole document — over `--workers`
+  concurrent downloads (default 4), in message order. It writes
+  directories, regular files (also empty and sparse ones), symlinks,
+  hard links, modes, mtimes and `user.*` xattrs; owners only when run
+  as root. Nothing is written to the channel.
+- **Verification:** after writing, every restored file is read back
+  from DEST and each chunk's keyed content hash compared with the
+  database's. (Downloads are authenticated on the way in as well.)
+- **Resumable:** run it again after an interruption or a failure — a
+  file already in DEST with the right size and matching keyed hashes is
+  skipped, and in a file that is partly right only the wrong chunks are
+  downloaded again.
+- It needs the secret (it decrypts on its own): a systemd unit for it
+  loads the credential like the mount's.
+- Exit 0 when everything was restored and verified. Otherwise every
+  file that did not come back exactly is listed in
+  `<profile>/restore-<time>.tsv` (kind, path, problem — never inside
+  DEST, so the restored tree stays exactly the backup) and the first 20
+  on stderr; the exit code says what kind of problem it was, the
+  weightiest first: **7** integrity — a chunk missing from the
+  database, a message gone or damaged, or a restored file whose bytes
+  differ from its keyed hashes; **6** Telegram failed after the retries
+  (the restore stops; run it again to resume); **4** a restore of the
+  live filesystem met files the mount had not uploaded yet (`telfs sync
+  --wait`, then restore again); **1** DEST could not be written.
 
 ## Recovery
 
