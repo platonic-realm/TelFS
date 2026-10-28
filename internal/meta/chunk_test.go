@@ -227,3 +227,49 @@ func TestDedupSharedChunkSurvivesOneUnlink(t *testing.T) {
 		t.Fatalf("ino2 lost its chunk_map row unexpectedly")
 	}
 }
+
+// MessageRefs pages the referenced messages in id order with their row
+// count, furthest packed extent and smallest inode; ExtentsPast counts a
+// message's extents that end past a size.
+func TestMessageRefs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := ctxT(t)
+	a := mkfile(t, s, RootIno, "a")
+	b := mkfile(t, s, RootIno, "b")
+	c := mkfile(t, s, RootIno, "c")
+	for _, ch := range []Chunk{
+		{Ino: a, Idx: 0, TGMessageID: 30, Size: 4096},
+		{Ino: a, Idx: 1, TGMessageID: 10, Size: 4096},
+		{Ino: b, Idx: 0, TGMessageID: 20, Size: 100, PackOffset: 0, PackSize: 120},
+		{Ino: c, Idx: 0, TGMessageID: 20, Size: 100, PackOffset: 120, PackSize: 130},
+		{Ino: b, Idx: 1, TGMessageID: 10, Size: 4096}, // dedup: two rows, one message
+	} {
+		if err := s.PutChunk(ctx, ch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.MessageRefs(ctx, -1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MessageRef{{MsgID: 10, Rows: 2, End: 0, Ino: a}, {MsgID: 20, Rows: 2, End: 250, Ino: b}}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("first page %+v, want %+v", got, want)
+	}
+	got, err = s.MessageRefs(ctx, 20, 2)
+	if err != nil || len(got) != 1 || got[0] != (MessageRef{MsgID: 30, Rows: 1, Ino: a}) {
+		t.Fatalf("second page %+v %v", got, err)
+	}
+	if got, _ := s.MessageRefs(ctx, 30, 2); len(got) != 0 {
+		t.Fatalf("past the end: %+v", got)
+	}
+	if n, ino, err := s.ExtentsPast(ctx, 20, 200); err != nil || n != 1 || ino != c {
+		t.Fatalf("past 200: %d rows, ino %d, %v", n, ino, err)
+	}
+	if n, ino, err := s.ExtentsPast(ctx, 20, 100); err != nil || n != 2 || ino != b {
+		t.Fatalf("past 100: %d rows, ino %d, %v", n, ino, err)
+	}
+	if n, ino, err := s.ExtentsPast(ctx, 20, 250); err != nil || n != 0 || ino != 0 {
+		t.Fatalf("past 250: %d rows, ino %d, %v", n, ino, err)
+	}
+}

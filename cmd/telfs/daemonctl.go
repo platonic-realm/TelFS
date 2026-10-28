@@ -17,6 +17,7 @@ import (
 	"telfs/internal/chunk"
 	"telfs/internal/config"
 	"telfs/internal/control"
+	"telfs/internal/fsck"
 	"telfs/internal/meta"
 	"telfs/internal/mountctl"
 	"telfs/internal/snapshot"
@@ -203,6 +204,11 @@ type daemonCtl struct {
 	verMu   sync.Mutex
 	verNext uint64
 	verJobs map[uint64]*versionJob
+
+	// fsckMu: one quick check at a time. msgs, when set, replaces sess
+	// as the channel the quick check asks (tests).
+	fsckMu sync.Mutex
+	msgs   fsck.Messages
 }
 
 type rateSample struct {
@@ -472,6 +478,7 @@ func (d *daemonCtl) handler() http.Handler {
 	})
 	if d.version == "" {
 		d.versionsRoutes(mux)
+		mux.HandleFunc("POST /fsck/quick", d.fsckQuick)
 	}
 	if d.telegram != nil {
 		mux.HandleFunc("GET /telegram", d.telegram)

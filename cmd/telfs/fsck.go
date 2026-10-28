@@ -42,8 +42,22 @@ func cmdFsck(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("fsck", flag.ContinueOnError)
 	doFix := fs.Bool("fix", false, "remove unreachable chunks from chunk_map after the report (affected files will end at the gap); on format 2 also re-pin / re-post the key message")
 	stopOn := fs.Int("stop-after", 0, "stop after N issues (0 = walk everything)")
+	quick := fs.Bool("quick", false, "format 2: only check that every referenced message exists with its document and every packed extent fits — nothing downloaded; through the running daemon (no secret) when there is one")
+	asJSON := fs.Bool("json", false, "with --quick: print the report as one JSON object")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *quick {
+		if *doFix || *stopOn != 0 {
+			return errors.New("--fix and --stop-after do not apply to --quick (usage: telfs fsck --quick [--json])")
+		}
+		if fs.NArg() > 0 {
+			return errors.New("usage: telfs fsck --quick [--json]")
+		}
+		return cmdFsckQuick(ctx, *asJSON, os.Stdout, os.Stderr)
+	}
+	if *asJSON {
+		return errors.New("--json needs --quick (usage: telfs fsck --quick [--json])")
 	}
 
 	cfg, err := config.Load()

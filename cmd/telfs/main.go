@@ -136,6 +136,13 @@ Usage:
   telfs fsck [--fix] [--stop-after N]
                                     Verify every chunk_map row against the channel;
                                       format 2: also the pinned key header.
+  telfs fsck --quick [--json]       Format 2: every referenced message exists
+                                      with its document and every packed
+                                      extent fits — nothing downloaded, 100
+                                      ids per request; through the running
+                                      daemon (no secret) when there is one.
+                                      0 ok, 6 Telegram, 7 problems (first 20
+                                      on stderr, all in --json).
   telfs snapshot {list, restore [--yes] <msg-id>}
                                     Inspect / roll back to a historical snapshot.
   telfs trash {enable [--ttl D], disable, status, list, empty}

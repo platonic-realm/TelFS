@@ -138,7 +138,7 @@ func cmdRestore(ctx context.Context, args []string) error {
 	}
 	sec.Zero()
 
-	sess, stop, err := connectReadOnly(ctx, client)
+	sess, stop, err := connectReadOnly(ctx, client, os.Stdout)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return errors.New("restore interrupted")
@@ -272,8 +272,8 @@ func within(p, root string) bool {
 
 // connectReadOnly starts a long-lived session (it reconnects) that
 // refuses every write to the channel, and checks the channel is
-// reachable. stop ends it.
-func connectReadOnly(ctx context.Context, client *tg.Client) (*tg.Session, func(), error) {
+// reachable (saying so on info). stop ends it.
+func connectReadOnly(ctx context.Context, client *tg.Client, info io.Writer) (*tg.Session, func(), error) {
 	mgr := client.NewSessionManager()
 	sess := mgr.Session()
 	sess.SetReadOnly(true)
@@ -298,7 +298,7 @@ func connectReadOnly(ctx context.Context, client *tg.Client) (*tg.Session, func(
 		cancel()
 		<-done
 	}
-	fmt.Println("Connecting to Telegram…")
+	fmt.Fprintln(info, "Connecting to Telegram…")
 	select {
 	case err := <-first:
 		if err != nil {

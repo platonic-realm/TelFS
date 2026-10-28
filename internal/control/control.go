@@ -1,6 +1,6 @@
 // Package control is the daemon's control socket (spec v1, rows 5 and 10):
 // an HTTP server on a Unix socket in the profile directory, through which
-// `telfs status`, `sync`, `unmount`, `versions` (and later `fsck --quick`)
+// `telfs status`, `sync`, `unmount`, `versions` and `fsck --quick`
 // talk to the running mount — without the secret, which only the daemon
 // holds. Owner-only: the socket is mode 0600 inside the 0700 profile
 // directory, and every connection's peer uid (SO_PEERCRED) must be the

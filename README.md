@@ -35,7 +35,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Snapshots that scale (format 2): rare whole-DB snapshots, found through a pinned encrypted anchor — no history scan | ✓ |
 | `--readonly` mount, FLOOD_WAIT handling, persistent LRU chunk cache | ✓ |
 | `telfs gc` — orphan chunks + stale snapshots | ✓ |
-| `telfs fsck` — channel-side integrity check | ✓ |
+| `telfs fsck` — channel-side integrity check; `--quick` (format 2): every referenced message exists with its size, nothing downloaded, through the running mount | ✓ |
 | `telfs status` / `telfs doctor` — one-screen state / local invariant lint | ✓ |
 | Format 2 (new filesystems): everything encrypted — chunks, captions, snapshots, journal; sizes Padmé-padded; Argon2id over 2 GiB | ✓ |
 | One secret per profile from a prompt, a secret file, or KeePassXC; encrypted `session.enc`; non-dumpable processes | ✓ |
@@ -243,6 +243,7 @@ telfs sync                     # exit 0 if the channel holds everything now, 4 i
 telfs sync --wait --timeout 6h # block until everything written before this call is on the channel
 telfs unmount <mountpoint|profile>   # returns when the daemon has exited
 telfs versions create NAME     # see Versions
+telfs fsck --quick [--json]    # every referenced message still on the channel (see Maintenance)
 ```
 
 **What `sync --wait` guarantees when it returns 0:** every change made
@@ -608,6 +609,7 @@ telfs gc                         # dry-run: orphan chunks + stale snapshots
 telfs gc --yes                   # actually delete
 telfs fsck                       # check every chunk_map row against the channel
 telfs fsck --fix                 # drop unreadable rows (file becomes short)
+telfs fsck --quick [--json]      # format 2: existence + size only, nothing downloaded
 telfs status                     # profile / channel / FS / encryption / mount
 telfs doctor                     # local invariant lint (see below)
 telfs trash enable --ttl 7d      # rm safety-net (see below)
@@ -619,6 +621,26 @@ by overwrites/unlinks; see Design choices) and **stale snapshots**
 pinned anchor names). The anchor, the key message, versions and any
 message gc does not recognize are never deleted. Default is dry-run.
 On a filesystem with [versions](#versions) gc refuses altogether.
+
+`fsck` downloads and decrypts every chunk — hours on a large
+filesystem. **`fsck --quick`** (format 2) downloads nothing: it asks
+the channel about every message `chunk_map` references, 100 ids per
+request (~1 k requests for 0.5 M files), and checks that each one still
+exists with its document and that every packed extent fits inside its
+document (`pack_offset + pack_size` ≤ the document's size). With a
+running mount it goes through the daemon's control socket and needs no
+secret (a monitoring unit can run it); without one it opens its own
+read-only session, which needs the secret. Exit 0 when everything is
+there; 7 when a message is missing (deleted, or without a document) or
+too small — the first 20 on stderr, each with how many chunk rows use it
+and one file that does; 6 when Telegram or the channel could not be
+read. `--json` prints one object: `{messages_checked, rows_checked,
+missing: [{msg_id, rows, example_path, example_ino, reason}], too_small:
+[{msg_id, rows, example_path, example_ino, doc_size, need}], took_s}`,
+every finding included. It checks the live filesystem's references (not
+those of versions; nothing a version references is ever deleted in v1),
+and says nothing about the content: a message that is there but damaged
+is the full `fsck`'s (or `restore`'s) to find.
 
 ### `telfs trash` — rm safety-net
 

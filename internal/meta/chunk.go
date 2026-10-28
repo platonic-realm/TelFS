@@ -263,6 +263,67 @@ func (s *Store) AllChunkMessageIDs(ctx context.Context) (map[int64]struct{}, err
 	return out, rows.Err()
 }
 
+// MessageRef sums up the chunk_map rows that reference one channel
+// message (`telfs fsck --quick` checks each referenced message once).
+type MessageRef struct {
+	MsgID int64
+	// Rows is how many chunk_map rows reference the message.
+	Rows int64
+	// End is the end of its furthest packed extent (pack_offset +
+	// pack_size): the document must be at least this long. 0 when no
+	// row is a packed extent.
+	End int64
+	// Ino is the smallest inode that references it (an example).
+	Ino int64
+}
+
+// MessageRefs returns the messages chunk_map references with an id
+// greater than after, in id order, at most limit of them. Each call is
+// one short query (the msgid index), so a caller paging through every
+// message never holds a read transaction open on a live DB.
+func (s *Store) MessageRefs(ctx context.Context, after int64, limit int) ([]MessageRef, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT tg_message_id, COUNT(*),
+		        MAX(CASE WHEN pack_size IS NOT NULL THEN COALESCE(pack_offset, 0) + pack_size ELSE 0 END),
+		        MIN(ino)
+		   FROM chunk_map
+		  WHERE tg_message_id > ?
+		  GROUP BY tg_message_id
+		  ORDER BY tg_message_id
+		  LIMIT ?`, after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("message refs after %d: %w", after, err)
+	}
+	defer rows.Close()
+	var out []MessageRef
+	for rows.Next() {
+		var r MessageRef
+		if err := rows.Scan(&r.MsgID, &r.Rows, &r.End, &r.Ino); err != nil {
+			return nil, fmt.Errorf("message refs after %d: scan: %w", after, err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ExtentsPast counts the packed rows of message msgID whose extent ends
+// past size bytes, and returns the smallest inode among them (0 when
+// there are none).
+func (s *Store) ExtentsPast(ctx context.Context, msgID, size int64) (rows int64, ino int64, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MIN(ino), 0)
+		   FROM chunk_map
+		  WHERE tg_message_id = ? AND pack_size IS NOT NULL
+		    AND COALESCE(pack_offset, 0) + pack_size > ?`, msgID, size).Scan(&rows, &ino)
+	if err != nil {
+		return 0, 0, fmt.Errorf("extents of msg %d past %d: %w", msgID, size, err)
+	}
+	return rows, ino, nil
+}
+
 // ReuseChunkByHash atomically reuses an existing channel chunk for a
 // new (ino, idx) slot if the content hash matches a previously uploaded
 // blob AND that blob's channel message is still referenced by some
