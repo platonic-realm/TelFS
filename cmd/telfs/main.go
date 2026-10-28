@@ -151,67 +151,80 @@ func run() error {
 		return err
 	}
 	os.Args = args
-	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
-	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	return dispatch(ctx, os.Args)
+}
 
-	switch os.Args[1] {
+// dispatch runs the command named by args[1]. Usage errors return an
+// error (exit 1, the v1 interface's "usage / other error"; they used to
+// exit 2, which v1 gives to "secret source unavailable").
+func dispatch(ctx context.Context, args []string) error {
+	if len(args) < 2 {
+		fmt.Fprint(os.Stderr, usage)
+		return errors.New("missing command (usage above)")
+	}
+	switch args[1] {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return nil
 	case "version", "-v", "--version":
+		// The PROGRAM version only. Anything after it is an error, so a
+		// script that typed `telfs version create x` (filesystem
+		// versions are `telfs versions …`) fails instead of printing
+		// the program version and exiting 0.
+		if len(args) > 2 {
+			return fmt.Errorf("`telfs %s` prints the program version and takes no arguments (filesystem versions: telfs versions create|list|delete)", args[1])
+		}
 		fmt.Printf("telfs %s (commit %s, built %s)\n", version, commit, buildDate)
 		return nil
+	case "versions":
+		return cmdVersions(ctx, args[2:])
 	case "login":
-		return cmdLogin(ctx, os.Args[2:])
+		return cmdLogin(ctx, args[2:])
 	case "channel":
-		return cmdChannel(ctx, os.Args[2:])
+		return cmdChannel(ctx, args[2:])
 	case "mount":
-		return cmdMount(ctx, os.Args[2:])
+		return cmdMount(ctx, args[2:])
 	case "unmount", "umount":
-		return cmdUnmount(ctx, os.Args[2:])
+		return cmdUnmount(ctx, args[2:])
 	case "init":
-		return cmdInit(ctx, os.Args[2:])
+		return cmdInit(ctx, args[2:])
 	case "encrypt":
-		return cmdEncrypt(ctx, os.Args[2:])
+		return cmdEncrypt(ctx, args[2:])
 	case "profile":
-		return cmdProfile(ctx, os.Args[2:])
+		return cmdProfile(ctx, args[2:])
 	case "status":
-		return cmdStatus(ctx, os.Args[2:])
+		return cmdStatus(ctx, args[2:])
 	case "web":
-		return cmdWeb(ctx, os.Args[2:])
+		return cmdWeb(ctx, args[2:])
 	case "fsck":
-		return cmdFsck(ctx, os.Args[2:])
+		return cmdFsck(ctx, args[2:])
 	case "gc":
-		return cmdGC(ctx, os.Args[2:])
+		return cmdGC(ctx, args[2:])
 	case "snapshot":
-		return cmdSnapshot(ctx, os.Args[2:])
+		return cmdSnapshot(ctx, args[2:])
 	case "trash":
-		return cmdTrash(ctx, os.Args[2:])
+		return cmdTrash(ctx, args[2:])
 	case "debug":
-		return cmdDebug(ctx, os.Args[2:])
+		return cmdDebug(ctx, args[2:])
 	case "doctor":
-		return cmdDoctor(ctx, os.Args[2:])
+		return cmdDoctor(ctx, args[2:])
 	case "ratelimit":
-		return cmdRateLimit(ctx, os.Args[2:])
+		return cmdRateLimit(ctx, args[2:])
 	case "bench":
-		return cmdBench(ctx, os.Args[2:])
+		return cmdBench(ctx, args[2:])
 	case "secret":
-		return cmdSecret(ctx, os.Args[2:])
+		return cmdSecret(ctx, args[2:])
 	case "session":
-		return cmdSession(ctx, os.Args[2:])
+		return cmdSession(ctx, args[2:])
 	case "key":
-		return cmdKey(ctx, os.Args[2:])
+		return cmdKey(ctx, args[2:])
 	case "recover":
-		return cmdRecover(ctx, os.Args[2:])
+		return cmdRecover(ctx, args[2:])
 	default:
-		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n%s", os.Args[1], usage)
-		os.Exit(2)
-		return nil
+		fmt.Fprint(os.Stderr, usage)
+		return fmt.Errorf("unknown command %q (usage above)", args[1])
 	}
 }
 
