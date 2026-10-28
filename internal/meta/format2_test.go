@@ -168,3 +168,56 @@ func TestReplaySetSizeKeepsMtimeAndChunkSizeJournaled(t *testing.T) {
 		t.Fatalf("replayed chunk size %d", in.ChunkSize)
 	}
 }
+
+// rsync's chmod of a temp file to the mode it already has and the
+// kernel's repeats of the current mtime change nothing: no journal op,
+// and the live row stays what a replay of the journal produces.
+func TestSetAttrNoOpsNotJournaled(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetJournalV2(true)
+	ino, err := s.CreateChild(ctx, RootIno, "f", Inode{Kind: KindFile, Mode: 0o100600, Mtime: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u32 := func(v uint32) *uint32 { return &v }
+	i64 := func(v int64) *int64 { return &v }
+	setattrs := func() []JournalOp {
+		pend, _ := s.PendingJournal(ctx)
+		var out []JournalOp
+		for _, e := range pend {
+			if op, _ := DecodeOp(e.OpJSON); op.Op == OpSetAttr {
+				out = append(out, op)
+			}
+		}
+		return out
+	}
+	s.SetAttrs(ctx, ino, SetAttrsPatch{Mode: u32(0o600)}) // go-fuse passes permission bits only
+	s.SetAttrs(ctx, ino, SetAttrsPatch{Mtime: i64(1000)}) // the current mtime again
+	if ops := setattrs(); len(ops) != 0 {
+		t.Fatalf("no-op setattrs journaled: %+v", ops)
+	}
+	s.SetAttrs(ctx, ino, SetAttrsPatch{Mode: u32(0o644), Mtime: i64(1000)})
+	ops := setattrs()
+	if len(ops) != 1 || len(ops[0].Set) != 1 || ops[0].Set[0] != "mode" || ops[0].Mode != 0o644 {
+		t.Fatalf("want one setattr of the mode only, got %+v", ops)
+	}
+	live, _ := s.GetInode(ctx, ino)
+	s2, _ := Open(filepath.Join(t.TempDir(), "db2.sqlite"))
+	defer s2.Close()
+	pend, _ := s.PendingJournal(ctx)
+	for _, e := range pend {
+		op, _ := DecodeOp(e.OpJSON)
+		if err := s2.ReplayOp(ctx, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep, _ := s2.GetInode(ctx, ino)
+	if rep.Mode != live.Mode || rep.Mtime != live.Mtime {
+		t.Fatalf("replayed mode %o mtime %d, live mode %o mtime %d", rep.Mode, rep.Mtime, live.Mode, live.Mtime)
+	}
+}

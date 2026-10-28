@@ -158,6 +158,11 @@ func (s *Store) SetAttrs(ctx context.Context, ino int64, p SetAttrsPatch) error 
 func (s *Store) setAttrs(ctx context.Context, ino int64, p SetAttrsPatch, journal bool) error {
 	if journal && s.journalV2.Load() && !s.replaying.Load() {
 		return s.WithTx(ctx, func(tx *sql.Tx) error {
+			cur, err := getInode(ctx, tx, ino)
+			if err != nil {
+				return err
+			}
+			p = dropUnchanged(cur, p)
 			if err := setAttrsTx(ctx, tx, ino, p); err != nil {
 				return err
 			}
@@ -177,11 +182,40 @@ func (s *Store) setAttrs(ctx context.Context, ino int64, p SetAttrsPatch, journa
 			if p.Size != nil {
 				op.Size, op.Set = *p.Size, append(op.Set, "size")
 			}
-			_, err := s.appendJournalTx(ctx, tx, op)
+			if len(op.Set) == 0 {
+				return nil // nothing changed: nothing to replay
+			}
+			_, err = s.appendJournalTx(ctx, tx, op)
 			return err
 		})
 	}
 	return s.setAttrsExec(ctx, ino, p)
+}
+
+// dropUnchanged removes the fields of p that already hold their value
+// (the mode compared on its permission bits: go-fuse passes only those,
+// while create stores the file type too). rsync's fchmod of a temp file
+// to the mode it was created with and the kernel's repeats of the
+// current mtime made 3 of rsync's 8 journal ops per file no-ops (P1
+// scale pilot). The UPDATE still bumps ctime, which is not journaled,
+// so the live row and a replayed one stay identical.
+func dropUnchanged(cur Inode, p SetAttrsPatch) SetAttrsPatch {
+	if p.Mode != nil && *p.Mode&0o7777 == cur.Mode&0o7777 {
+		p.Mode = nil
+	}
+	if p.UID != nil && *p.UID == cur.UID {
+		p.UID = nil
+	}
+	if p.GID != nil && *p.GID == cur.GID {
+		p.GID = nil
+	}
+	if p.Mtime != nil && *p.Mtime == cur.Mtime {
+		p.Mtime = nil
+	}
+	if p.Size != nil && *p.Size == cur.Size {
+		p.Size = nil
+	}
+	return p
 }
 
 // setAttrsTx is the UPDATE inside a transaction.

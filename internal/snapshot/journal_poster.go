@@ -52,6 +52,14 @@ const DefaultPosterInterval = 5 * time.Second
 // instead of 10000.
 const DefaultPosterBatchSize = 1000
 
+// DefaultPosterBatchBytes2 bounds a FORMAT-2 batch by the plain JSON of
+// its ops instead of by count. Format-2 bodies are zstd-compressed
+// (about 9:1 on journal JSON), so 1,000 ops came out at ~11 KB — the
+// 1,000-op cap above was sized for ~250 KB of PLAIN JSON, and an rsync
+// of 50,000 files took 400 messages (P1 scale pilot). 2 MiB of op JSON
+// compresses to roughly 200–250 KB: the size the cap was meant to give.
+const DefaultPosterBatchBytes2 = 2 << 20
+
 // Poster posts pending journal entries to the channel. One Poster
 // per FS; co-runs alongside the snapshot Manager on the same gotd
 // session.
@@ -149,16 +157,15 @@ func (p *Poster) drainOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fs_uuid: %w", err)
 	}
-	batchSize := p.BatchSize
+	batchSize, batchBytes := p.BatchSize, 0
 	if batchSize <= 0 {
 		batchSize = DefaultPosterBatchSize
 	}
-	for start := 0; start < len(pending); start += batchSize {
-		end := start + batchSize
-		if end > len(pending) {
-			end = len(pending)
-		}
-		batch := pending[start:end]
+	if p.Keys != nil {
+		batchSize, batchBytes = 0, DefaultPosterBatchBytes2
+	}
+	for _, r := range journalBatches(pending, batchSize, batchBytes) {
+		batch := pending[r[0]:r[1]]
 		entries := make([]tg.JournalBatchEntry, len(batch))
 		for i, e := range batch {
 			entries[i] = tg.JournalBatchEntry{Seq: e.Seq, Op: e.OpJSON}
@@ -190,4 +197,29 @@ func (p *Poster) drainOnce(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// journalBatches cuts pending into consecutive [start, end) ranges of at
+// most maxOps ops (0 = no count limit) and at most maxBytes bytes of op
+// JSON (0 = no byte limit). A single op larger than maxBytes still forms
+// its own batch.
+func journalBatches(pending []meta.JournalEntry, maxOps, maxBytes int) [][2]int {
+	var out [][2]int
+	for start := 0; start < len(pending); {
+		end, n := start, 0
+		for end < len(pending) {
+			if maxOps > 0 && end-start >= maxOps {
+				break
+			}
+			sz := len(pending[end].OpJSON)
+			if maxBytes > 0 && end > start && n+sz > maxBytes {
+				break
+			}
+			n += sz
+			end++
+		}
+		out = append(out, [2]int{start, end})
+		start = end
+	}
+	return out
 }

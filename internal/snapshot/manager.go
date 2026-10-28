@@ -73,6 +73,11 @@ type Manager struct {
 	// the "channel holds everything" state the web sync indicator
 	// reports.
 	QuiesceCheck func(ctx context.Context) bool
+	// QuiesceMinGap is the least time between two snapshot attempts
+	// for the drain-triggered early snapshot (0 = 30 s). Only the
+	// TEST-ONLY `telfs mount --snapshot-interval` raises it (P1 scale
+	// test; to be removed or replaced by the P2 snapshot design).
+	QuiesceMinGap time.Duration
 
 	// mu guards the change-detection baseline below. Once (cadence
 	// goroutine) writes it; Synced (metrics HTTP goroutines) reads it.
@@ -159,7 +164,10 @@ func (m *Manager) Run(ctx context.Context) error {
 	if tick < 5*time.Second {
 		tick = 5 * time.Second
 	}
-	const quiesceMinGap = 30 * time.Second
+	quiesceMinGap := 30 * time.Second
+	if m.QuiesceMinGap > quiesceMinGap {
+		quiesceMinGap = m.QuiesceMinGap
+	}
 	lastAttempt := time.Now()
 	t := time.NewTicker(tick)
 	defer t.Stop()

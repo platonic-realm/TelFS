@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -601,9 +602,14 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	memCacheCap := fs.String("mem-cache-cap", "", "in-RAM hot-tier cache size (e.g. 128MiB, 1GiB, 0 to disable). Empty falls through to 128 MiB. Reads hit the mem tier first, skipping os.ReadFile on hot chunks.")
 	blobPrefetch := fs.String("blob-prefetch", "", "packed-blob locality prefetch span (e.g. 4MiB): a cold read of one packed small file warms its blob neighbors in one ranged download. Empty = default 4 MiB; 0 disables.")
 	keyHeader := fs.String("key-header", "", "recover a format-2 filesystem with this key header export (telfs key export) instead of the channel's pinned key message; only used when the local DB is missing")
+	// TEST-ONLY (P1 scale test, Arash 2026-10-26): hidden from the help,
+	// warns on every use, to be removed or replaced by the P2 snapshot
+	// design. Holds periodic AND drain-triggered snapshots to one per D;
+	// the snapshots at mount and at unmount are unchanged.
+	snapInterval := fs.Duration("snapshot-interval", 0, "TEST-ONLY")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] [--cache-cap SIZE] <mountpoint>")
-		fs.PrintDefaults()
+		printDefaultsExcept(fs, "snapshot-interval")
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -638,6 +644,13 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}
 	}
 	checkFusermount()
+	if *snapInterval < 0 {
+		return errors.New("--snapshot-interval must be positive")
+	}
+	if *snapInterval > 0 {
+		fmt.Fprintf(os.Stderr, "WARNING: --snapshot-interval is a TEST-ONLY flag (P1 scale test) and will be removed or replaced by the P2 snapshot design.\n"+
+			"WARNING: periodic and drain-triggered snapshots are held back to one per %s; the channel copy lags further behind the local DB (journal batches still go out every 5 s).\n", *snapInterval)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -1067,6 +1080,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// can report snapshot-coverage state from day one of the
 		// process; the sync indicator keys off it.
 		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher, Keys: pipe.keys, QuiesceCheck: queueDrained}
+		if *snapInterval > 0 { // TEST-ONLY, see the flag
+			snapMgr.Interval, snapMgr.QuiesceMinGap = *snapInterval, *snapInterval
+		}
 
 		// Metrics endpoint (opt-in). Gauges are registered AFTER the
 		// pool & cache exist so they read the live values, not the
@@ -1886,6 +1902,18 @@ func armForceExit(mountpoint string) {
 		_ = mountctl.LazyUnmount(mountpoint)
 		os.Exit(130)
 	}()
+}
+
+// printDefaultsExcept is fs.PrintDefaults without the hidden flags.
+func printDefaultsExcept(fs *flag.FlagSet, hidden ...string) {
+	shown := flag.NewFlagSet(fs.Name(), flag.ContinueOnError)
+	shown.SetOutput(fs.Output())
+	fs.VisitAll(func(f *flag.Flag) {
+		if !slices.Contains(hidden, f.Name) {
+			shown.Var(f.Value, f.Name, f.Usage)
+		}
+	})
+	shown.PrintDefaults()
 }
 
 // neverUsedDB reports a DB that neither `telfs init` nor a recovery
