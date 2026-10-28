@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -68,6 +69,11 @@ func (w *FloodWaiter) Handle(next tg.Invoker) telegram.InvokeFunc {
 				return fmt.Errorf("flood wait %v exceeds cap %v: %w", d, w.max, err)
 			}
 			metrics.FloodWaits.Inc()
+			// Every flood wait is named, however short: an operator
+			// watching a long run must be able to tell "Telegram asked us
+			// to slow down" from a slow network (short waits used to be
+			// slept through silently).
+			fmt.Fprintf(os.Stderr, "[flood-wait] %s: Telegram asked to wait %v\n", methodName(input), d.Round(time.Second))
 			if err := sleepWithProgress(ctx, d); err != nil {
 				return err
 			}
@@ -108,4 +114,13 @@ func sleepWithProgress(ctx context.Context, d time.Duration) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// methodName is the RPC's type name without the package ("UploadGetFileRequest").
+func methodName(input bin.Encoder) string {
+	n := fmt.Sprintf("%T", input)
+	if i := strings.LastIndexByte(n, '.'); i >= 0 {
+		n = n[i+1:]
+	}
+	return n
 }

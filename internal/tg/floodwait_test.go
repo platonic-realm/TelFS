@@ -3,6 +3,8 @@ package tg
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"testing"
 	"time"
 
@@ -111,5 +113,27 @@ func TestFloodWaiterPassesThroughNonFlood(t *testing.T) {
 	}
 	if fi.calls != 1 {
 		t.Fatalf("expected exactly 1 call for non-retryable error, got %d", fi.calls)
+	}
+}
+
+// Every flood wait is named on stderr, even a short one.
+func TestFloodWaiterNamesEveryWait(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	fi := &fakeInvoker{wait: []time.Duration{1 * time.Second}}
+	fw := &FloodWaiter{max: MaxFloodWait}
+	err = fw.Handle(&invokerAdapter{f: fi})(context.Background(), &tg.UploadGetFileRequest{}, nil)
+	os.Stderr = old
+	w.Close()
+	out, _ := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "[flood-wait] UploadGetFileRequest: Telegram asked to wait 1s\n"; string(out) != want {
+		t.Fatalf("stderr %q, want %q", out, want)
 	}
 }
