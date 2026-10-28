@@ -1,5 +1,13 @@
 # 06 — The chunk pipeline
 
+> **Since v1 (October 2026)** a staged chunk no longer waits in memory:
+> its wire is written to the staging directory first and uploaded from
+> there, under a byte cap with backpressure (`[staging]`). Uploads go
+> over a pool of connections. Both are in
+> [chapter 18](18-v1-backup-service.md), sections 1 and 10; the
+> in-memory pipeline described here is still what runs without a staging
+> directory (tests).
+
 This is the longest chapter because the chunk pipeline is the single
 most complex component. It also has the highest density of
 "why-not-X" decisions, because every part of it touches latency,

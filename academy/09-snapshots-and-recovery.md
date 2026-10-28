@@ -1,5 +1,11 @@
 # 09 — Snapshots and recovery
 
+> **Since v1 (October 2026) the cadence below is format 1's.** A format-2
+> filesystem journals every change, chunk placements included, takes a
+> whole-DB snapshot only every 500,000 journal ops or 24 h, and is found
+> through a pinned anchor instead of a history scan: see
+> [chapter 18](18-v1-backup-service.md), section 6.
+
 The local SQLite DB is fast and authoritative while the daemon is
 running. But it's on **one machine**. If that machine dies, every
 chunk on the channel becomes an orphan — we can see the bytes, but

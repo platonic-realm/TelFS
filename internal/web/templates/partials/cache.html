@@ -26,13 +26,13 @@
       <dd>
         <strong>{{.PendingCount}}</strong> wire(s),
         <strong>{{humanBytes .PendingBytes}}</strong>
-        <small>(at <code>{{.PendingDir}}</code> — NOT counted against the cap. Wires sitting here represent chunks dispatched but whose <code>chunk_map</code> row hasn't landed yet.)</small>
+        <small>(at <code>{{.PendingDir}}</code> — chunks written through the mount and not uploaded yet. Not part of the cache: bounded by <code>[staging] max_bytes</code>, not by the cache cap; the Telegram tab shows the queue live.)</small>
       </dd>
     </dl>
   {{else}}
     <p>
-      <em>Cache panel unavailable — the running daemon's
-      <code>--metrics-addr</code> endpoint did not respond.</em>
+      <em>Cache panel unavailable — no mount of this profile
+      answered on its control socket.</em>
     </p>
     <p><small>
       On-disk footprint (informational only):

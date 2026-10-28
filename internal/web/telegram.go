@@ -72,11 +72,23 @@ type tgQueue struct {
 	PackerChunks      int   `json:"packer_chunks"`
 	PackerBytes       int64 `json:"packer_bytes"`
 	PackerTargetBytes int64 `json:"packer_target_bytes"`
-	// PendingWiresCount + Bytes: wires durably staged on disk under
-	// cache/pending/. Each represents a dispatched chunk whose
-	// chunk_map row hasn't landed yet. Survives daemon crash.
+	// PendingWiresCount + Bytes: wires durably staged on disk in the
+	// staging directory ([staging] dir, default cache/pending/). Each
+	// is a chunk written through the mount whose upload has not landed
+	// yet. Survives daemon crash.
 	PendingWiresCount int   `json:"pending_wires_count"`
 	PendingWiresBytes int64 `json:"pending_wires_bytes"`
+	// The disk-backed staging queue (spec v1, row 9): its directory, the
+	// staged bytes, the cap ([staging] max_bytes; 0 = no cap, or a
+	// daemon without the queue), whether a writer is waiting on the cap
+	// or the free-space floor, and the staged direct uploads waiting for
+	// / holding an upload worker. Daemons older than v1 send none of it.
+	StagingDir          string `json:"staging_dir"`
+	StagingBytes        int64  `json:"staging_bytes"`
+	StagingCapBytes     int64  `json:"staging_cap_bytes"`
+	StagingBlocked      bool   `json:"staging_blocked"`
+	StagedDirectWaiting int64  `json:"staged_direct_waiting"`
+	StagedDirectRunning int32  `json:"staged_direct_running"`
 	// PoolInFlight / PoolCap: how many concurrency slots in the
 	// UploadPool are currently held vs the cap.
 	PoolInFlight int `json:"pool_in_flight"`
@@ -88,6 +100,48 @@ type tgQueue struct {
 	// JournalUnposted: rows in the local journal table not yet
 	// posted to the channel.
 	JournalUnposted int `json:"journal_unposted"`
+}
+
+// stagingWarnRatio: above this share of the staging cap the link pill
+// turns yellow (writes do not wait yet, but uploads are behind).
+const stagingWarnRatio = 0.8
+
+// StagingLevel classifies the staging queue for the pill and the meter:
+// "err" while writes wait for uploads (the cap or the free-space floor is
+// reached), "warn" above 80 % of the cap, "" otherwise. A large backlog
+// below the cap is normal during a first backup, so the number of staged
+// wires plays no part.
+func (q tgQueue) StagingLevel() string {
+	switch {
+	case q.StagingBlocked:
+		return "err"
+	case q.StagingCapBytes > 0 && float64(q.StagingBytes) > stagingWarnRatio*float64(q.StagingCapBytes):
+		return "warn"
+	}
+	return ""
+}
+
+// StagingPct is the staged bytes as a share of the cap, 0..100 (0 when
+// there is no cap).
+func (q tgQueue) StagingPct() float64 {
+	if q.StagingCapBytes <= 0 {
+		return 0
+	}
+	p := float64(q.StagingBytes) / float64(q.StagingCapBytes) * 100
+	return max(0, min(p, 100))
+}
+
+// stagingSummary is "N wire(s), X of the Y cap" for tooltips.
+func (q tgQueue) stagingSummary() string {
+	b := q.StagingBytes
+	if b == 0 {
+		b = q.PendingWiresBytes // a daemon without the queue fields
+	}
+	s := fmt.Sprintf("%d wire(s), %s staged", q.PendingWiresCount, humanBytesTpl(b))
+	if q.StagingCapBytes > 0 {
+		s += fmt.Sprintf(" of the %s cap (%.0f %%)", humanBytesTpl(q.StagingCapBytes), q.StagingPct())
+	}
+	return s
 }
 
 // tgSync is the daemon's channel-sync verdict. ChannelComplete means

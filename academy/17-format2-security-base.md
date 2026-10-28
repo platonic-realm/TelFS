@@ -5,7 +5,8 @@ optionally encrypted, snapshots wrapped in an encrypted envelope, the
 Telegram session in a plain JSON file. This chapter covers the pass that
 prepared TelFS to hold an off-site backup of a whole home folder — the
 first phase (P1) of a plan whose later phases add scalable snapshots,
-versions and a boot service. P1 is about one question: **what can anyone
+versions and a boot service (they became v1:
+[chapter 18](18-v1-backup-service.md)). P1 is about one question: **what can anyone
 who reads the channel, or copies the profile folder, learn or do?**
 
 ## What was still in the clear

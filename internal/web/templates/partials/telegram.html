@@ -4,7 +4,7 @@
 <div class="panel error">
   <p><strong>Daemon /telegram endpoint unreachable.</strong></p>
   <p>Tried <code>{{.Source}}</code>: {{.FetchError}}</p>
-  <p>Make sure <code>telfs mount</code> is running with <code>--metrics-addr 127.0.0.1:9090</code>.</p>
+  <p>No mount of this profile answers on its control socket (<code>daemon.sock</code> in the profile directory). Start one — <code>telfs mount &lt;mountpoint&gt;</code> or the Mounts tab — and this page fills in by itself.</p>
 </div>
 {{if .Persisted}}
 <div class="panel">
@@ -83,19 +83,34 @@
         {{end}}
       </td>
     </tr>
-    <tr title="Wires durably staged on disk under cache/pending/. Each one is a chunk dispatched to the packer whose chunk_map row hasn't landed yet. Survives daemon crash; the next startup re-submits them.">
+    <tr title="Chunks written through the mount and not uploaded yet, each a wire in the staging directory ([staging] dir). Until a chunk is uploaded its staged wire is the only copy: it survives a crash and the next mount uploads it. Above the cap ([staging] max_bytes) — or near the staging filesystem's free-space floor ([staging] min_free) — writes wait for uploads.">
       <td>Staged on disk</td>
       <td>
         <strong>{{.State.Queue.PendingWiresCount}}</strong> wire(s),
-        <strong>{{humanBytes .State.Queue.PendingWiresBytes}}</strong>
-        {{if gt .State.Queue.PendingWiresCount 0}}
-          <small>dispatched, chunk_map row not yet landed</small>
+        <strong>{{humanBytes .State.Queue.PendingWiresBytes}}</strong>{{if gt .State.Queue.StagingCapBytes 0}} of <strong>{{humanBytes .State.Queue.StagingCapBytes}}</strong> cap{{end}}
+        {{if gt .State.Queue.StagingCapBytes 0}}
+          <div class="qbar" title="{{printf "%.1f" .State.Queue.StagingPct}} % of the staging cap">
+            <div class="qbar-fill {{.State.Queue.StagingLevel}}" style="width: {{printf "%.1f" .State.Queue.StagingPct}}%"></div>
+          </div>
+        {{end}}
+        {{if .State.Queue.StagingBlocked}}
+          <small class="error"><strong>writes are waiting for uploads</strong> — the cap or the free-space floor is reached</small>
+        {{else if eq .State.Queue.StagingLevel "warn"}}
+          <small class="warn">over 80 % of the cap — uploads are behind the writes</small>
+        {{else if gt .State.Queue.PendingWiresCount 0}}
+          <small>written, waiting for upload</small>
         {{else}}
-          <small>all dispatched chunks have committed</small>
+          <small>every write has been uploaded</small>
+        {{end}}
+        {{if or .State.Queue.StagedDirectWaiting .State.Queue.StagedDirectRunning}}
+          <br><small>direct uploads: {{.State.Queue.StagedDirectRunning}} running, {{.State.Queue.StagedDirectWaiting}} queued (small chunks go through the packer)</small>
+        {{end}}
+        {{if .State.Queue.StagingDir}}
+          <br><small>in <code>{{.State.Queue.StagingDir}}</code></small>
         {{end}}
       </td>
     </tr>
-    <tr title="Local journal rows that haven't been posted to the channel yet. The poster batches up to 1000 ops per channel message.">
+    <tr title="Local journal rows that haven't been posted to the channel yet. The poster runs every 5 s and batches up to 2 MiB of ops per channel message (format 1: 1,000 ops).">
       <td>Journal unposted</td>
       <td>
         <strong>{{.State.Queue.JournalUnposted}}</strong> op(s)

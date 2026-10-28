@@ -1,5 +1,11 @@
 # 12 — The web UI
 
+> **Since v1 (October 2026)** the console reads the active profile's
+> mount over its owner-only control socket (`<profile>/daemon.sock`)
+> instead of the fixed TCP port it used to assume, and the link
+> lamp classifies the upload backlog by the staging cap: see
+> [chapter 18](18-v1-backup-service.md), sections 1 and 2.
+
 `internal/web/`. Largest single package, but most of it is shape and
 glue. The interesting decisions are about *what the web is* and *how
 the web stays simple*.

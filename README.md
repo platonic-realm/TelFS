@@ -6,11 +6,15 @@
 
 A POSIX filesystem that stores its data in a private Telegram channel.
 Files are chunked, encrypted with AES-256-GCM, and uploaded as channel
-messages; a local SQLite database holds the metadata and is
-periodically snapshotted — encrypted — back to the same channel, so a
-fresh machine with the account and the profile's secret can mount and
-read every byte. On the channel nothing is readable without the secret
-but message sizes and times. Pure-Go, single static binary.
+messages; a local SQLite database holds the metadata, and every change
+to it is posted — encrypted — to the same channel as a journal, with an
+occasional whole-database snapshot, so a fresh machine with the account
+and the profile's secret can mount and read every byte. On the channel
+nothing is readable without the secret but message sizes and times.
+Built to hold an off-site backup: it runs as a systemd service, tells a
+backup job when the channel holds everything (`telfs sync --wait`),
+keeps named versions and restores them in bulk. Pure-Go, single static
+binary.
 
 ```sh
 telfs profile create main && telfs profile use main
@@ -31,11 +35,15 @@ End-to-end verified on a real Telegram account + private channel:
 | Login — interactive phone + code + 2FA over MTProto (one identity per profile, logout supported) | ✓ |
 | Read/write mount with full POSIX: files, dirs, hardlinks, symlinks, xattrs | ✓ |
 | Multi-chunk files (no per-file ceiling), cross-chunk-boundary read/write | ✓ |
-| Cold-mount recovery from channel snapshot, journal replay (≤5 s loss) | ✓ |
-| Snapshots that scale (format 2): rare whole-DB snapshots, found through a pinned encrypted anchor — no history scan | ✓ |
+| Cold-mount recovery from channel snapshot + journal replay (the journal trails by ≤5 s) | ✓ |
+| Snapshots that scale (format 2): rare whole-DB snapshots, found through a pinned encrypted anchor — no history scan | ✓ v1 |
 | `--readonly` mount, FLOOD_WAIT handling, persistent LRU chunk cache | ✓ |
-| `telfs gc` — orphan chunks + stale snapshots | ✓ |
-| `telfs fsck` — channel-side integrity check; `--quick` (format 2): every referenced message exists with its size, nothing downloaded, through the running mount | ✓ |
+| Service mode: `mount --service` (systemd `Type=notify`, waits for the network at boot, never prompts), example unit, secret from systemd encrypted credentials | ✓ v1 |
+| Control socket per mount: `status --json`, `sync --wait`, `unmount` that waits for the daemon — no secret needed | ✓ v1 |
+| Disk-backed staging queue with a byte cap: a 400 GB `rsync` slows to upload speed instead of filling the disk | ✓ v1 |
+| Parallel uploads: a pool of connections to the account's data centre, a byte-rate cap | ✓ v1 |
+| `telfs gc` — orphan chunks + stale snapshots (not while mounted, not with versions) | ✓ |
+| `telfs fsck` — channel-side integrity check; `--quick` (format 2): every referenced message exists with its size, nothing downloaded, through the running mount | ✓ (`--quick`: v1) |
 | `telfs status` / `telfs doctor` — one-screen state / local invariant lint | ✓ |
 | Format 2 (new filesystems): everything encrypted — chunks, captions, snapshots, journal; sizes Padmé-padded; Argon2id over 2 GiB | ✓ |
 | One secret per profile from a prompt, a secret file, or KeePassXC; encrypted `session.enc`; non-dumpable processes | ✓ |
@@ -45,10 +53,19 @@ End-to-end verified on a real Telegram account + private channel:
 | Web management UI: dashboard, login wizard, mount supervisor, file browser | ✓ (`telfs web`) |
 | `telfs trash` — `rm` reroutes to `/.trash`, TTL GC | ✓ |
 | Snapshot history + point-in-time restore (last 12 by default) | ✓ |
-| Versions (format 2): named, immutable whole-filesystem versions, each mountable read-only next to the live mount | ✓ (`telfs versions`) |
-| Bulk restore (format 2): each channel message downloaded once, every restored file verified by its keyed hashes, resumable | ✓ (`telfs restore`) |
-| Content-addressed chunk dedup, keyed hash (format 2; format 1: plaintext + convergent) | ✓ |
-| Multi-mounter coordination | ✗ assume one mount per channel |
+| Versions (format 2): named, immutable whole-filesystem versions, each mountable read-only next to the live mount | ✓ v1 (`telfs versions`) |
+| Bulk restore (format 2): each channel message downloaded once, every restored file verified by its keyed hashes, resumable | ✓ v1 (`telfs restore`) |
+| Content-addressed chunk dedup, keyed hash (format 2; format 1: plaintext + convergent); small packed files are not deduplicated | ✓ |
+| Space reclamation on an always-mounted filesystem, version-aware gc | ✗ later (see [Known limits](#known-limits)) |
+| Multi-mounter coordination | ✗ one writer per machine is enforced; nothing stops a second machine |
+
+Rows marked **v1** are built and unit-tested against fakes of the
+channel; their live acceptance run (≈0.5 M files, ≥10 versions, a cold
+recovery checked file by file, a timed restore, service boot/stop) is
+still to come. The rest has run end to end on a real account. New
+features need a format-2 filesystem (`telfs init`); a format-1
+filesystem refuses them with a clear message (see
+[Format 1](#format-1-filesystems-from-v022-and-earlier)).
 
 ## Telegram API credentials (API ID + hash)
 
@@ -203,11 +220,22 @@ the meta DB instead), and tears down the MTProto session.
 ## Mount options
 
 ```
-telfs mount [--readonly [--version NAME]] [--allow-other] [--debug] <mountpoint>
+telfs mount [--readonly [--version NAME]] [--service] [--key-header FILE]
+            [--allow-other] [--debug] [--no-recover] [--metrics-addr ADDR] <mountpoint>
 ```
 
 `--allow-other` needs `user_allow_other` in `/etc/fuse.conf`.
-`--debug` logs every FUSE op (very chatty).
+`--debug` logs every FUSE op (very chatty). `--service` is for systemd
+(see [Running unattended](#running-unattended)), `--key-header` for a
+recovery without the pinned key message (see [Recovery](#recovery)).
+`--no-recover` makes a mount without a local DB fail instead of
+recovering it from the channel. `--metrics-addr ADDR` additionally
+serves Prometheus `/metrics` (and the daemon's JSON pages) over TCP;
+it is off by default — everything else talks to the
+[control socket](#talking-to-a-running-mount-status-sync-unmount).
+Cache and read tuning: `--cache-cap`, `--mem-cache-cap`,
+`--prefetch-window`, `--prefetch-concurrency`, `--blob-prefetch`
+(`telfs mount -h`).
 
 **`--readonly` never writes to the channel** — no snapshots, no journal,
 no uploads, no deletions, no pins: the Telegram session itself refuses
@@ -241,7 +269,7 @@ use it and need no secret — a backup or monitoring job never sees one:
 telfs status --json            # one JSON object (schema 1); works mounted or not
 telfs sync                     # exit 0 if the channel holds everything now, 4 if not
 telfs sync --wait --timeout 6h # block until everything written before this call is on the channel
-telfs unmount <mountpoint|profile>   # returns when the daemon has exited
+telfs unmount <mountpoint|profile>   # returns when the daemon has exited (--timeout, default 2m)
 telfs versions create NAME     # see Versions
 telfs fsck --quick [--json]    # every referenced message still on the channel (see Maintenance)
 ```
@@ -256,27 +284,56 @@ replays the journal after the newest one) and says nothing about later
 changes. Format 2 only. Data of a file still open for writing counts
 once it is closed.
 
-`status --json` (schema 1 — fields are only ever added): `profile`,
-`fs_uuid`, `format`, `mounted`, `read_only`, `version_mount`,
-`mountpoint`, `pid`, `link` (state ok/busy/down/fault), `sync` (synced,
-pending uploads and bytes, unposted journal ops, oldest pending age),
-`snapshot`, `versions` (count, newest name and creation time),
-`upload` (configured connections and rate cap, measured upload rate in
-bytes/s), `staging` (dir, pending bytes, cap, blocked), `key_header`,
-`crypto_uses`, `last_error`. Without a running mount it reports from
-local state, with the live-only fields null. `telfs status --json
---version NAME` asks that version's mount instead (`version_mount` =
-its name; exit 5 when it is not mounted).
+`sync --wait` without `--timeout` waits as long as it takes; with one
+it exits 4 when the time is up. Without a running mount `sync` exits 5.
 
-Exit codes, the same for every command: 0 ok · 1 usage or other error ·
-2 secret source unavailable · 3 wrong secret · 4 timeout / not synced
-yet · 5 not mounted · 6 Telegram or the channel unreachable or refused ·
-7 integrity problem (fsck findings, a recovery refused or incomplete,
-restored files that do not match their keyed hashes).
+`telfs status --json` prints one object, **schema 1** — fields are only
+ever added within it:
 
-The TCP endpoint of earlier versions (`127.0.0.1:9090`) is off now;
-`--metrics-addr 127.0.0.1:9090` still serves Prometheus `/metrics` (and
-the JSON pages) for those who scrape it.
+```json
+{
+  "schema": 1, "telfs_version": "v1.0.0", "profile": "backup", "fs_uuid": "…", "format": 2,
+  "mounted": true, "read_only": false, "version_mount": null, "mountpoint": "/srv/telfs/backup",
+  "pid": 1234, "log_path": null,
+  "link": {"state": "ok", "last_success_unix": 0, "flood_wait_until_unix": 0},
+  "sync": {"synced": true, "pending_uploads": 0, "pending_bytes": 0, "journal_unposted": 0,
+           "oldest_pending_age_s": 0},
+  "snapshot": {"last_msg_id": 0, "last_unix": 0, "journal_ops_since": 0},
+  "versions": {"count": 0, "newest": {"name": "…", "created_unix": 0}},
+  "upload": {"connections": 8, "rate_cap_bytes_per_s": 5000000, "rate_bytes_per_s": 0},
+  "staging": {"dir": "/…/pending", "pending_bytes": 0, "cap_bytes": 50000000000, "blocked": false},
+  "key_header": {"pinned_ok": true, "checked_unix": 0},
+  "crypto_uses": {"chunk": 0, "meta": 0, "caption": 0, "warn": false},
+  "last_error": {"text": "…", "unix": 0}
+}
+```
+
+`link.state` is `ok`, `busy` (a flood wait, or uploads without progress
+for a minute), `down` (not connected) or `fault` (an error in the last
+30 s). `sync.synced` is the same verdict as `telfs sync`; `staging.blocked`
+means writes are waiting for uploads (the staging cap or free-space floor
+is reached). Without a running mount the object comes from local state:
+`mounted: false`, `sync` as of the last unmount, the live-only fields
+(`read_only`, `link`, `upload`, …) null; `last_error` is null when there
+was none. `status --json` exits 0 mounted or not (1 only when the
+profile cannot be read). `telfs status --json --version NAME` asks that
+version's mount instead (`version_mount` = its name; exit 5 when it is
+not mounted).
+
+### Exit codes
+
+The same for every command:
+
+| Code | Meaning |
+|---|---|
+| 0 | ok |
+| 1 | usage or other error |
+| 2 | secret source unavailable (no file, no KeePassXC, `$CREDENTIALS_DIRECTORY` unset, a prompt in service mode) |
+| 3 | wrong secret |
+| 4 | timeout / not synced yet (`sync`, `versions create`; `restore` of data the mount had not uploaded yet) |
+| 5 | not mounted — no daemon answers (`sync`, `unmount`, `versions create\|delete`, `status --json --version`) |
+| 6 | Telegram or the channel unreachable or refused, after the retries the command does |
+| 7 | integrity problem: `fsck` findings, a recovery refused or incomplete, a key header mismatch, restored files that do not match their keyed hashes |
 
 ## Versions
 
@@ -382,18 +439,24 @@ telfs restore [--workers 4] SRC DEST
 ## Recovery
 
 Lose the local DB? The next `telfs mount` restores the newest snapshot
-and replays the journal posted after it. At worst you lose what was
-written in the last journal cycle (journal poster: 5 s).
+and replays the journal posted after it. Nothing that `telfs sync
+--wait` had confirmed is ever lost; beyond that, the journal trails by
+about 5 s, and data still waiting in the staging directory is on the
+channel only once its upload lands (see [Known limits](#known-limits)).
 
 ```sh
 PROFDIR=~/.config/telfs/profiles/main
 rm -rf $PROFDIR/db.sqlite $PROFDIR/cache
-telfs mount ./mnt
-# Local DB missing — scanning channel for snapshot…
-# Found snapshot msg=29 (ts 2026-05-28T18:03:00Z)
-# Restored 1489 gzipped bytes → db.sqlite (TFSE envelope decrypted)
-# Mounted at ./mnt.
+telfs mount ~/mnt
+# Local DB missing — looking for the filesystem on the channel…
+# Key header opened (filesystem 0b6f…). Looking for the newest snapshot…
+# Anchor (msg 912): snapshot msg=905 (journal seq 5157198, 2026-10-28T09:12:44Z)
+# Replaying 597012 journal op(s) since seq 5157198…
+# Mounted at /home/you/mnt. Press ^C to unmount.
 ```
+
+Measured: a snapshot of 1 M files plus a journal of 597,012 ops after it
+recovered in 1 min 48 s.
 
 A channel with no TelFS filesystem is an error ("run `telfs init`") —
 a filesystem is created only by `telfs init`, never implicitly. An
@@ -819,6 +882,14 @@ with HTMX-polled log tail, lifetime Telegram stats (persisted in the
 profile's SQLite, visible even while the daemon is down), and a file
 browser through a chosen mountpoint.
 
+The masthead carries two lamps for the active profile, read from its
+mount's control socket: **link** (ok / busy / down / fault; it turns
+yellow when the staging directory holds more than 80 % of its cap and
+red, "backlog", when writes are waiting for uploads — a large backlog
+below the cap is normal during a first backup) and **sync** (green when
+the channel alone could recover the filesystem). The Telegram tab shows
+the upload queue, including the staging directory, its bytes and cap.
+
 First-time users land on a guided `/setup` wizard where every step is
 an inline form on one page: create profile → API creds → phone login
 (code + 2FA inline) → pick a channel from your dialog list → optional
@@ -855,15 +926,43 @@ kernel mount may stay in `/proc/mounts` while writes silently fall
 through to the *local* filesystem underneath. Files dropped during
 that window land on disk locally, not in the channel.
 
-For production, run it as a service: `telfs mount --service` never
-prompts, waits (and tells systemd why) while the network or Telegram is
-unreachable at boot, reports `READY=1` once mounted and `STOPPING=1` on
-stop, and exits with the codes above. An example unit is
-[`contrib/systemd/telfs@.service`](contrib/systemd/telfs@.service):
-`Type=notify`, the secret through `LoadCredentialEncrypted=` (the
-profile's `[secret] file = "${CREDENTIALS_DIRECTORY}/telfs-secret"`),
-and no restart loop on the exit codes that need a human (2, 3, 6, 7).
-Several profiles can be mounted at once: each has its own control
+For production, run it as a service: `telfs mount --service`
+
+- never prompts — a prompt-source profile exits 2 at once; the secret
+  comes from a file or systemd's encrypted credentials (see
+  [Secrets](#secrets));
+- waits while the network or Telegram is unreachable at boot: recovery
+  and the channel-access check are retried (5 s doubling to 5 min) on
+  network errors, timeouts and Telegram server errors only, and systemd
+  is told why (`STATUS=`) and asked for more time
+  (`EXTEND_TIMEOUT_USEC`) so a boot without network waits instead of
+  being killed; a refusal ends the service (exit 6), a refused recovery
+  too (exit 7);
+- reports `READY=1` once the filesystem is mounted and its control
+  socket answers, `STOPPING=1` on stop;
+- stops cleanly on SIGTERM: lets the uploads under way finish (up to
+  12 s), posts the journal (up to 10 s) and exits 0; whatever is still
+  staged stays on disk and is uploaded at the next start (run `telfs
+  sync --wait` first when the channel must hold everything).
+
+An example unit is
+[`contrib/systemd/telfs@.service`](contrib/systemd/telfs@.service)
+(an example — the real unit belongs to the deployment):
+
+```ini
+[Service]
+Type=notify
+Environment=TELFS_PROFILE=%i
+LoadCredentialEncrypted=telfs-secret:/etc/credstore.encrypted/telfs-%i
+ExecStart=/usr/local/bin/telfs mount --service /srv/telfs/%i
+TimeoutStopSec=90
+Restart=on-failure
+RestartPreventExitStatus=2 3 6 7
+```
+
+with the profile's `[secret] file = "${CREDENTIALS_DIRECTORY}/telfs-secret"`;
+no restart loop on the [exit codes](#exit-codes) that need a human (2, 3,
+6, 7). Several profiles can be mounted at once: each has its own control
 socket. Other jobs talk to the mount without the secret:
 
 ```sh
@@ -878,17 +977,50 @@ data.
 ## Known limits
 
 - **One read-write mounter per channel.** Enforced on one machine (see
-  [Mount options](#mount-options)); across machines it is your
-  discipline until a channel-side writer lease exists.
-- **≤5 s recovery window.** A background journal poster drains the
-  local `journal` table every 5 s and posts the pending ops to the
-  channel; recovery restores the latest snapshot, then replays the
-  journal ops after it. Format 2 journals every change, including
-  attributes, xattrs and where each chunk was uploaded, so the latest
-  snapshot plus the journal is the whole filesystem. Format 1 journals
-  only the namespace (`create`, `link`, `unlink`, `rename`, `setsize`):
-  there, files uploaded after the latest snapshot come back without
-  their content.
+  [Mount options](#mount-options)); **nothing stops a second machine**
+  from mounting the same channel read-write — across machines it is
+  your discipline until a channel-side writer lease exists. Drill
+  elsewhere with `--readonly`.
+- **Nothing is reclaimed while mounted, nor with versions.** `telfs gc`
+  refuses while the filesystem is mounted and on a filesystem with
+  versions; v1 has no version-aware reclamation. An always-mounted
+  filesystem with versions therefore only grows on the channel:
+  overwritten and deleted data, old snapshots and posted journal
+  batches all stay. Nothing a version references can ever be deleted.
+- **Small files are not deduplicated.** Chunks under 256 KiB go into
+  packs, and packs are not in the dedup index: two identical small
+  files are both uploaded (a small chunk can only reuse a large file's
+  identical chunk). There are no explicit reference counts — a message
+  is referenced by its `chunk_map` rows.
+- **A snapshot is one document.** Format 2 uploads the whole database
+  as a snapshot (~100 B per file sealed: 107 MB for 1 M files), and a
+  Telegram document holds at most 2 GiB — roughly 20 M files. Snapshots
+  are rare (see [Configuration](#configuration)), so that is the ceiling,
+  not the cost.
+- **Staged data is not fsynced.** A write is on the channel only once
+  its staged copy is uploaded; after a power loss the mount's crash
+  repair cuts files back to what reached the channel, and says which
+  (`<profile>/repair-<time>.tsv`). `telfs sync --wait` tells you when
+  nothing is at risk.
+- **Versions are read through their own mount** (`mount --readonly
+  --version NAME`), not under a directory of the live mount; their
+  retention is the caller's (`versions list` / `delete`).
+- **Format 1 gets none of the v1 features.** Filesystems from v0.22 and
+  earlier keep working as they did (journal in clear, a snapshot every
+  5 minutes, no chunk placements in the journal), and `sync`, `versions`,
+  `restore` and `fsck --quick` refuse them. Move the data with `rsync`
+  into a new filesystem.
+- **Recovery window.** A background journal poster drains the local
+  `journal` table every 5 s and posts the pending ops to the channel,
+  but a file's data reaches the channel only when its staged upload
+  lands — during a large first backup, hours later. `telfs sync --wait`
+  marks the point where nothing is missing. Recovery restores the
+  latest snapshot, then replays the journal ops after it. Format 2
+  journals every change, including attributes, xattrs and where each
+  chunk was uploaded, so the latest snapshot plus the journal is the
+  whole filesystem. Format 1 journals only the namespace (`create`,
+  `link`, `unlink`, `rename`, `setsize`): there, files uploaded after
+  the latest snapshot come back without their content.
 - **A recovery never empties files.** If a file comes back from the
   channel with a size but without all its chunks, the mount refuses,
   lists the files (`<profile>/recovery-incomplete-<time>.tsv`) and keeps
@@ -896,9 +1028,10 @@ data.
   rebuilds the chunk placements from the captions. The crash repair of
   a normal mount still cuts a file back to what reached the channel,
   and says so: count, paths, and `<profile>/repair-<time>.tsv`.
-- **Encryption metadata leakage is bounded, not zero.** Snapshots are
-  TFSE ciphertext, but chunk count, chunk size to ~chunk-size
-  resolution, and snapshot cadence remain visible.
+- **Encryption metadata leakage is bounded, not zero.** On format 2 the
+  number of messages, their Padmé-padded sizes and their times remain
+  visible (so does the upload rhythm); on format 1 also chunk counts per
+  file and the journal itself.
 - **One channel = one TelFS.** `fs_uuid` is stored in `meta_kv` and
   baked into every snapshot caption; recovery filters by it, so
   reusing a channel for a fresh instance leaves old snapshots as
@@ -911,21 +1044,34 @@ data.
 
 ## Roadmap
 
-No named items outstanding. Open directions:
+After v1:
 
+- **Reclamation inside the daemon** — a version-aware gc that frees
+  chunks no live file and no version references, prunes old journal
+  batches, and runs on an always-mounted filesystem.
+- **Dedup of packed small files** and explicit reference counts.
+- **`/.versions/<name>/`** inside the live mount, and retention rules
+  (keep daily/weekly/monthly) inside TelFS.
+- **Incremental snapshots** — no whole-database upload, no 2 GiB ceiling;
+  needed only far beyond 10 M files.
+- **A writer lease on the channel**, so a second machine cannot mount
+  read-write.
+- **Upload defaults** finalised from measurements, and the adaptive
+  limiter's slow start revisited.
+- **The web console for the v1 parts** (versions, restore, sync).
 - Reproducible `telfs bench` for chunker/cache/upload regression
   detection.
 - Better error UX in the web UI on failed login / network errors.
-- Multi-mounter coordination (currently TelFS assumes one writer per
-  channel).
 
 See [issues](https://github.com/platonic-realm/TelFS/issues) for
 current state.
 
 ## Architecture
 
-See [`docs/architecture.md`](docs/architecture.md) for module layout,
-SQLite schema, channel message format, and the recovery model.
+See the [academy](academy/README.md) — chapter by chapter, from the
+module layout, the SQLite schema and the chunk pipeline to the channel
+format ([17](academy/17-format2-security-base.md)) and the v1 work
+([18](academy/18-v1-backup-service.md)).
 
 ## License
 

@@ -1,15 +1,8 @@
 // Command telfs mounts a Telegram channel as a FUSE filesystem.
 //
-// Subcommands:
-//
-//	telfs login                       interactive MTProto auth
-//	telfs channel list                list channels you can post to
-//	telfs channel set <id>            pick the backing channel
-//	telfs channel info                show the configured channel
-//	telfs channel ping                smoke-test post + read-back round trip
-//	telfs mount <mountpoint>          mount the filesystem (read-only in M3)
-//
-// See docs/architecture.md for the design.
+// The commands and their flags are listed in the usage text below
+// (`telfs help`); README.md documents them for users, and academy/
+// explains the design chapter by chapter.
 package main
 
 import (
@@ -61,53 +54,94 @@ var (
 const usage = `telfs — FUSE filesystem backed by a Telegram channel
 
 Usage:
+ Setup
   telfs login                       Authenticate against Telegram (interactive
                                       MTProto phone → code → 2FA). The first
                                       login SETS the profile's secret: the
                                       session is stored encrypted (session.enc).
   telfs channel list                List your channels (id, title, post permission).
-  telfs channel set [--access-hash N] <id>
+  telfs channel set [--access-hash N] [--force] <id>
                                     Configure the backing channel.
                                       --access-hash overrides the automatic
-                                      dialog-list discovery when needed.
+                                      dialog-list discovery; --force rebinds a
+                                      profile that already has data (dangerous).
   telfs channel info                Show the currently configured channel.
   telfs channel ping                Round-trip a test message (smoke test).
-  telfs mount [flags] <mountpoint>  Mount the filesystem. A missing local DB is
-                                      recovered from the channel.
-                                      Flags: --readonly --allow-other --debug
-                                      --readonly --version NAME (mount a version,
-                                      next to the live mount)
-                                      --key-header FILE (recover with an export)
-                                      --service (systemd Type=notify: never
-                                      prompts, waits for network/Telegram)
+  telfs init [--chunk-size N] [--compression none|zstd] [--kdf-memory SIZE] [--kdf-time N]
+                                    Create a NEW filesystem (format 2: always
+                                      encrypted) on the bound channel; posts and
+                                      pins its key message and the first anchor,
+                                      prints the key export.
+  telfs profile {list, show, create, delete, use, reset-auth, export, import}
+                                    Manage multiple profiles (accounts/channels).
+                                      Each profile is ONE identity; reset-auth
+                                      wipes it (session + channel binding).
+
+ Mount and service
+  telfs mount [flags] <mountpoint>  Mount the filesystem (foreground daemon). A
+                                      missing local DB is recovered from the
+                                      channel (pinned key message + anchor).
+      --readonly                    Write nothing to the channel (drills).
+      --readonly --version NAME     Mount a version instead of the live tree;
+                                      may run next to the live mount.
+      --service                     systemd Type=notify: never prompts, waits
+                                      and retries while the network/Telegram
+                                      is unreachable, READY=1 once mounted,
+                                      STOPPING=1 on stop.
+      --key-header FILE             Recover with a key export (missing DB only).
+      --metrics-addr ADDR           Also serve Prometheus /metrics over TCP
+                                      (off by default).
+      --allow-other --debug --no-recover
+      --cache-cap --mem-cache-cap --prefetch-window --prefetch-concurrency
+      --blob-prefetch               Cache and read tuning (telfs mount -h).
   telfs unmount [--timeout D] <mountpoint|profile>
                                     Stop the mount daemon and return when it
                                       has exited (asked over its control
-                                      socket; older daemons: SIGTERM, then
-                                      SIGKILL + lazy unmount).
-  telfs sync [--wait] [--timeout D] Exit 0 when everything written through the
-                                      mount (before the call, with --wait) is
-                                      on the channel; 4 if not (yet), 5 if not
-                                      mounted. Needs no secret.
-  telfs versions create NAME [--timeout D] | list [--json] | delete NAME
-                                    Named, immutable versions (format 2): create
-                                      syncs, then posts the version (through the
-                                      running mount, no secret); 0 on the channel,
-                                      4 timeout, 5 not mounted, 6 Telegram.
+                                      socket; default --timeout 2m). 5 = not
+                                      mounted.
+
+ Talking to a running mount (control socket <profile>/daemon.sock; no secret)
+  telfs status [--json [--version NAME]]
+                                    One-screen summary of the active profile;
+                                      --json: one object (schema 1) for scripts,
+                                      mounted or not; --version: that version's
+                                      mount (5 if not mounted).
+  telfs sync [--wait] [--timeout D] 0 when everything written through the mount
+                                      (with --wait: before the call) is on the
+                                      channel; 4 not (yet) / timeout, 5 not
+                                      mounted. Format 2.
+  telfs versions create NAME [--timeout D]
+                                    Sync, then post a named, immutable version
+                                      (format 2); 0 once on the channel, 4 sync
+                                      timeout (nothing posted), 5, 6 Telegram.
+  telfs versions list [--json]      The registry (from the mount, else local).
+  telfs versions delete NAME        Delete a version (refused while mounted).
+  telfs fsck --quick [--json]       Format 2: every referenced message exists
+                                      with its document and every packed extent
+                                      fits — nothing downloaded, 100 ids per
+                                      request. Without a mount: own read-only
+                                      session (secret). 0 ok, 6 Telegram,
+                                      7 findings (first 20 on stderr).
+
+ Restore and recovery
   telfs restore [--version NAME] [--workers N] SRC DEST
                                     Copy SRC (a path in the filesystem; a
                                       directory's contents) into the local
                                       directory DEST, from the live filesystem
                                       or a version: each message downloaded
-                                      once, every file re-read and checked
-                                      against its keyed hashes; a re-run skips
-                                      what is already right. 0 ok, 4 data the
-                                      mount had not uploaded yet, 6 Telegram,
-                                      7 integrity (list: <profile>/restore-*.tsv).
-  telfs init [--chunk-size N] [--compression none|zstd] [--kdf-memory SIZE]
-                                    Create a NEW filesystem (format 2: always
-                                      encrypted) on the bound channel; posts and
-                                      pins its key message, prints the export.
+                                      once (default 4 workers), every file
+                                      re-read and checked against its keyed
+                                      hashes; a re-run skips what is already
+                                      right. 0 ok, 4 data the mount had not
+                                      uploaded yet, 6 Telegram, 7 integrity
+                                      (list: <profile>/restore-<time>.tsv).
+  telfs recover --from-captions [--journal use|ignore] [--report FILE] [--key-header FILE]
+                                    Rebuild the local DB from captions, pack
+                                      indexes and journal — no snapshot needed.
+  telfs snapshot {list [--max N], restore [--yes] <msg-id>}
+                                    Inspect / roll back to a historical snapshot.
+
+ Keys and secrets
   telfs secret test                 Check the profile's secret (exit 0 ok,
                                       2 source failed, 3 wrong secret).
   telfs secret change --new-from-prompt | --new-file PATH | --new-entry ENTRY
@@ -116,52 +150,51 @@ Usage:
   telfs session encrypt             Convert a v0.22 plaintext session.json.
   telfs key export [--out FILE]     Print the key header export (keep it with
                                       the secret: KeePassXC entry, break-glass kit).
-  telfs recover --from-captions [--journal use|ignore] [--report FILE] [--key-header FILE]
-                                    Rebuild the local DB from captions, pack
-                                      indexes and journal — no snapshot needed.
-  telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots
-                                      (refuses on a filesystem with versions).
   telfs encrypt status              Show the filesystem's encryption state.
-  telfs profile {list,show,create,delete,use,reset-auth,export,import}
-                                    Manage multiple profiles (accounts/channels).
-                                      Each profile is ONE identity; reset-auth
-                                      wipes it (session + channel binding).
-  telfs status [--json [--version NAME]]
-                                    One-screen summary of the active profile;
-                                      --json: one object (schema 1) for
-                                      scripts, needs no secret; --version:
-                                      that version's mount.
-  telfs doctor                      Lint local profile + DB state for known invariants.
-  telfs web [--listen ADDR] [--token TOKEN]
-                                    HTTP management UI (default 127.0.0.1:8080).
+
+ Maintenance
   telfs fsck [--fix] [--stop-after N]
-                                    Verify every chunk_map row against the channel;
+                                    Download and verify every chunk_map row;
                                       format 2: also the pinned key header.
-  telfs fsck --quick [--json]       Format 2: every referenced message exists
-                                      with its document and every packed
-                                      extent fits — nothing downloaded, 100
-                                      ids per request; through the running
-                                      daemon (no secret) when there is one.
-                                      0 ok, 6 Telegram, 7 problems (first 20
-                                      on stderr, all in --json).
-  telfs snapshot {list, restore [--yes] <msg-id>}
-                                    Inspect / roll back to a historical snapshot.
+  telfs gc [--yes] [--pages N] [--min-age D]
+                                    Reclaim orphan chunks + old snapshots
+                                      (dry run without --yes; refuses while
+                                      mounted and on a filesystem with versions).
+  telfs doctor                      Lint local profile + DB state for known invariants.
   telfs trash {enable [--ttl D], disable, status, list, empty}
                                     Manage the rm safety-net at /.trash.
-  telfs ratelimit {show, set <N>, clear}
-                                    View or change the TG requests/min cap.
-                                    0 = unlimited; running daemon hot-reloads
-                                    within 5 s of a CLI change.
+  telfs ratelimit {show, set <N>, clear, mode adaptive|manual}
+                                    View or change the TG requests/min caps
+                                      (telfs ratelimit help); a running daemon
+                                      picks a change up within 5 s.
+  telfs web [--listen ADDR] [--token TOKEN] [--tls-cert F --tls-key F]
+                                    HTTP management UI (default 127.0.0.1:8080).
   telfs bench [flags] <dir>         Micro-benchmark IO scenarios (stat storms,
                                       small files, streaming, random reads)
                                       against a directory — a TelFS mountpoint,
                                       or any local dir for a baseline. See
                                       telfs bench --help for the scenario list.
+  telfs version                     Print the program version (also -v,
+                                      --version); takes no arguments.
 
 Global flags (anywhere on the line):
   --secret-from prompt|file|keepassxc
                    Read the secret from this source for one command
                    (the [secret] table of config.toml names the default).
+
+Exit codes (every command):
+  0 ok              1 usage or other error     2 secret source unavailable
+  3 wrong secret    4 timeout / not synced yet 5 not mounted (no daemon answers)
+  6 Telegram or the channel unreachable or refused (after the retries)
+  7 integrity problem (fsck findings, recovery refused, restore mismatch)
+
+config.toml (per profile; see README "Configuration"):
+  [secret]   source = "prompt"|"file"|"keepassxc", file, entry
+             (file = "${CREDENTIALS_DIRECTORY}/<name>" for systemd credentials)
+  [staging]  dir, max_bytes (default 50GB), min_free (default 5GiB)
+  [snapshot] every_ops (default 500000), every (default 24h)   — format 2
+  [upload]   connections (default 8), parts_per_upload (default 2),
+             max_rate (default 5MB/s)
 
 Environment:
   TELFS_PROFILE    Active profile name (overrides ~/.config/telfs/active)
@@ -634,9 +667,9 @@ func cmdUnmount(_ context.Context, args []string) error {
 	} else {
 		mounts := mountctl.ScanProcMounts()
 		if len(mounts) == 0 {
-			return fmt.Errorf("unmount: %q is not a fuse.telfs mountpoint or a mounted profile (no telfs mounts are active)", target)
+			return fmt.Errorf("unmount: %q is not a fuse.telfs mountpoint or a mounted profile (no telfs mounts are active): %w", target, errNotMounted)
 		}
-		return fmt.Errorf("unmount: %q is not a fuse.telfs mountpoint or a mounted profile\nactive telfs mounts: %s", target, strings.Join(mounts, ", "))
+		return fmt.Errorf("unmount: %q is not a fuse.telfs mountpoint or a mounted profile: %w\nactive telfs mounts: %s", target, errNotMounted, strings.Join(mounts, ", "))
 	}
 
 	// A v1 daemon is asked over its control socket and the command waits
@@ -677,7 +710,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	readonly := fs.Bool("readonly", false, "mount read-only (rejects all write ops with EROFS)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access the mount (FUSE -o allow_other; requires user_allow_other in /etc/fuse.conf)")
 	debug := fs.Bool("debug", false, "log every FUSE op")
-	noRecover := fs.Bool("no-recover", false, "skip cold-mount recovery from channel snapshot (starts with an empty DB if local DB is missing)")
+	noRecover := fs.Bool("no-recover", false, "never recover from the channel: with no local DB the mount fails instead (a filesystem is created only by telfs init)")
 	metricsAddr := fs.String("metrics-addr", "", "also serve Prometheus /metrics (and /telegram, /cache) over TCP at this address, e.g. 127.0.0.1:9090. Off by default: status, sync and the web console use the profile's owner-only control socket.")
 	cacheCap := fs.String("cache-cap", "", "override the LRU disk-cache size cap (e.g. 8GiB, 512MiB, 2GB). Flag wins over config; empty falls through to config.toml's cache_cap; that falls through to 1 GiB.")
 	prefetchWindow := fs.Int("prefetch-window", 0, "how many chunks past the current read cursor to speculatively warm (0 = default 8). Bigger = more parallel reads in flight for sequential streams; smaller = less wasted bandwidth on random reads.")

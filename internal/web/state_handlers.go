@@ -30,8 +30,8 @@ type stateShowData struct {
 	PendingBytes int64
 
 	// CacheLive holds the daemon's live cache numbers (size, cap,
-	// hit ratio). Nil when the daemon's --metrics-addr endpoint is
-	// unreachable, in which case the template falls back to showing
+	// hit ratio). Nil when no daemon answers on the profile's control
+	// socket, in which case the template falls back to showing
 	// just the on-disk size from CacheSize / CacheN above.
 	CacheLive *cacheLiveStats
 

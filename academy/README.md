@@ -39,6 +39,7 @@ references inside them point at real code paths so you can keep
 | [15 — The read-performance pass](15-read-perf-pass.md) | Singleflight, parallel ranged fetch, FileReference cache, RAM hot tier, seek detection, cancellable prefetch | What it takes to make reads bandwidth-bound instead of RTT-bound |
 | [16 — The profile-identity pass](16-profile-identity-pass.md) | Identity-scoped access hashes, bot-auth removal, mount preflight, `telfs unmount`, the inline setup wizard, persistent stats | How "it didn't fail" turned out to be the worst bug report of all |
 | [17 — Format 2 and the security base](17-format2-security-base.md) | Key hierarchy, secret sources, `session.enc`, non-dumpable processes, encrypted captions/journal, Padmé, the key message and its export, rebuilding from captions | What an observer of the channel — or a copy of the profile folder — can no longer learn |
+| [18 — v1: TelFS as a backup service](18-v1-backup-service.md) | Disk-backed staging and backpressure, the control socket and the sync barrier, service mode, systemd credentials, journal-first snapshots and the anchor, versions, bulk restore with verification, `fsck --quick`, parallel uploads | What a backup job, a boot unit and a monitor need from a filesystem that a desktop user never asked for |
 
 ## Conventions
 

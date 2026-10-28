@@ -8,20 +8,27 @@ import (
 
 // healthPartial renders the small one-line pill that lives in the
 // header on every page. Polled every 5 s via HTMX. Reads from the
-// running daemon's /telegram JSON (no daemon → red pill with a hint
-// to start the mount).
+// running daemon's /telegram JSON over the profile's control socket
+// (no daemon → red pill).
 //
 // Status rules — keep them simple so an operator can predict what
 // turns the pill yellow vs red without reading code:
 //
-//	🟢 healthy — daemon online, last error > 5 min ago, no FLOOD_WAIT
-//	             in the last 5 min, pending wires < 100.
-//	🟡 busy    — queue > 0 with last-success-age > 60 s, OR FLOOD_WAIT
-//	             observed in the last 5 min, OR pending wires 100–999.
-//	🔴 issue   — daemon offline, last error < 30 s, OR pending wires
-//	             ≥ 1000 (the disk-leak signal — that many wires
-//	             accumulating means the FK-violation cleanup isn't
-//	             keeping up).
+//	green  "link ok"     daemon online and none of the below.
+//	yellow "link busy"   no upload progress for > 60 s with work queued,
+//	                     OR a FLOOD_WAIT in the last 5 min, OR the staging
+//	                     directory holds more than 80 % of its cap.
+//	red    "link down"   no daemon answers.
+//	red    "link fault"  last error < 30 s ago.
+//	red    "backlog"     writes are blocked: the staging cap ([staging]
+//	                     max_bytes) or the staging filesystem's free-space
+//	                     floor ([staging] min_free) is reached, so writes
+//	                     wait for uploads.
+//
+// A large staged backlog by itself is normal (a first backup writes far
+// faster than it uploads; the disk-backed staging queue exists for that),
+// so the wire COUNT never colours the pill — only how close the staged
+// BYTES are to the cap, and whether writes actually wait.
 func (s *Server) healthPartial(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	state := s.fetchTelegramStatePartial(r)
@@ -51,8 +58,9 @@ func classifyHealth(state tgPageData) (kind, label, tip string) {
 	if state.State.LastErrorAgeSeconds > 0 && state.State.LastErrorAgeSeconds < 30 {
 		return "err", "link fault", fmt.Sprintf("Last error %ds ago: %s", state.State.LastErrorAgeSeconds, state.State.LastErrorMessage)
 	}
-	if q.PendingWiresCount >= 1000 {
-		return "err", "backlog", fmt.Sprintf("%d wires staged on disk — FK-violation cleanup may be lagging. Check the daemon log.", q.PendingWiresCount)
+	if q.StagingBlocked {
+		return "err", "backlog", "Writes are waiting for uploads: " + q.stagingSummary() +
+			" — the staging cap ([staging] max_bytes) or the staging filesystem's free-space floor ([staging] min_free) is reached; writes resume as uploads land."
 	}
 	// Yellow conditions.
 	var yellowReasons []string
@@ -62,8 +70,8 @@ func classifyHealth(state tgPageData) (kind, label, tip string) {
 	if hasFloodWaitInLast5Min(state) {
 		yellowReasons = append(yellowReasons, "FLOOD_WAIT observed in the last 5 min")
 	}
-	if q.PendingWiresCount >= 100 && q.PendingWiresCount < 1000 {
-		yellowReasons = append(yellowReasons, fmt.Sprintf("%d wires staged", q.PendingWiresCount))
+	if q.StagingLevel() == "warn" {
+		yellowReasons = append(yellowReasons, "staging nearly full: "+q.stagingSummary()+" — uploads are behind the writes")
 	}
 	if len(yellowReasons) > 0 {
 		return "warn", "link busy", strings.Join(yellowReasons, " · ")
@@ -73,8 +81,8 @@ func classifyHealth(state tgPageData) (kind, label, tip string) {
 	if state.State.LastSuccessAgeSeconds > 0 {
 		parts = append(parts, fmt.Sprintf("last RPC %ds ago", state.State.LastSuccessAgeSeconds))
 	}
-	if q.PendingWiresCount > 0 {
-		parts = append(parts, fmt.Sprintf("%d wire(s) staged (draining)", q.PendingWiresCount))
+	if q.PendingWiresCount > 0 || q.StagingBytes > 0 {
+		parts = append(parts, q.stagingSummary()+" (draining)")
 	}
 	return "ok", "link ok", strings.Join(parts, " · ")
 }
