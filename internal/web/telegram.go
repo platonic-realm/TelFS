@@ -243,6 +243,11 @@ func loadOfflineSync(ctx context.Context, data *tgPageData) {
 	data.OfflineSyncKnown = true
 	data.OfflineSyncComplete = st.JournalUnposted == 0 && pendingClean &&
 		snapSeq >= 0 && (seq == 0 || seq == snapSeq)
+	if f, err := mstore.Format(ctx); err == nil && f == 2 {
+		// Format 2 journals every change, chunk placements included, and
+		// snapshots only rarely: the posted journal is the whole story.
+		data.OfflineSyncComplete = st.JournalUnposted == 0 && pendingClean
+	}
 }
 
 // telegramPage renders the connection-state + request-log view. Data

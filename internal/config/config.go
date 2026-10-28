@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -82,6 +83,10 @@ type Config struct {
 	// Staging is where written-but-not-yet-uploaded data waits, and how
 	// much of it may (spec v1, row 9).
 	Staging StagingConfig `toml:"staging,omitempty"`
+
+	// Snapshot is when a format-2 filesystem takes a whole-DB snapshot
+	// (spec v1, row 4).
+	Snapshot SnapshotConfig `toml:"snapshot,omitempty"`
 
 	// DataDir is the resolved location of the .telfs/ directory. Not serialized.
 	DataDir string `toml:"-"`
@@ -582,6 +587,51 @@ func (c *Config) StagingLimits() (maxBytes, minFree int64, err error) {
 		}
 	}
 	return maxBytes, minFree, nil
+}
+
+// SnapshotConfig is `[snapshot]` in config.toml (spec v1, row 4). Format 2
+// only: format 1 keeps its 5-minute cadence.
+//
+//	[snapshot]
+//	every_ops = 500000  # journal ops since the last snapshot that call for a new one
+//	every = "24h"       # or this long since the last one, if anything changed
+//
+// The journal holds every change (chunk placements included), so a
+// snapshot only shortens a recovery's replay; it waits for a quiet moment
+// (upload queue drained), at most an hour.
+type SnapshotConfig struct {
+	EveryOps int64  `toml:"every_ops,omitempty"`
+	Every    string `toml:"every,omitempty"`
+}
+
+// Snapshot policy defaults (the same as snapshot.DefaultEveryOps /
+// DefaultEvery).
+const (
+	DefaultSnapshotEveryOps = 500_000
+	DefaultSnapshotEvery    = 24 * time.Hour
+)
+
+// SnapshotPolicy returns [snapshot] every_ops and every, with the
+// defaults for unset values.
+func (c *Config) SnapshotPolicy() (everyOps int64, every time.Duration, err error) {
+	everyOps, every = DefaultSnapshotEveryOps, DefaultSnapshotEvery
+	if c.Snapshot.EveryOps < 0 {
+		return 0, 0, fmt.Errorf("[snapshot] every_ops = %d: must be positive", c.Snapshot.EveryOps)
+	}
+	if c.Snapshot.EveryOps > 0 {
+		everyOps = c.Snapshot.EveryOps
+	}
+	if c.Snapshot.Every != "" {
+		d, err := time.ParseDuration(c.Snapshot.Every)
+		if err != nil {
+			return 0, 0, fmt.Errorf("[snapshot] every: %w (e.g. \"24h\", \"168h\")", err)
+		}
+		if d <= 0 {
+			return 0, 0, fmt.Errorf("[snapshot] every = %q: must be positive", c.Snapshot.Every)
+		}
+		every = d
+	}
+	return everyOps, every, nil
 }
 
 // CredentialsDirVar is the variable systemd sets for a unit that loads

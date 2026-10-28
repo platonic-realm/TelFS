@@ -17,9 +17,9 @@ import (
 
 // Init2 creates a format-2 filesystem: a fresh local DB at dbPath, a
 // random DEK wrapped under secret (key message posted + pinned), and the
-// first snapshot. Refuses a channel that already holds a TelFS
-// filesystem (format 1 or 2) and a local DB that already holds one.
-// Returns the new fs_uuid.
+// first snapshot with its pinned anchor. Refuses a channel that already
+// holds a TelFS filesystem (format 1 or 2) and a local DB that already
+// holds one. Returns the new fs_uuid.
 func Init2(ctx context.Context, dbPath string, secret []byte, sess *tg.Session, chunkSize int64, codecName string, params crypto.ArgonParams) (string, error) {
 	if _, err := os.Stat(dbPath); err == nil {
 		m, err := meta.Open(dbPath)

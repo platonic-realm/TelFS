@@ -32,6 +32,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Read/write mount with full POSIX: files, dirs, hardlinks, symlinks, xattrs | ✓ |
 | Multi-chunk files (no per-file ceiling), cross-chunk-boundary read/write | ✓ |
 | Cold-mount recovery from channel snapshot, journal replay (≤5 s loss) | ✓ |
+| Snapshots that scale (format 2): rare whole-DB snapshots, found through a pinned encrypted anchor — no history scan | ✓ |
 | `--readonly` mount, FLOOD_WAIT handling, persistent LRU chunk cache | ✓ |
 | `telfs gc` — orphan chunks + stale snapshots | ✓ |
 | `telfs fsck` — channel-side integrity check | ✓ |
@@ -193,8 +194,9 @@ ln -s notes/hello.txt mnt/link               # symlink
 setfattr -n user.tag -v important mnt/notes/hello.txt
 ```
 
-On `^C` the daemon snapshots the meta DB to the channel, `fusermount
--u`s, drains in-flight requests, and tears down the MTProto session.
+On `^C` the daemon `fusermount -u`s, drains in-flight requests and
+uploads, posts the last journal ops (a format-1 filesystem: snapshots
+the meta DB instead), and tears down the MTProto session.
 
 ## Mount options
 
@@ -265,10 +267,9 @@ the JSON pages) for those who scrape it.
 
 ## Recovery
 
-Lose the local DB? The next `telfs mount` scans the channel for the
-most-recent snapshot and restores it. At worst you lose what was
-written between the last snapshot/journal cycle (snapshot cadence: 5
-min; journal poster: 5 s).
+Lose the local DB? The next `telfs mount` restores the newest snapshot
+and replays the journal posted after it. At worst you lose what was
+written in the last journal cycle (journal poster: 5 s).
 
 ```sh
 PROFDIR=~/.config/telfs/profiles/main
@@ -285,9 +286,15 @@ a filesystem is created only by `telfs init`, never implicitly. An
 empty `db.sqlite` that neither `init` nor a recovery made (something
 opened a missing database) is refused too, not mounted.
 
-On a format-2 filesystem the mount first reads the **pinned key
-message**, unlocks it with the profile's secret, then finds the newest
-snapshot. If the key message is gone, recover with the export:
+On a format-2 filesystem the mount reads the channel's **pinned
+messages**: the key message, unlocked with the profile's secret, and
+the **anchor** — a small encrypted document naming the newest snapshot
+and where the journal after it starts. It downloads that snapshot and
+only the journal batches posted after it; nothing scans the channel's
+history, however many chunk messages it holds. (A filesystem from
+before the anchor existed is recovered by scanning, as before; its
+first mount with this version posts an anchor.) If the key message is
+gone, recover with the export:
 
 ```sh
 telfs mount --key-header ~/telfs-main-key.txt ./mnt   # re-posts + pins it
@@ -307,8 +314,11 @@ and later renames are lost.
 
 ### Time travel: rolling back to a historical snapshot
 
-Snapshots are retained on the channel (last 12 by default, ~1h at 5
-min cadence). Older ones are auto-pruned.
+Snapshots are retained on the channel (last 12 by default; the one
+the anchor names is never pruned). A format-2 filesystem snapshots
+rarely (see `[snapshot]` under Configuration) — between snapshots the
+journal holds every change, so a restore point is a snapshot, not any
+moment. Format 1 snapshots every 5 minutes (~1 h of history).
 
 ```sh
 telfs snapshot list                 # MSG-ID | AGE | TS | JOURNAL-SEQ
@@ -319,7 +329,9 @@ telfs mount ~/External              # files now reflect that state
 ```
 
 Restore is destructive to the current DB; the pre-restore copy beside
-it lets you manually roll forward again.
+it lets you manually roll forward again. On format 2 the next mount
+takes a snapshot of the rolled-back state at once and pins its anchor,
+so a recovery from the channel brings back the rolled-back state.
 
 ## Encryption
 
@@ -491,8 +503,9 @@ telfs trash enable --ttl 7d      # rm safety-net (see below)
 
 `gc` finds **orphan chunks** (msg_ids not in `chunk_map` — left behind
 by overwrites/unlinks; see Design choices) and **stale snapshots**
-(any snapshot caption other than the current `meta_kv` recorded one).
-Default is dry-run.
+(beyond the retention window; never the current one nor the one the
+pinned anchor names). The anchor, the key message and any message gc
+does not recognize are never deleted. Default is dry-run.
 
 ### `telfs trash` — rm safety-net
 
@@ -551,7 +564,24 @@ title = "My TelFS"
 dir = "/srv/telfs-staging"    # default <profile>/cache/pending — persistent storage, not tmpfs
 max_bytes = "50GB"            # above this, writes wait for uploads (default 50 GB; "0" = no cap)
 min_free = "5GiB"             # never fill the staging filesystem below this (default 5 GiB)
+
+[snapshot]                    # format 2: when to take a whole-DB snapshot
+every_ops = 500000            # after this many journal ops since the last one (default 500000)
+every = "24h"                 # or after this long, if anything changed (default 24h; Go duration)
 ```
+
+**Snapshots (format 2).** The journal holds every change, including
+where each chunk lives, so the newest snapshot plus the journal after it
+is the whole filesystem; a snapshot only shortens a recovery's replay.
+The mount takes one when the journal has grown by `every_ops` since the
+last, or `every` has passed and something changed — at a quiet moment
+(nothing left to upload), waiting at most an hour for one. Nothing at
+mount when nothing changed, nothing when the upload queue drains,
+nothing at unmount. After each snapshot it pins a new **anchor** naming
+it (the previous anchor is deleted), so a recovery finds it without
+scanning the channel. The channel therefore carries two pinned
+messages: the key message and the anchor. At ~500,000 files a snapshot
+is roughly 55 MB.
 
 **Staging.** A write goes to the staging directory first and to the
 channel later, so `close()` returns at disk speed. Until a chunk is
@@ -579,12 +609,12 @@ Environment overrides:
 |---|---|---|
 | Language | Go (`hanwen/go-fuse` + `gotd/td` + `modernc.org/sqlite`) | Pure-Go SQLite — no cgo, fully-static binary. |
 | Telegram API | MTProto via `gotd/td`, user auth only | One data-plane path; 2 GB per upload. HTTP Bot API never used. |
-| Metadata | Local SQLite + periodic channel snapshots | Fast reads; recovery window = snapshot cadence. |
+| Metadata | Local SQLite + channel snapshots + a journal of every change | Fast reads; recovery = newest snapshot + the journal after it. |
 | Chunk size | 4 MiB default, per-FS configurable via `telfs init --chunk-size`; immutable after first chunk; power of two ∈ [64 KiB, 1.5 GiB] | Throughput vs `chunk_map` row count. |
 | POSIX surface | files, dirs, symlinks, hardlinks, xattrs (`user.*`) | Enough for typical workloads. |
 | Encryption | Format 2: always on — AES-256-GCM, Argon2id 2 GiB, HKDF subkeys, Padmé padding, encrypted captions/journal | Nothing on the channel but the key header, sizes and times. Format 1 (old): opt-in, journal in clear. |
 | Inline TG deletes | None for chunks; snapshot delete supersedes prior | Never destroys data inline; `gc` reclaims; trash layers on top. |
-| Snapshot / journal cadence | Snapshot every 5 min + clean unmount; journal poster every 5 s | Bounded recovery window without burning bandwidth. |
+| Snapshot / journal cadence | Format 2: snapshot per 500,000 journal ops or 24 h, found through a pinned anchor; format 1: every 5 min + clean unmount. Journal poster every 5 s | Bounded recovery window without re-uploading the whole DB all day. |
 
 ## Profiles + portable bundles
 

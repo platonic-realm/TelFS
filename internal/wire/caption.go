@@ -26,6 +26,7 @@ const (
 	KindPack     = "p"
 	KindSnapshot = "s"
 	KindJournal  = "j"
+	KindAnchor   = "a" // the pinned anchor naming the newest snapshot (anchor.go)
 )
 
 // Caption is the encrypted description every format-2 document carries.
@@ -54,7 +55,8 @@ type Caption struct {
 	IO int64 `json:"io,omitempty"`
 	IL int64 `json:"il,omitempty"`
 
-	// Snapshot (K = "s") and journal batch (K = "j").
+	// Snapshot (K = "s"), journal batch (K = "j") and anchor (K = "a":
+	// Seq = its snapshot's seq).
 	Seq   int64 `json:"seq,omitempty"`
 	TS    int64 `json:"ts,omitempty"`
 	DBSz  int64 `json:"dbsz,omitempty"`

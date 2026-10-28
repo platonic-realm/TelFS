@@ -21,8 +21,10 @@ import (
 // key. A format-2 message is recognized only by decrypting its caption.
 
 // ScanPages bounds history scans (newest first, 100 messages a page):
-// 200 pages = 20,000 messages, as format-1 recovery. P2 replaces the
-// scan for snapshots; the key message is found through the pin.
+// 200 pages = 20,000 messages, as format-1 recovery. Since v1 the
+// snapshot is found through the pinned anchor and the key message
+// through the pinned list; the scans remain for filesystems from before
+// v1 (no anchor yet).
 const ScanPages = 200
 
 // KeyFound is a key message located on the channel.
@@ -33,24 +35,47 @@ type KeyFound struct {
 	Pinned bool
 }
 
-// FindKeyMessages returns the channel's key messages: the pinned one
-// first (if it is a key message), then any others found newest-first in
-// the last ScanPages pages.
-func FindKeyMessages(ctx context.Context, sess *tg.Session) ([]KeyFound, error) {
+// PinnedKeyMessages returns the key messages among the pinned messages,
+// newest first.
+func PinnedKeyMessages(pins []tg.ChannelMessage) []KeyFound {
 	var out []KeyFound
-	pinned, err := sess.PinnedMessageID(ctx)
+	for _, p := range pins {
+		if p.HasDoc || !wire.IsKeyMessage(p.RawCaption) {
+			continue
+		}
+		if h, js, err := wire.ParseKeyMessage(p.RawCaption); err == nil {
+			out = append(out, KeyFound{MsgID: p.ID, Header: h, JSON: js, Pinned: true})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].MsgID > out[j].MsgID })
+	return out
+}
+
+// FindKeyMessages returns the channel's key messages: the pinned ones
+// first (newest first), then any others found newest-first in the last
+// ScanPages pages. The scan is skipped when a key message AND an anchor
+// are pinned (a filesystem since v1): finding the filesystem must not
+// depend on scanning history.
+func FindKeyMessages(ctx context.Context, ch Channel) ([]KeyFound, error) {
+	pins, err := ch.PinnedMessages(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if pinned > 0 {
-		if text, terr := sess.GetMessageText(ctx, pinned); terr == nil && wire.IsKeyMessage(text) {
-			if h, js, perr := wire.ParseKeyMessage(text); perr == nil {
-				out = append(out, KeyFound{MsgID: pinned, Header: h, JSON: js, Pinned: true})
-			}
-		}
+	return FindKeyMessagesIn(ctx, ch, pins)
+}
+
+// FindKeyMessagesIn is FindKeyMessages with the pinned list already read.
+func FindKeyMessagesIn(ctx context.Context, ch Channel, pins []tg.ChannelMessage) ([]KeyFound, error) {
+	out := PinnedKeyMessages(pins)
+	if len(out) > 0 && hasPinnedDocCaption(pins) {
+		return out, nil
 	}
-	err = sess.WalkChannelMessages(ctx, ScanPages, func(cm tg.ChannelMessage) error {
-		if cm.HasDoc || cm.ID == pinned || !wire.IsKeyMessage(cm.RawCaption) {
+	pinned := map[int]bool{}
+	for _, k := range out {
+		pinned[k.MsgID] = true
+	}
+	err := ch.WalkChannelMessages(ctx, ScanPages, func(cm tg.ChannelMessage) error {
+		if cm.HasDoc || pinned[cm.ID] || !wire.IsKeyMessage(cm.RawCaption) {
 			return nil
 		}
 		if h, js, perr := wire.ParseKeyMessage(cm.RawCaption); perr == nil {
@@ -76,12 +101,12 @@ func UnlockAny(found []KeyFound, secret []byte) (KeyFound, []byte, string, error
 }
 
 // PostKeyMessage posts the key message and pins it.
-func PostKeyMessage(ctx context.Context, sess *tg.Session, h wire.KeyHeader) (int, error) {
-	id, err := sess.PostMessage(ctx, h.Message())
+func PostKeyMessage(ctx context.Context, ch Channel, h wire.KeyHeader) (int, error) {
+	id, err := ch.PostMessage(ctx, h.Message())
 	if err != nil {
 		return 0, fmt.Errorf("post key message: %w", err)
 	}
-	if err := sess.PinMessage(ctx, id); err != nil {
+	if err := ch.PinMessage(ctx, id); err != nil {
 		return id, fmt.Errorf("pin key message: %w", err)
 	}
 	return id, nil
@@ -94,10 +119,10 @@ type Found2 struct {
 }
 
 // FindLatestSnapshot2 scans newest-first for the newest snapshot of the
-// filesystem the keys belong to.
-func FindLatestSnapshot2(ctx context.Context, sess *tg.Session, keys *wire.Keys) (*Found2, error) {
+// filesystem the keys belong to (filesystems without an anchor).
+func FindLatestSnapshot2(ctx context.Context, ch Channel, keys *wire.Keys) (*Found2, error) {
 	var found *Found2
-	err := sess.WalkChannelMessages(ctx, ScanPages, func(cm tg.ChannelMessage) error {
+	err := ch.WalkChannelMessages(ctx, ScanPages, func(cm tg.ChannelMessage) error {
 		if !cm.HasDoc || !wire.LooksLikeCaption(cm.RawCaption) {
 			return nil
 		}
@@ -112,9 +137,9 @@ func FindLatestSnapshot2(ctx context.Context, sess *tg.Session, keys *wire.Keys)
 }
 
 // DownloadSnapshot2 fetches and decrypts a snapshot body (gzipped DB).
-func DownloadSnapshot2(ctx context.Context, sess *tg.Session, keys *wire.Keys, msgID int) ([]byte, error) {
+func DownloadSnapshot2(ctx context.Context, ch Channel, keys *wire.Keys, msgID int) ([]byte, error) {
 	var buf bytes.Buffer
-	if _, err := sess.DownloadDocument(ctx, msgID, &buf); err != nil {
+	if _, err := ch.DownloadDocument(ctx, msgID, &buf); err != nil {
 		return nil, fmt.Errorf("download snapshot %d: %w", msgID, err)
 	}
 	return keys.OpenMeta("snap", buf.Bytes())
@@ -129,12 +154,13 @@ type journalBody2 struct {
 // Like the format-1 scan it must reach the sinceSeq boundary (or the
 // start of the channel): a missing prefix would replay later ops onto
 // the wrong state, so a scan cut short is an error, never a silent
-// truncation.
-func ListJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, sinceSeq int64) ([]tg.JournalBatchEntry, error) {
+// truncation. Filesystems without an anchor; ListJournal2After is the
+// anchor's way.
+func ListJournal2(ctx context.Context, ch Channel, keys *wire.Keys, sinceSeq int64) ([]tg.JournalBatchEntry, error) {
 	var out []tg.JournalBatchEntry
 	boundary := false
 	const pages = 2000 // runaway guard (200k messages), as format 1
-	exhausted, err := sess.WalkChannelMessagesExhaust(ctx, pages, func(cm tg.ChannelMessage) error {
+	exhausted, err := ch.WalkChannelMessagesExhaust(ctx, pages, func(cm tg.ChannelMessage) error {
 		if !cm.HasDoc || !wire.LooksLikeCaption(cm.RawCaption) {
 			return nil
 		}
@@ -146,7 +172,7 @@ func ListJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, sinceS
 			boundary = true
 			return tg.ErrStopWalk
 		}
-		ops, err := DownloadJournal2(ctx, sess, keys, cm.ID)
+		ops, err := DownloadJournal2(ctx, ch, keys, cm.ID)
 		if err != nil {
 			return err
 		}
@@ -167,8 +193,13 @@ func ListJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, sinceS
 	if !boundary && !exhausted {
 		return nil, fmt.Errorf("journal scan hit its %d-page cap before reaching seq %d — refusing a truncated replay set", pages, sinceSeq+1)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
-	// Dedupe (a batch can be re-posted after a lost ack).
+	return sortDedupe(out), nil
+}
+
+// sortDedupe sorts ops by seq and drops repeats (a batch can be
+// re-posted after a lost ack).
+func sortDedupe(out []tg.JournalBatchEntry) []tg.JournalBatchEntry {
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
 	dedup := out[:0]
 	var last int64 = -1
 	for _, e := range out {
@@ -177,13 +208,53 @@ func ListJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, sinceS
 			last = e.Seq
 		}
 	}
-	return dedup, nil
+	return dedup
+}
+
+// ListJournal2After returns every journal op with seq > sinceSeq from the
+// batches posted after message afterMsgID (an anchor's jnl_after),
+// ascending. It reads only the history after that message, never the
+// whole channel. The ops must continue the snapshot without a hole: a
+// missing batch would replay later ops onto the wrong state.
+func ListJournal2After(ctx context.Context, ch Channel, keys *wire.Keys, sinceSeq int64, afterMsgID int) ([]tg.JournalBatchEntry, error) {
+	var out []tg.JournalBatchEntry
+	err := ch.WalkChannelMessagesAfter(ctx, afterMsgID, func(cm tg.ChannelMessage) error {
+		if !cm.HasDoc || !wire.LooksLikeCaption(cm.RawCaption) {
+			return nil
+		}
+		c, err := keys.OpenCaption(cm.RawCaption)
+		if err != nil || c.K != wire.KindJournal || c.Last <= sinceSeq {
+			return nil
+		}
+		ops, err := DownloadJournal2(ctx, ch, keys, cm.ID)
+		if err != nil {
+			return err
+		}
+		for _, e := range ops {
+			if e.Seq > sinceSeq {
+				out = append(out, e)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out = sortDedupe(out)
+	next := sinceSeq + 1
+	for _, e := range out {
+		if e.Seq != next {
+			return nil, fmt.Errorf("the journal after the snapshot (seq %d) has a hole: seq %d is missing (next found: %d) — refusing a replay with a gap; `telfs recover --from-captions` rebuilds without it", sinceSeq, next, e.Seq)
+		}
+		next++
+	}
+	return out, nil
 }
 
 // DownloadJournal2 fetches and decrypts one journal batch.
-func DownloadJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, msgID int) ([]tg.JournalBatchEntry, error) {
+func DownloadJournal2(ctx context.Context, ch Channel, keys *wire.Keys, msgID int) ([]tg.JournalBatchEntry, error) {
 	var buf bytes.Buffer
-	if _, err := sess.DownloadDocument(ctx, msgID, &buf); err != nil {
+	if _, err := ch.DownloadDocument(ctx, msgID, &buf); err != nil {
 		return nil, fmt.Errorf("download journal batch %d: %w", msgID, err)
 	}
 	sealed, err := keys.OpenMeta("journal", buf.Bytes())
@@ -202,7 +273,7 @@ func DownloadJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, ms
 }
 
 // UploadJournal2 posts one encrypted journal batch.
-func UploadJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, ops []tg.JournalBatchEntry) (int, error) {
+func UploadJournal2(ctx context.Context, ch Channel, keys *wire.Keys, ops []tg.JournalBatchEntry) (int, error) {
 	if len(ops) == 0 {
 		return 0, errors.New("empty journal batch")
 	}
@@ -223,7 +294,7 @@ func UploadJournal2(ctx context.Context, sess *tg.Session, keys *wire.Keys, ops 
 	if err != nil {
 		return 0, err
 	}
-	return sess.UploadDocument(ctx, bytes.NewReader(body), wire.DocName, capt)
+	return ch.UploadDocument(ctx, bytes.NewReader(body), wire.DocName, capt)
 }
 
 // KVSnapMsgIDs lists (comma-separated, oldest first) the format-2
@@ -263,50 +334,4 @@ func RecordSnapID(ctx context.Context, m *meta.Store, id int) error {
 		}
 	}
 	return storeSnapIDs(ctx, m, append(ids, id))
-}
-
-// once2 is Once's format-2 upload + retention.
-func (m *Manager) once2(ctx context.Context, snap *Snapshot) (int, error) {
-	body, err := m.Keys.SealMeta("snap", snap.Bytes)
-	if err != nil {
-		return 0, err
-	}
-	capt, err := m.Keys.SealCaption(wire.Caption{K: wire.KindSnapshot, Seq: snap.JournalSeq,
-		TS: time.Now().Unix(), DBSz: int64(len(snap.Bytes))})
-	if err != nil {
-		return 0, err
-	}
-	id, err := m.Session.UploadDocument(ctx, bytes.NewReader(body), wire.DocName, capt)
-	if err != nil {
-		return 0, fmt.Errorf("upload: %w", err)
-	}
-	return id, nil
-}
-
-// pruneRetention2 keeps the newest Retention snapshots from the local
-// list and deletes the rest.
-func (m *Manager) pruneRetention2(ctx context.Context, justUploaded int) error {
-	ids := loadSnapIDs(ctx, m.Meta)
-	found := false
-	for _, x := range ids {
-		if x == justUploaded {
-			found = true
-		}
-	}
-	if !found {
-		ids = append(ids, justUploaded)
-	}
-	keep := m.retention()
-	var del []int
-	if len(ids) > keep {
-		del = append(del, ids[:len(ids)-keep]...)
-		ids = ids[len(ids)-keep:]
-	}
-	if err := storeSnapIDs(ctx, m.Meta, ids); err != nil {
-		return err
-	}
-	if len(del) == 0 {
-		return nil
-	}
-	return m.Session.DeleteChannelMessages(ctx, del...)
 }

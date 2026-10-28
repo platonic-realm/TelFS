@@ -8,9 +8,9 @@ import (
 	"github.com/gotd/td/tg"
 )
 
-// PinnedMessageID returns the id of the channel's pinned message (0 when
-// nothing is pinned). Format 2 keeps its key message pinned so a cold
-// recovery finds it with one request (spec P1 §4.2).
+// PinnedMessageID returns the id of the channel's NEWEST pinned message
+// (0 when nothing is pinned). A format-2 channel has two pins since v1
+// (key message + snapshot anchor): use PinnedMessages to see them all.
 func (s *Session) PinnedMessageID(ctx context.Context) (int, error) {
 	_, inCh, err := s.channelPeer()
 	if err != nil {

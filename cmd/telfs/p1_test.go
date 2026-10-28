@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -111,19 +110,6 @@ func TestSeedUsesFromRebuild(t *testing.T) {
 	loadUses(ctx, m, &c)
 	if c.Chunk.Load() != 765 || c.Meta.Load() != 14 || c.Caption.Load() != 32 {
 		t.Fatalf("chunk %d meta %d caption %d; want 765 14 32", c.Chunk.Load(), c.Meta.Load(), c.Caption.Load())
-	}
-}
-
-// The TEST-ONLY --snapshot-interval stays out of `telfs mount --help`.
-func TestPrintDefaultsExceptHidesFlag(t *testing.T) {
-	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
-	fs.Bool("readonly", false, "mount read-only")
-	fs.Duration("snapshot-interval", 0, "TEST-ONLY")
-	var b strings.Builder
-	fs.SetOutput(&b)
-	printDefaultsExcept(fs, "snapshot-interval")
-	if out := b.String(); strings.Contains(out, "snapshot-interval") || !strings.Contains(out, "-readonly") {
-		t.Fatalf("help output:\n%s", out)
 	}
 }
 

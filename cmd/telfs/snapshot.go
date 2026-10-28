@@ -93,10 +93,12 @@ func cmdSnapshot(ctx context.Context, args []string) error {
 func snapshotUsage() error {
 	fmt.Print(`telfs snapshot — inspect and roll back to historical snapshots
 
-The mount daemon posts a snapshot of the local SQLite metadata to the
-backing channel every 5 minutes (configurable). The last 12 snapshots
-are retained on the channel by default — about an hour of recoverable
-state. Older ones are auto-deleted as new ones land.
+The mount daemon posts snapshots of the local SQLite metadata to the
+backing channel: format 2 when 500,000 journal ops or 24 hours (with
+changes) have passed since the last ([snapshot] in config.toml) — the
+journal in between holds every change; format 1 every 5 minutes. The
+last 12 snapshots are retained on the channel; older ones are deleted
+as new ones land.
 
 Usage:
   telfs snapshot list             Show the snapshots currently on the
@@ -236,10 +238,13 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 	// Format 2: a snapshot from before a secret change carries the OLD
 	// key header; keep the CURRENT one so the restored DB still opens
 	// with today's secret.
-	var currentHeader []byte
+	var currentHeader, currentAnchor []byte
+	var currentSeq int64
 	if keys != nil {
 		if m, merr := meta.Open(cfg.DBPath()); merr == nil {
 			_, currentHeader, _ = keyHeaderOf(ctx, m)
+			currentAnchor, _ = m.GetKV(ctx, snapshot.KVAnchorMsgID)
+			currentSeq, _ = m.LastJournalSeq(ctx)
 			m.Close()
 		}
 	}
@@ -282,6 +287,18 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 			if m, merr := meta.Open(cfg.DBPath()); merr == nil {
 				_ = m.PutKV(ctx, meta.KVKeyHeader, currentHeader)
 				_ = snapshot.RecordSnapID(ctx, m, msgID)
+				// Format 2 snapshots rarely: the channel's anchor still
+				// names the newest snapshot, not this rolled-back state.
+				// The next mount takes a snapshot at once, and its anchor
+				// replaces the current one.
+				// The rolled-back journal continues after every seq the
+				// abandoned one reached, so the two never share a number
+				// on the channel.
+				_ = m.AdvanceJournalSeq(ctx, currentSeq)
+				_ = m.PutKV(ctx, snapshot.KVSnapDue, []byte(fmt.Sprintf("restored from snapshot %d", msgID)))
+				if len(currentAnchor) > 0 {
+					_ = m.PutKV(ctx, snapshot.KVAnchorMsgID, currentAnchor)
+				}
 				m.Close()
 			}
 		}

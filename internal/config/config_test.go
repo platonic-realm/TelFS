@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateProfileNameRejectsPathTraversal(t *testing.T) {
@@ -252,5 +253,40 @@ func TestLegacySessionAndRemove(t *testing.T) {
 	}
 	if c.HasSession() {
 		t.Fatal("RemoveSessionFiles must remove both")
+	}
+}
+
+// [snapshot] every_ops / every: defaults when unset, read from
+// config.toml, bad values refused; a config without the table saves
+// without one.
+func TestSnapshotPolicyConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{DataDir: dir, APIID: 1, APIHash: "h"}
+	ops, every, err := cfg.SnapshotPolicy()
+	if err != nil || ops != 500_000 || every != 24*time.Hour {
+		t.Fatalf("defaults: %d %s %v", ops, every, err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(cfg.ConfigPath()); strings.Contains(string(b), "[snapshot]") {
+		t.Fatalf("an unset [snapshot] must not be written:\n%s", b)
+	}
+	toml := "api_id = 7\napi_hash = \"h\"\n\n[snapshot]\nevery_ops = 200000\nevery = \"6h\"\n"
+	if err := os.WriteFile(filepath.Join(dir, ConfigFile), []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ops, every, err = got.SnapshotPolicy(); err != nil || ops != 200_000 || every != 6*time.Hour {
+		t.Fatalf("configured: %d %s %v", ops, every, err)
+	}
+	for _, bad := range []SnapshotConfig{{EveryOps: -1}, {Every: "1d"}, {Every: "0s"}, {Every: "-1h"}} {
+		c := &Config{Snapshot: bad}
+		if _, _, err := c.SnapshotPolicy(); err == nil || !strings.Contains(err.Error(), "[snapshot]") {
+			t.Errorf("%+v: %v, want an error naming [snapshot]", bad, err)
+		}
 	}
 }

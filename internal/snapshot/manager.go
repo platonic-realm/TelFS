@@ -32,7 +32,7 @@ const KVCurrentJournalSeq = "snap_journal_seq"
 // KVLastSnapUnix is when the newest snapshot was taken (unix seconds).
 const KVLastSnapUnix = "snap_last_unix"
 
-// DefaultInterval is how often the cadence goroutine snapshots.
+// DefaultInterval is how often the format-1 cadence goroutine snapshots.
 const DefaultInterval = 5 * time.Minute
 
 // DefaultRetention is how many recent snapshots to keep on the
@@ -43,14 +43,28 @@ const DefaultInterval = 5 * time.Minute
 // of KB to a few MB depending on FS size).
 const DefaultRetention = 12
 
-// Manager runs periodic snapshots for the lifetime of a mounted FUSE
-// daemon. One snapshot is taken on entry (so a freshly-recovered DB
-// gets re-uploaded promptly), then every DefaultInterval, then one
-// final snapshot when ctx is canceled (clean unmount).
+// Manager runs snapshots for the lifetime of a mounted FUSE daemon.
+//
+// Format 1: one snapshot on entry (so a freshly-recovered DB gets
+// re-uploaded promptly), then every Interval (and soon after the upload
+// queue drains), plus the final snapshot the caller takes at unmount.
+//
+// Format 2 (Keys set): the snapshot Policy (policy.go) — rare whole-DB
+// snapshots, each followed by a pinned anchor naming it; none at mount
+// when nothing changed, none on drain, none at unmount.
 type Manager struct {
-	Meta     *meta.Store
-	Session  *tg.Session
+	Meta    *meta.Store
+	Session *tg.Session
+	// Channel is what the format-2 code talks to (nil: Session). Tests
+	// set a fake.
+	Channel Channel
+	// Interval is the format-1 cadence (0 = DefaultInterval).
 	Interval time.Duration
+	// Policy is the format-2 snapshot policy (zero = the defaults).
+	Policy Policy
+	// Tick is how often the format-2 loop evaluates Policy (0 =
+	// DefaultPolicyTick).
+	Tick time.Duration
 	// Retention is how many recent snapshots to keep on the channel
 	// after each successful upload. <=0 falls back to DefaultRetention.
 	// Older snapshots are deleted at the end of Once().
@@ -70,17 +84,17 @@ type Manager struct {
 
 	// QuiesceCheck, when non-nil, reports whether the upload queue is
 	// fully drained (no packer buffer, no staged wires, no in-flight
-	// uploads, no unposted journal ops). Run's loop uses it to take an
-	// EARLY snapshot shortly after the FS quiesces dirty, instead of
-	// making the operator wait out the full cadence interval to reach
-	// the "channel holds everything" state the web sync indicator
-	// reports.
+	// uploads, no unposted journal ops). Format 1: Run's loop uses it to
+	// take an EARLY snapshot shortly after the FS quiesces dirty,
+	// instead of making the operator wait out the full cadence interval
+	// to reach the "channel holds everything" state the web sync
+	// indicator reports. Format 2: the quiet moment a due snapshot
+	// prefers (never waiting more than Policy.MaxQuietWait).
 	QuiesceCheck func(ctx context.Context) bool
-	// QuiesceMinGap is the least time between two snapshot attempts
-	// for the drain-triggered early snapshot (0 = 30 s). Only the
-	// TEST-ONLY `telfs mount --snapshot-interval` raises it (P1 scale
-	// test; to be removed or replaced by the P2 snapshot design).
-	QuiesceMinGap time.Duration
+
+	// dueSince is when the format-2 policy first asked for a snapshot
+	// at a quiet moment (zero: none pending). Run's goroutine only.
+	dueSince time.Time
 
 	// mu guards the change-detection baseline below. Once (cadence
 	// goroutine) writes it; Synced (metrics HTTP goroutines) reads it.
@@ -119,7 +133,15 @@ func (m *Manager) setBaseline(counter int64) {
 // False before this process has posted its first snapshot: a baseline
 // it never recorded is a baseline it can't vouch for. Cheap (one KV
 // read + one MAX(seq) + one atomic), fine on a 2 s poll.
+//
+// Format 2: always true. Its journal carries every change, chunk
+// placements included, so no snapshot is needed for the channel to be
+// complete — the caller's queue check (uploads + unposted journal) is
+// the whole condition.
 func (m *Manager) Synced(ctx context.Context) bool {
+	if m.Keys != nil {
+		return true
+	}
 	lastCounter, have := m.baseline()
 	if !have || m.Meta.WriteCounter() != lastCounter {
 		return false
@@ -135,12 +157,16 @@ func (m *Manager) Synced(ctx context.Context) bool {
 	return currentSeq == prevSeq
 }
 
-// Run executes the periodic snapshot loop until ctx is canceled. It
-// does NOT take a final snapshot on shutdown — by the time ctx is
-// canceled, the underlying gotd session is being torn down and uploads
-// fail with "engine closed". Callers should drive the final snapshot
-// synchronously via Once before signaling shutdown to gotd.
+// Run executes the snapshot loop until ctx is canceled. It does NOT take
+// a final snapshot on shutdown — by the time ctx is canceled, the
+// underlying gotd session is being torn down and uploads fail with
+// "engine closed". Format-1 callers drive the final snapshot
+// synchronously via Once before signaling shutdown to gotd; format 2
+// takes none (its posted journal suffices).
 func (m *Manager) Run(ctx context.Context) error {
+	if m.Keys != nil {
+		return m.run2(ctx)
+	}
 	if m.Interval <= 0 {
 		m.Interval = DefaultInterval
 	}
@@ -167,10 +193,7 @@ func (m *Manager) Run(ctx context.Context) error {
 	if tick < 5*time.Second {
 		tick = 5 * time.Second
 	}
-	quiesceMinGap := 30 * time.Second
-	if m.QuiesceMinGap > quiesceMinGap {
-		quiesceMinGap = m.QuiesceMinGap
-	}
+	const quiesceMinGap = 30 * time.Second
 	lastAttempt := time.Now()
 	t := time.NewTicker(tick)
 	defer t.Stop()
@@ -219,7 +242,14 @@ func channelLostHint(err error) string {
 // shutdown. The first Once() of a process never skips, so a chunk
 // that landed just before a crash is captured by the next mount's
 // initial snapshot.
+//
+// Format 2 (Keys set): always takes a snapshot (callers ask for one:
+// `telfs init`, a secret change) and posts the anchor naming it.
 func (m *Manager) Once(ctx context.Context) error {
+	if m.Keys != nil {
+		_, err := m.once2(ctx)
+		return err
+	}
 	currentSeq, err := m.Meta.LastJournalSeq(ctx)
 	if err != nil {
 		return fmt.Errorf("read last journal seq: %w", err)
@@ -243,32 +273,25 @@ func (m *Manager) Once(ctx context.Context) error {
 		return fmt.Errorf("take: %w", err)
 	}
 
-	var newID int
-	if m.Keys != nil {
-		if newID, err = m.once2(ctx, snap); err != nil {
-			return err
+	// If the FS is encrypted, wrap the gzipped blob in an envelope
+	// that bundles the KDF state so recovery can decrypt with just
+	// the user's passphrase. Plaintext filesystems upload the
+	// gzipped DB directly (still compatible with M5-vintage clients).
+	body := snap.Bytes
+	if m.shouldEncrypt() {
+		opts, kerr := loadWrapOpts(ctx, m.Meta)
+		if kerr != nil {
+			return fmt.Errorf("snapshot encryption: %w", kerr)
 		}
-	} else {
-		// If the FS is encrypted, wrap the gzipped blob in an envelope
-		// that bundles the KDF state so recovery can decrypt with just
-		// the user's passphrase. Plaintext filesystems upload the
-		// gzipped DB directly (still compatible with M5-vintage clients).
-		body := snap.Bytes
-		if m.shouldEncrypt() {
-			opts, kerr := loadWrapOpts(ctx, m.Meta)
-			if kerr != nil {
-				return fmt.Errorf("snapshot encryption: %w", kerr)
-			}
-			wrapped, werr := Wrap(m.Cipher, opts, snap.Bytes)
-			if werr != nil {
-				return fmt.Errorf("wrap snapshot: %w", werr)
-			}
-			body = wrapped
+		wrapped, werr := Wrap(m.Cipher, opts, snap.Bytes)
+		if werr != nil {
+			return fmt.Errorf("wrap snapshot: %w", werr)
 		}
-		newID, err = m.Session.UploadSnapshot(ctx, body, snap.JournalSeq, time.Now().Unix(), snap.FSUUID)
-		if err != nil {
-			return fmt.Errorf("upload: %w", err)
-		}
+		body = wrapped
+	}
+	newID, err := m.Session.UploadSnapshot(ctx, body, snap.JournalSeq, time.Now().Unix(), snap.FSUUID)
+	if err != nil {
+		return fmt.Errorf("upload: %w", err)
 	}
 	if err := storeCurrentMsgID(ctx, m.Meta, newID); err != nil {
 		return fmt.Errorf("persist new snap msg_id: %w", err)
@@ -278,35 +301,10 @@ func (m *Manager) Once(ctx context.Context) error {
 	}
 	// When it was taken (`telfs status --json`: snapshot.last_unix).
 	_ = m.Meta.PutKV(ctx, KVLastSnapUnix, []byte(strconv.FormatInt(time.Now().Unix(), 10)))
-	// Local journal pruning: rows with seq <= this snapshot's seq that
-	// have ALSO been posted to the channel are superseded — their
-	// effects are inside the snapshot we just uploaded, and channel-
-	// side replay only ever asks for seq > snapshot seq. Without this
-	// the journal table grows forever and is re-VACUUMed, re-gzipped
-	// and re-uploaded inside every snapshot (this was the dominant
-	// driver of snapshot bloat). Unposted rows stay: an older retained
-	// snapshot restored later replays from the CHANNEL's journal
-	// messages, so those must reach the channel before deletion.
-	if pruned, err := m.Meta.DeleteJournalUpTo(ctx, snap.JournalSeq); err != nil {
-		if m.Logger != nil {
-			m.Logger.Printf("[snapshot] journal prune: %v", err)
-		}
-	} else if pruned > 0 && m.Logger != nil {
-		m.Logger.Printf("[snapshot] pruned %d superseded journal rows", pruned)
-	}
-	// Format 2: record the id and prune by the local list (a bookkeeping
-	// write, so it happens BEFORE the baseline below).
-	if m.Keys != nil {
-		if err := m.pruneRetention2(ctx, newID); err != nil && m.Logger != nil {
-			m.Logger.Printf("[snapshot] retention prune: %v", err)
-		}
-	}
+	m.pruneLocalJournal(ctx, snap.JournalSeq)
 	// Record the change-detection baseline AFTER our own bookkeeping
 	// writes so they don't count as "new changes" next cycle.
 	m.setBaseline(m.Meta.WriteCounter())
-	if m.Keys != nil {
-		return nil
-	}
 	// Retention pruning: list every snapshot for this fs_uuid, keep the
 	// `retention` newest, delete the rest. Best-effort — if delete
 	// fails the orphan stays on the channel but the FS keeps working;
@@ -315,6 +313,25 @@ func (m *Manager) Once(ctx context.Context) error {
 		m.Logger.Printf("[snapshot] retention prune: %v", err)
 	}
 	return nil
+}
+
+// pruneLocalJournal: rows with seq <= this snapshot's seq that have
+// ALSO been posted to the channel are superseded — their effects are
+// inside the snapshot we just uploaded, and channel-side replay only
+// ever asks for seq > snapshot seq. Without this the journal table
+// grows forever and is re-VACUUMed, re-gzipped and re-uploaded inside
+// every snapshot (this was the dominant driver of snapshot bloat).
+// Unposted rows stay: an older retained snapshot restored later replays
+// from the CHANNEL's journal messages, so those must reach the channel
+// before deletion.
+func (m *Manager) pruneLocalJournal(ctx context.Context, seq int64) {
+	if pruned, err := m.Meta.DeleteJournalUpTo(ctx, seq); err != nil {
+		if m.Logger != nil {
+			m.Logger.Printf("[snapshot] journal prune: %v", err)
+		}
+	} else if pruned > 0 && m.Logger != nil {
+		m.Logger.Printf("[snapshot] pruned %d superseded journal rows", pruned)
+	}
 }
 
 // retention returns the effective snapshot retention count.

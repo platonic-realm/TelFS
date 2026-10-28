@@ -222,6 +222,15 @@ func statusFormat2(ctx context.Context, cfg *config.Config, m *meta.Store) {
 	} else {
 		fmt.Println("  (none recorded yet)")
 	}
+	if a, err := m.GetKV(ctx, snapshot.KVAnchorMsgID); err == nil {
+		named, _ := m.GetKV(ctx, snapshot.KVAnchorSnapID)
+		fmt.Printf("  pinned anchor:  msg %s (names snapshot %s)\n", strings.TrimSpace(string(a)), strings.TrimSpace(string(named)))
+	} else {
+		fmt.Println("  pinned anchor:  none yet (the next mount posts one)")
+	}
+	if st, err := snapshot.LoadPolicyState(ctx, m); err == nil && st.HaveSnap {
+		fmt.Printf("  journal ops since: %d\n", st.CurrentSeq-st.SnapSeq)
+	}
 }
 
 // authSummary renders the profile's identity line: who session.json

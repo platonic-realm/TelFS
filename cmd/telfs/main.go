@@ -24,7 +24,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -553,8 +552,9 @@ func humanBytes(n int64) string {
 // Works regardless of who started the daemon (CLI foreground, web
 // supervisor, or a process orphaned by a dead session): the daemon is
 // located via /proc, SIGTERMed so its orderly shutdown (upload drain +
-// final snapshot) runs, and the kernel mount is verified gone
-// afterward — escalating to SIGKILL + lazy unmount only if it wedges.
+// final journal post; format 1: final snapshot) runs, and the kernel
+// mount is verified gone afterward — escalating to SIGKILL + lazy
+// unmount only if it wedges.
 func cmdUnmount(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("unmount", flag.ContinueOnError)
 	timeout := fs.Duration("timeout", 2*time.Minute, "how long to wait for the daemon to finish its orderly shutdown and exit")
@@ -638,14 +638,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	blobPrefetch := fs.String("blob-prefetch", "", "packed-blob locality prefetch span (e.g. 4MiB): a cold read of one packed small file warms its blob neighbors in one ranged download. Empty = default 4 MiB; 0 disables.")
 	serviceFlag := fs.Bool("service", false, "run as a systemd service (Type=notify): never prompt (the secret comes from a file or systemd credentials), wait and retry while the network or Telegram is unreachable at boot, report READY/STATUS/STOPPING to systemd")
 	keyHeader := fs.String("key-header", "", "recover a format-2 filesystem with this key header export (telfs key export) instead of the channel's pinned key message; only used when the local DB is missing")
-	// TEST-ONLY (P1 scale test, Arash 2026-10-26): hidden from the help,
-	// warns on every use, to be removed or replaced by the P2 snapshot
-	// design. Holds periodic AND drain-triggered snapshots to one per D;
-	// the snapshots at mount and at unmount are unchanged.
-	snapInterval := fs.Duration("snapshot-interval", 0, "TEST-ONLY")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] [--cache-cap SIZE] <mountpoint>")
-		printDefaultsExcept(fs, "snapshot-interval")
+		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -680,19 +675,17 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}
 	}
 	checkFusermount()
-	if *snapInterval < 0 {
-		return errors.New("--snapshot-interval must be positive")
-	}
-	if *snapInterval > 0 {
-		fmt.Fprintf(os.Stderr, "WARNING: --snapshot-interval is a TEST-ONLY flag (P1 scale test) and will be removed or replaced by the P2 snapshot design.\n"+
-			"WARNING: periodic and drain-triggered snapshots are held back to one per %s; the channel copy lags further behind the local DB (journal batches still go out every 5 s).\n", *snapInterval)
-	}
 
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 	if err := cfg.RequireChannel(); err != nil {
+		return err
+	}
+	// [snapshot] (format 2): checked before anything slow happens.
+	snapEveryOps, snapEvery, err := cfg.SnapshotPolicy()
+	if err != nil {
 		return err
 	}
 
@@ -865,10 +858,10 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	}
 
 	// The gotd session must stay alive past signalCtx cancellation so
-	// the final snapshot can post. We give RunSession its own
-	// Background-derived context and let our callback drive shutdown
-	// in the correct order (final snapshot → unmount FUSE → return →
-	// gotd shuts down).
+	// the final journal post (format 1: the final snapshot) can go out.
+	// We give RunSession its own Background-derived context and let our
+	// callback drive shutdown in the correct order (unmount FUSE → drain
+	// → final post → return → gotd shuts down).
 	// Resolve the cipher up front: plaintext (NoopCipher) unless this
 	// FS was set up with `telfs encrypt init` (crypto_mode set in
 	// meta_kv). For the encrypted case we prompt for the passphrase
@@ -1179,10 +1172,8 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// Created here (started further down) so the /telegram handler
 		// can report snapshot-coverage state from day one of the
 		// process; the sync indicator keys off it.
-		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher, Keys: pipe.keys, QuiesceCheck: queueDrained}
-		if *snapInterval > 0 { // TEST-ONLY, see the flag
-			snapMgr.Interval, snapMgr.QuiesceMinGap = *snapInterval, *snapInterval
-		}
+		snapMgr := &snapshot.Manager{Meta: metaStore, Session: sess, Cipher: cipher, Keys: pipe.keys, QuiesceCheck: queueDrained,
+			Policy: snapshot.Policy{EveryOps: snapEveryOps, Every: snapEvery}}
 
 		// Metrics endpoint (opt-in). Gauges are registered AFTER the
 		// pool & cache exist so they read the live values, not the
@@ -1256,10 +1247,12 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			return err
 		}
 
-		// Snapshot cadence: takes one snapshot immediately (so a
-		// freshly-recovered DB is re-baselined) then every interval.
-		// We pass signalCtx — the goroutine exits when the gotd session
-		// tears down. The user-stop signal stops it via snapCtx below.
+		// Snapshots. Format 1: one immediately (so a freshly-recovered
+		// DB is re-baselined), then every interval. Format 2: the policy
+		// (rare whole-DB snapshots + the pinned anchor; nothing at mount
+		// when nothing changed). We pass signalCtx — the goroutine exits
+		// when the gotd session tears down. The user-stop signal stops
+		// it via snapCtx below.
 		snapCtx, stopSnap := context.WithCancel(signalCtx)
 		snapDone := make(chan struct{})
 		go func() {
@@ -1515,7 +1508,8 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			//      via async close. Until this returns, freshly-
 			//      closed files may have inode.size persisted but
 			//      no chunk_map row.
-			// THEN take the snapshot, so the channel state reflects
+			// THEN take the snapshot (format 1) or post the last
+			// journal ops (format 2), so the channel state reflects
 			// a fully-quiescent DB. Snapshotting before drain would
 			// ship a torn DB (file present, chunks missing) — fine
 			// for warm restart (local DB is authoritative) but
@@ -1554,6 +1548,20 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			drainCtx, cancelDrain := context.WithTimeout(context.Background(), 12*time.Second)
 			backend.Shutdown(drainCtx)
 			cancelDrain()
+			// Format 2 takes no final snapshot: its journal carries every
+			// change, chunk placements included. The poster's own final
+			// drain ran when the stop signal came; uploads that landed
+			// during the drain above journaled their placements after
+			// it, so post those now (same 10 s budget the format-1 final
+			// snapshot gets). Whatever doesn't make it stays in the local
+			// journal and goes out at the next mount.
+			if !*readonly && pipe.format == 2 {
+				postCtx, postCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if err := journalPoster.Drain(postCtx); err != nil {
+					fmt.Fprintln(os.Stderr, "[journal-poster] final post:", err)
+				}
+				postCancel()
+			}
 			if metricsSrv != nil {
 				mctx, mcancel := context.WithTimeout(context.Background(), 2*time.Second)
 				_ = metricsSrv.Shutdown(mctx)
@@ -1562,12 +1570,12 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			// Final lifetime-stats write BEFORE the final snapshot so
 			// the snapshot blob carries the up-to-date totals.
 			persistStats(context.Background())
-			// Final snapshot, post-drain. Uploads after RunSession
-			// returns fail with "engine closed", so this MUST run
-			// inside the callback. 10-second budget keeps the total
-			// (12 drain + 10 snapshot + slack) under the 30s
-			// watchdog below.
-			if !*readonly {
+			// Format 1: final snapshot, post-drain. Uploads after
+			// RunSession returns fail with "engine closed", so this MUST
+			// run inside the callback. 10-second budget keeps the total
+			// (12 drain + 10 snapshot + slack) under the 30s watchdog
+			// below.
+			if !*readonly && pipe.format == 1 {
 				fmt.Println("Taking final snapshot…")
 				finalCtx, finalCancel := context.WithTimeout(context.Background(), 10*time.Second)
 				if err := snapMgr.Once(finalCtx); err != nil {
@@ -1587,7 +1595,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return nil
 	}()
 	// Stop the session manager AFTER the shutdown sequence ran the
-	// final snapshot. The manager's goroutine then unwinds; mgrDone
+	// final post/snapshot. The manager's goroutine then unwinds; mgrDone
 	// signals when the gotd client's run loop has fully torn down.
 	stopMgr()
 	<-mgrDone
@@ -2054,18 +2062,6 @@ func armForceExit(mountpoint string) {
 	}()
 }
 
-// printDefaultsExcept is fs.PrintDefaults without the hidden flags.
-func printDefaultsExcept(fs *flag.FlagSet, hidden ...string) {
-	shown := flag.NewFlagSet(fs.Name(), flag.ContinueOnError)
-	shown.SetOutput(fs.Output())
-	fs.VisitAll(func(f *flag.Flag) {
-		if !slices.Contains(hidden, f.Name) {
-			shown.Var(f.Value, f.Name, f.Usage)
-		}
-	})
-	shown.PrintDefaults()
-}
-
 // neverUsedDB reports a DB that neither `telfs init` nor a recovery
 // produced: format 1 (no format marker), never snapshotted, nothing but
 // the root directory, no chunks, no journal. That is what meta.Open
@@ -2315,6 +2311,8 @@ func classify2(cm tg.ChannelMessage, keys *wire.Keys) tg.ChannelMessage {
 		out.Kind = tg.KindJournal
 		out.JnlCap = tg.JournalCaption{Kind: tg.MessageKindJournal, FSUUID: c.FS, FirstSeq: c.First, LastSeq: c.Last, Count: c.N}
 	}
+	// Anything else — the pinned anchor, a kind a newer telfs posts —
+	// stays KindUnknown, which gc never deletes.
 	return out
 }
 
@@ -2375,10 +2373,17 @@ func cmdGC(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("gc: read fs_uuid: %w", err)
 	}
-	var currentSnap int
+	var currentSnap, anchorSnap int
 	if v, err := metaStore.GetKV(ctx, snapshot.KVCurrentMsgID); err == nil {
 		if id, err := strconv.Atoi(string(v)); err == nil {
 			currentSnap = id
+		}
+	}
+	// Format 2: the snapshot the pinned anchor names is what a recovery
+	// starts from — never stale, even when a newer one exists.
+	if v, err := metaStore.GetKV(ctx, snapshot.KVAnchorSnapID); err == nil {
+		if id, err := strconv.Atoi(string(v)); err == nil {
+			anchorSnap = id
 		}
 	}
 
@@ -2458,7 +2463,7 @@ func cmdGC(ctx context.Context, args []string) error {
 						minRetainedSeq = seq
 					}
 				}
-				if cm.ID == currentSnap {
+				if cm.ID == currentSnap || (anchorSnap > 0 && cm.ID == anchorSnap) {
 					keepSnap(cm.SnapCap.Seq)
 					return nil
 				}

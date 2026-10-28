@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -173,13 +174,19 @@ func openPipeline(ctx context.Context, m *meta.Store, sec *secret.Secret) (*pipe
 	return p, nil
 }
 
-// recover2 restores a format-2 filesystem from the channel: key message
-// (or an export) → secret → newest snapshot → journal replay.
-// found2=false means "no format-2 key header here" (try format 1).
+// recover2 restores a format-2 filesystem from the channel: pinned list
+// → key message (or an export) → secret → the pinned anchor's snapshot →
+// the journal posted after it (filesystems without an anchor: the newest
+// snapshot and the journal by scanning). found2=false means "no format-2
+// key header here" (try format 1).
 func recover2(ctx context.Context, cfg *config.Config, sess *tg.Session, sec *secret.Secret, keyHeaderPath string) (found2 bool, err error) {
+	pins, err := sess.PinnedMessages(ctx)
+	if err != nil {
+		return false, err
+	}
 	var cands []snapshot.KeyFound
 	var onChannel []snapshot.KeyFound
-	onChannel, err = snapshot.FindKeyMessages(ctx, sess)
+	onChannel, err = snapshot.FindKeyMessagesIn(ctx, sess, pins)
 	if err != nil {
 		return false, err
 	}
@@ -224,20 +231,14 @@ func recover2(ctx context.Context, cfg *config.Config, sess *tg.Session, sec *se
 		return true, err
 	}
 	fmt.Printf("Key header opened (filesystem %s). Looking for the newest snapshot…\n", fsUUID)
-	snap, err := snapshot.FindLatestSnapshot2(ctx, sess, keys)
+	got, err := snapshot.Fetch2(ctx, sess, keys, pins, func(f string, a ...any) { fmt.Printf(f+"\n", a...) })
 	if err != nil {
+		if errors.Is(err, snapshot.ErrNoSnapshot2) {
+			return true, fmt.Errorf("the key header opens, but %w (filesystem %s)", err, fsUUID)
+		}
 		return true, err
 	}
-	if snap == nil {
-		return true, fmt.Errorf("the key header opens, but no snapshot of filesystem %s was found in the newest %d messages", fsUUID, snapshot.ScanPages*100)
-	}
-	fmt.Printf("Found snapshot msg=%d (journal seq %d, %s)\n", snap.MsgID, snap.Caption.Seq,
-		time.Unix(snap.Caption.TS, 0).UTC().Format(time.RFC3339))
-	gz, err := snapshot.DownloadSnapshot2(ctx, sess, keys, snap.MsgID)
-	if err != nil {
-		return true, err
-	}
-	if err := snapshot.Restore(ctx, gz, cfg.DBPath()); err != nil {
+	if err := snapshot.Restore(ctx, got.DB, cfg.DBPath()); err != nil {
 		return true, err
 	}
 	fail := func(e error) (bool, error) {
@@ -251,16 +252,12 @@ func recover2(ctx context.Context, cfg *config.Config, sess *tg.Session, sec *se
 		return fail(err)
 	}
 	defer m.Close()
-	if got, _ := m.FSUUID(ctx); got != fsUUID {
-		return fail(fmt.Errorf("restored snapshot is filesystem %s, the key header says %s", got, fsUUID))
+	if restored, _ := m.FSUUID(ctx); restored != fsUUID {
+		return fail(fmt.Errorf("restored snapshot is filesystem %s, the key header says %s", restored, fsUUID))
 	}
-	_ = snapshot.RecordSnapID(ctx, m, snap.MsgID)
-	ops, err := snapshot.ListJournal2(ctx, sess, keys, snap.Caption.Seq)
-	if err != nil {
-		return fail(fmt.Errorf("journal: %w", err))
-	}
+	ops := got.Journal
 	if len(ops) > 0 {
-		fmt.Printf("Replaying %d journal op(s) since seq %d…\n", len(ops), snap.Caption.Seq)
+		fmt.Printf("Replaying %d journal op(s) since seq %d…\n", len(ops), got.SnapSeq)
 	}
 	for _, e := range ops {
 		op, derr := meta.DecodeOp(e.Op)
@@ -275,6 +272,11 @@ func recover2(ctx context.Context, cfg *config.Config, sess *tg.Session, sec *se
 		if err := m.AdvanceJournalSeq(ctx, ops[len(ops)-1].Seq); err != nil {
 			return fail(err)
 		}
+	}
+	// The restored DB names the snapshot before the one it came from;
+	// record the one it came from (and its anchor).
+	if err := snapshot.RecordRecovered(ctx, m, got.Located2); err != nil {
+		return fail(err)
 	}
 	// The header that opened is the current one.
 	if err := m.PutKV(ctx, meta.KVKeyHeader, k.JSON); err != nil {
@@ -352,43 +354,60 @@ type keyCheck struct {
 	Detail string `json:"detail"`
 }
 
-func checkPinnedHeader(ctx context.Context, sess *tg.Session, m *meta.Store) keyCheck {
+func checkPinnedHeader(ctx context.Context, sess pinLister, m *meta.Store) keyCheck {
 	kc := keyCheck{TS: time.Now().Unix()}
 	_, local, err := keyHeaderOf(ctx, m)
 	if err != nil {
 		kc.Detail = err.Error()
 		return kc
 	}
-	pinned, err := sess.PinnedMessageID(ctx)
+	// Every pin: a format-2 channel has two (the key message and the
+	// snapshot anchor), and channels.getFullChannel names only the newest.
+	pins, err := sess.PinnedMessages(ctx)
 	if err != nil {
-		kc.Detail = "cannot read the pinned message: " + err.Error()
+		kc.Detail = "cannot read the pinned messages: " + err.Error()
 		return kc
 	}
-	if pinned == 0 {
+	if len(pins) == 0 {
 		kc.Detail = "no message is pinned — the key message must be pinned (fsck --fix re-pins it)"
 		return kc
 	}
-	text, err := sess.GetMessageText(ctx, pinned)
-	if err != nil {
-		kc.Detail = fmt.Sprintf("cannot read pinned message %d: %v", pinned, err)
-		return kc
+	var keyIDs []int
+	damaged := ""
+	for _, p := range pins {
+		if p.HasDoc || !wire.IsKeyMessage(p.RawCaption) {
+			continue
+		}
+		keyIDs = append(keyIDs, p.ID)
+		_, js, err := wire.ParseKeyMessage(p.RawCaption)
+		if err != nil {
+			damaged = fmt.Sprintf("pinned key message %d is damaged: %v", p.ID, err)
+			continue
+		}
+		if bytes.Equal(js, local) {
+			kc.OK = true
+			kc.Detail = fmt.Sprintf("pinned key message %d matches the local key header", p.ID)
+			return kc
+		}
 	}
-	if !wire.IsKeyMessage(text) {
-		kc.Detail = fmt.Sprintf("pinned message %d is not a key message (fsck --fix re-pins the key message)", pinned)
-		return kc
+	switch {
+	case len(keyIDs) == 0:
+		kc.Detail = fmt.Sprintf("none of the %d pinned message(s) is a key message (fsck --fix re-pins the key message)", len(pins))
+	case damaged != "" && len(keyIDs) == 1:
+		kc.Detail = damaged
+	default:
+		ids := fmt.Sprint(keyIDs[0])
+		if len(keyIDs) > 1 {
+			ids = fmt.Sprint(keyIDs)
+		}
+		kc.Detail = fmt.Sprintf("pinned key message %s differs from the local key header (stale after an interrupted secret change? fsck --fix replaces it)", ids)
 	}
-	_, js, err := wire.ParseKeyMessage(text)
-	if err != nil {
-		kc.Detail = fmt.Sprintf("pinned key message %d is damaged: %v", pinned, err)
-		return kc
-	}
-	if !bytes.Equal(js, local) {
-		kc.Detail = fmt.Sprintf("pinned key message %d differs from the local key header (stale after an interrupted secret change? fsck --fix replaces it)", pinned)
-		return kc
-	}
-	kc.OK = true
-	kc.Detail = fmt.Sprintf("pinned key message %d matches the local key header", pinned)
 	return kc
+}
+
+// pinLister is the part of tg.Session the key check needs.
+type pinLister interface {
+	PinnedMessages(ctx context.Context) ([]tg.ChannelMessage, error)
 }
 
 func storeKeyCheck(ctx context.Context, m *meta.Store, kc keyCheck) {

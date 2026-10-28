@@ -159,6 +159,11 @@ func (p *Poster) Run(ctx context.Context) error {
 	}
 }
 
+// Drain posts every pending journal entry now. For the shutdown path
+// AFTER Run has returned (format 2 posts the chunk placements of uploads
+// that landed during the final upload drain); never concurrently with Run.
+func (p *Poster) Drain(ctx context.Context) error { return p.drainOnce(ctx) }
+
 // drainOnce reads pending journal entries and posts them to the
 // channel in BATCHES — one TG message per batch instead of one per
 // op. A 10k-file unzip used to generate 10k+ TG messages here;
