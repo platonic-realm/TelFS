@@ -107,6 +107,7 @@ func readSecret(ctx context.Context, cfg *config.Config, purpose secret.Purpose)
 		Purpose:  purpose,
 		Prompt:   label,
 		PipeFD:   secretFD,
+		NoPrompt: noPrompt,
 	})
 }
 

@@ -660,40 +660,21 @@ kernel mount may stay in `/proc/mounts` while writes silently fall
 through to the *local* filesystem underneath. Files dropped during
 that window land on disk locally, not in the channel.
 
-For production, run under a supervisor:
-
-```ini
-# ~/.config/systemd/user/telfs@.service
-[Unit]
-Description=TelFS mount (profile %i)
-After=network-online.target
-
-[Service]
-Type=simple
-Environment=TELFS_PROFILE=%i
-ExecStart=%h/.local/bin/telfs mount %h/External-%i
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-The profile reads its secret from a file — never from the unit's
-environment:
-
-```toml
-# ~/.config/telfs/profiles/work/config.toml
-[secret]
-source = "file"
-file   = "/home/you/.config/telfs/work.secret"   # chmod 0600 (or 0640 for a service group)
-```
+For production, run it as a service: `telfs mount --service` never
+prompts, waits (and tells systemd why) while the network or Telegram is
+unreachable at boot, reports `READY=1` once mounted and `STOPPING=1` on
+stop, and exits with the codes above. An example unit is
+[`contrib/systemd/telfs@.service`](contrib/systemd/telfs@.service):
+`Type=notify`, the secret through `LoadCredentialEncrypted=` (the
+profile's `[secret] file = "${CREDENTIALS_DIRECTORY}/telfs-secret"`),
+and no restart loop on the exit codes that need a human (2, 3, 6, 7).
+Several profiles can be mounted at once: each has its own control
+socket. Other jobs talk to the mount without the secret:
 
 ```sh
-systemctl --user enable --now telfs@work.service
+telfs sync --wait --timeout 6h && echo "the channel holds this backup"
+telfs status --json | jq .sync
 ```
-
-(A service mode with `Type=notify`, network-wait and several mounts at
-once is the next phase.)
 
 For interactive use, at minimum: `nohup telfs mount ~/External &` —
 and verify the daemon survives a shell exit before trusting it with

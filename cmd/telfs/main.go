@@ -76,11 +76,17 @@ Usage:
                                       recovered from the channel.
                                       Flags: --readonly --allow-other --debug
                                       --key-header FILE (recover with an export)
-  telfs unmount <mountpoint|profile>
-                                    Stop the mount daemon (however it was
-                                      started) and detach the mountpoint.
-                                      SIGTERM → orderly shutdown → verify;
-                                      escalates to SIGKILL + lazy unmount.
+                                      --service (systemd Type=notify: never
+                                      prompts, waits for network/Telegram)
+  telfs unmount [--timeout D] <mountpoint|profile>
+                                    Stop the mount daemon and return when it
+                                      has exited (asked over its control
+                                      socket; older daemons: SIGTERM, then
+                                      SIGKILL + lazy unmount).
+  telfs sync [--wait] [--timeout D] Exit 0 when everything written through the
+                                      mount (before the call, with --wait) is
+                                      on the channel; 4 if not (yet), 5 if not
+                                      mounted. Needs no secret.
   telfs init [--chunk-size N] [--compression none|zstd] [--kdf-memory SIZE]
                                     Create a NEW filesystem (format 2: always
                                       encrypted) on the bound channel; posts and
@@ -102,7 +108,9 @@ Usage:
                                     Manage multiple profiles (accounts/channels).
                                       Each profile is ONE identity; reset-auth
                                       wipes it (session + channel binding).
-  telfs status                      One-screen summary of the active profile.
+  telfs status [--json]             One-screen summary of the active profile;
+                                      --json: one object (schema 1) for
+                                      scripts, needs no secret.
   telfs doctor                      Lint local profile + DB state for known invariants.
   telfs web [--listen ADDR] [--token TOKEN]
                                     HTTP management UI (default 127.0.0.1:8080).
@@ -628,6 +636,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	prefetchConcurrency := fs.Int("prefetch-concurrency", 0, "max prefetchOne goroutines (0 = default 4). Each one can issue 4 concurrent upload.getFile RPCs through the parallel ranged fetcher.")
 	memCacheCap := fs.String("mem-cache-cap", "", "in-RAM hot-tier cache size (e.g. 128MiB, 1GiB, 0 to disable). Empty falls through to 128 MiB. Reads hit the mem tier first, skipping os.ReadFile on hot chunks.")
 	blobPrefetch := fs.String("blob-prefetch", "", "packed-blob locality prefetch span (e.g. 4MiB): a cold read of one packed small file warms its blob neighbors in one ranged download. Empty = default 4 MiB; 0 disables.")
+	serviceFlag := fs.Bool("service", false, "run as a systemd service (Type=notify): never prompt (the secret comes from a file or systemd credentials), wait and retry while the network or Telegram is unreachable at boot, report READY/STATUS/STOPPING to systemd")
 	keyHeader := fs.String("key-header", "", "recover a format-2 filesystem with this key header export (telfs key export) instead of the channel's pinned key message; only used when the local DB is missing")
 	// TEST-ONLY (P1 scale test, Arash 2026-10-26): hidden from the help,
 	// warns on every use, to be removed or replaced by the P2 snapshot
@@ -709,6 +718,11 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return fmt.Errorf("--key-header recovers a missing local DB, but %s exists — move it away first (or mount without --key-header)", cfg.DBPath())
 	}
 
+	noPrompt = *serviceFlag
+	svc := newService(*serviceFlag)
+	go svc.keepStarting(signalCtx)
+	svc.status("starting")
+
 	// The profile's secret, read ONCE: it opens session.enc (Argon2id
 	// #1) and, below, the filesystem key (Argon2id #2 on format 2, the
 	// passphrase of an encrypted format-1 FS). Zeroed as soon as both
@@ -730,7 +744,22 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		if *noRecover {
 			return errors.New("--no-recover: there is no local DB to mount — run `telfs init` to create a filesystem, or mount without --no-recover to restore one from the channel")
 		}
-		if err := tryRecover(signalCtx, cfg, client, sec, *keyHeader, *readonly); err != nil {
+		svc.status("recovering the filesystem from the channel")
+		attempt := 0
+		err := svc.retryAtBoot(signalCtx, "recovery", func(ctx context.Context) error {
+			if attempt++; attempt > 1 {
+				// The DB was missing at the start: whatever a failed
+				// attempt left behind goes before the next one.
+				for _, sfx := range []string{"", "-wal", "-shm"} {
+					_ = os.Remove(cfg.DBPath() + sfx)
+				}
+			}
+			return tryRecover(ctx, cfg, client, sec, *keyHeader, *readonly)
+		})
+		if err != nil {
+			if retriable(err) {
+				err = fmt.Errorf("%w: %w", errTelegram, err)
+			}
 			return fmt.Errorf("recovery: %w", err)
 		}
 	}
@@ -895,6 +924,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// signals Reconnect when no upload progress for 90 s; in the
 	// wedged-TCP scenario this auto-recovers within seconds instead
 	// of waiting for the kernel's TCP timeout (~15 min).
+	svc.status("connecting to Telegram")
 	mgr := client.NewSessionManager()
 	sess := mgr.Session()
 	// --readonly never writes to the channel: the session itself refuses
@@ -929,7 +959,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			if errors.Is(err, context.Canceled) {
 				return nil
 			}
-			return err
+			return fmt.Errorf("%w: %w", errTelegram, err)
 		}
 	case <-signalCtx.Done():
 		stopMgr()
@@ -943,16 +973,19 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// channel RPC dies in a CHANNEL_INVALID retry storm only visible
 	// in the log.
 	{
-		verifyCtx, cancelVerify := context.WithTimeout(signalCtx, 30*time.Second)
-		verr := sess.VerifyAccess(verifyCtx)
-		cancelVerify()
+		svc.status("checking access to the channel")
+		verr := svc.retryAtBoot(signalCtx, "channel access", func(ctx context.Context) error {
+			verifyCtx, cancelVerify := context.WithTimeout(ctx, 30*time.Second)
+			defer cancelVerify()
+			return sess.VerifyAccess(verifyCtx)
+		})
 		if verr != nil {
 			stopMgr()
 			<-mgrDone
 			if errors.Is(verr, context.Canceled) {
 				return nil
 			}
-			return fmt.Errorf("mount preflight: %w", verr)
+			return fmt.Errorf("mount preflight: %w: %w", errTelegram, verr)
 		}
 	}
 
@@ -1444,7 +1477,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		go ctl.sampleRate(signalCtx)
 
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
+		svc.markReady(mountpoint)
 		<-signalCtx.Done()
+		svc.stopping()
 
 		// User asked to stop. Two failsafes:
 		//  1. A second ^C (or SIGTERM) force-exits via lazy unmount.

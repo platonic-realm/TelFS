@@ -1,0 +1,45 @@
+# EXAMPLE unit for a TelFS mount as a service (spec v1 §3). The real unit
+# belongs to whoever deploys TelFS (on S9: the fatehi.dev session); adjust
+# the user, the paths and the credential name.
+#
+# The secret comes from systemd's encrypted credentials and is never on a
+# command line, in the environment or anywhere else on disk:
+#
+#   systemd-creds encrypt --name=telfs-secret secret.txt /etc/credstore.encrypted/telfs-<profile>
+#
+# and the profile's config.toml says
+#
+#   [secret]
+#   source = "file"
+#   file   = "${CREDENTIALS_DIRECTORY}/telfs-secret"
+#
+# Commands other than the mount (telfs status --json, telfs sync --wait,
+# telfs unmount) talk to the running daemon over its control socket and need
+# no secret.
+
+[Unit]
+Description=TelFS mount (profile %i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=CHANGE-ME
+Environment=TELFS_PROFILE=%i
+LoadCredentialEncrypted=telfs-secret:/etc/credstore.encrypted/telfs-%i
+# --service: never prompts; waits (and tells systemd why) while the network or
+# Telegram is unreachable at boot; READY=1 once mounted, STOPPING=1 on stop.
+ExecStart=/usr/local/bin/telfs mount --service /srv/telfs/%i
+# A clean stop drains uploads and posts the journal; whatever is still staged
+# is uploaded at the next start.
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=30
+# Exit codes that need a human — 2 secret source unavailable, 3 wrong secret,
+# 6 the channel or the session refused, 7 integrity (e.g. a recovery refused):
+# don't restart-loop on them.
+RestartPreventExitStatus=2 3 6 7
+
+[Install]
+WantedBy=multi-user.target
