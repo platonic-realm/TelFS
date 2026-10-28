@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"text/tabwriter"
@@ -22,19 +23,25 @@ import (
 // localKeys2 unlocks the local DB's keys when it is format 2; nil (no
 // error) for format 1 or no local DB.
 func localKeys2(ctx context.Context, cfg *config.Config, sec *secret.Secret) (*wire.Keys, error) {
+	keys, _, err := localKeys2C(ctx, cfg, sec)
+	return keys, err
+}
+
+// localKeys2C is localKeys2 with the keys' use counters (seeded from the
+// local DB).
+func localKeys2C(ctx context.Context, cfg *config.Config, sec *secret.Secret) (*wire.Keys, *wire.Counters, error) {
 	if _, err := os.Stat(cfg.DBPath()); err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	m, err := meta.Open(cfg.DBPath())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer m.Close()
 	if f, err := m.Format(ctx); err != nil || f != 2 {
-		return nil, err
+		return nil, nil, err
 	}
-	keys, _, err := unlock2(ctx, m, sec)
-	return keys, err
+	return unlock2(ctx, m, sec)
 }
 
 // listSnapshots2 lists format-2 snapshots newest first by decrypting
@@ -231,24 +238,21 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	keys, err := localKeys2(ctx, cfg, sec)
+	keys, counters, err := localKeys2C(ctx, cfg, sec)
 	if err != nil {
 		return err
 	}
-	// Format 2: a snapshot from before a secret change carries the OLD
-	// key header; keep the CURRENT one so the restored DB still opens
-	// with today's secret.
-	var currentHeader, currentAnchor, currentVersions []byte
-	var currentSeq int64
+	// Format 2: what the rolled-back DB must keep from today's.
+	var cur rollback2
 	if keys != nil {
-		if m, merr := meta.Open(cfg.DBPath()); merr == nil {
-			_, currentHeader, _ = keyHeaderOf(ctx, m)
-			currentAnchor, _ = m.GetKV(ctx, snapshot.KVAnchorMsgID)
-			currentSeq, _ = m.LastJournalSeq(ctx)
-			// Versions live on the channel, not in the tree: the
-			// rolled-back DB keeps today's registry.
-			currentVersions, _ = m.GetKV(ctx, snapshot.KVVersions)
-			m.Close()
+		m, merr := meta.Open(cfg.DBPath())
+		if merr != nil {
+			return merr
+		}
+		cur, err = readRollback2(ctx, m)
+		m.Close()
+		if err != nil {
+			return err
 		}
 	}
 	return client.RunSession(ctx, func(ctx context.Context, sess *tg.Session) error {
@@ -271,8 +275,9 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 		// the WAL) and (b) get replayed by sqlite into the RESTORED
 		// database on next open, silently corrupting it. Restore()
 		// also defensively deletes leftover sidecars.
+		var backup string
 		if _, err := os.Stat(cfg.DBPath()); err == nil {
-			backup := fmt.Sprintf("%s.pre-restore-%d", cfg.DBPath(), time.Now().Unix())
+			backup = fmt.Sprintf("%s.pre-restore-%d", cfg.DBPath(), time.Now().Unix())
 			if err := os.Rename(cfg.DBPath(), backup); err != nil {
 				return fmt.Errorf("backup %s → %s: %w", cfg.DBPath(), backup, err)
 			}
@@ -286,34 +291,127 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 		if err := snapshot.Restore(ctx, plaintext, cfg.DBPath()); err != nil {
 			return err
 		}
-		if len(currentHeader) > 0 {
-			if m, merr := meta.Open(cfg.DBPath()); merr == nil {
-				_ = m.PutKV(ctx, meta.KVKeyHeader, currentHeader)
-				_ = snapshot.RecordSnapID(ctx, m, msgID)
-				// Format 2 snapshots rarely: the channel's anchor still
-				// names the newest snapshot, not this rolled-back state.
-				// The next mount takes a snapshot at once, and its anchor
-				// replaces the current one.
-				// The rolled-back journal continues after every seq the
-				// abandoned one reached, so the two never share a number
-				// on the channel.
-				_ = m.AdvanceJournalSeq(ctx, currentSeq)
-				_ = m.PutKV(ctx, snapshot.KVSnapDue, []byte(fmt.Sprintf("restored from snapshot %d", msgID)))
-				if len(currentAnchor) > 0 {
-					_ = m.PutKV(ctx, snapshot.KVAnchorMsgID, currentAnchor)
-				}
-				if len(currentVersions) > 0 {
-					_ = m.PutKV(ctx, snapshot.KVVersions, currentVersions)
-				} else {
-					_ = m.DeleteKV(ctx, snapshot.KVVersions)
-				}
+		if keys == nil {
+			fmt.Printf("Restored snapshot msg=%d → %s\n", msgID, cfg.DBPath())
+			fmt.Println("Mount the profile to see the rolled-back state.")
+			return nil
+		}
+		m, err := meta.Open(cfg.DBPath())
+		if err == nil {
+			if err = applyRollback2(ctx, m, cur, msgID); err != nil {
 				m.Close()
 			}
 		}
+		if err != nil {
+			// Without its record the rolled-back DB must not be mounted
+			// (its journal would reuse seqs the channel already holds):
+			// put the previous DB back.
+			if uerr := undoRestore(cfg.DBPath(), backup); uerr != nil {
+				return fmt.Errorf("recording the rollback failed: %v; putting the previous DB back failed too: %w (it is %s)", err, uerr, backup)
+			}
+			return fmt.Errorf("recording the rollback failed, the previous DB is back in place (nothing changed): %w", err)
+		}
+		defer m.Close()
+		persistUses(ctx, m, counters)
 		fmt.Printf("Restored snapshot msg=%d → %s\n", msgID, cfg.DBPath())
+		// The channel's anchor still names the newest snapshot of the
+		// abandoned state: a recovery through it would replay that
+		// state's journal and then this one's. Post the rolled-back state
+		// now and the anchor naming it (the journal gap applyRollback2
+		// left makes a recovery through the old anchor refuse meanwhile).
+		fmt.Println("Posting a snapshot of the rolled-back state and the anchor naming it…")
+		mgr := &snapshot.Manager{Meta: m, Session: sess, Keys: keys, Logger: log.New(os.Stdout, "", 0)}
+		id, serr := mgr.SnapshotAndAnchor(ctx)
+		persistUses(ctx, m, counters)
+		if serr != nil {
+			return fmt.Errorf("the rolled-back state is restored locally, but it is not on the channel yet: %w — "+
+				"the next mount posts it at once (until then the filesystem is not synced, and a recovery from the "+
+				"channel refuses at the journal gap instead of mixing the two states)", serr)
+		}
+		fmt.Printf("Snapshot %d of the rolled-back state is on the channel; the anchor names it.\n", id)
 		fmt.Println("Mount the profile to see the rolled-back state.")
 		return nil
 	})
+}
+
+// rollback2 is what a format-2 `snapshot restore` keeps from the DB it
+// replaces.
+type rollback2 struct {
+	header   []byte // the CURRENT key header: a snapshot from before a secret change carries the old one
+	anchor   []byte // the pinned anchor's message id (the next anchor deletes it)
+	versions []byte // the registry: versions live on the channel, not in the tree
+	seq      int64  // the newest journal seq of the abandoned state
+}
+
+func readRollback2(ctx context.Context, m *meta.Store) (rollback2, error) {
+	var r rollback2
+	var err error
+	if _, r.header, err = keyHeaderOf(ctx, m); err != nil {
+		return r, err
+	}
+	kv, err := m.GetKVs(ctx, snapshot.KVAnchorMsgID, snapshot.KVVersions)
+	if err != nil {
+		return r, err
+	}
+	r.anchor, r.versions = kv[snapshot.KVAnchorMsgID], kv[snapshot.KVVersions]
+	if r.seq, err = m.LastJournalSeq(ctx); err != nil {
+		return r, err
+	}
+	return r, nil
+}
+
+// applyRollback2 makes a DB just restored from snapshot msgID the
+// filesystem's current state, in one transaction: today's key header,
+// registry and anchor id; a snapshot owed; and a journal that continues
+// one seq PAST the abandoned state's newest. The skipped seq is
+// deliberate: the old anchor names a snapshot whose journal on the
+// channel runs to that newest seq, and ops of the rolled-back state
+// right after it would read as one gap-free journal — a recovery through
+// the old anchor would replay both states mixed. With the gap it refuses.
+func applyRollback2(ctx context.Context, m *meta.Store, r rollback2, msgID int) error {
+	return m.UpdateKV(ctx, func(k *meta.KVTx) error {
+		if err := snapshot.RecordSnapIDTx(k, msgID); err != nil {
+			return err
+		}
+		if err := k.Put(meta.KVKeyHeader, r.header); err != nil {
+			return err
+		}
+		if err := k.Put(snapshot.KVSnapDue, []byte(fmt.Sprintf("restored from snapshot %d (%s)", msgID, time.Now().UTC().Format(time.RFC3339Nano)))); err != nil {
+			return err
+		}
+		if len(r.anchor) > 0 {
+			if err := k.Put(snapshot.KVAnchorMsgID, r.anchor); err != nil {
+				return err
+			}
+		}
+		if len(r.versions) > 0 {
+			if err := k.Put(snapshot.KVVersions, r.versions); err != nil {
+				return err
+			}
+		} else if err := k.Delete(snapshot.KVVersions); err != nil {
+			return err
+		}
+		return k.AdvanceJournalSeq(r.seq + 1)
+	})
+}
+
+// undoRestore removes the DB a restore wrote and moves the backup of the
+// previous one (and its sidecars) back.
+func undoRestore(dbPath, backup string) error {
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if backup == "" {
+		return nil
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Rename(backup+suffix, dbPath+suffix); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return os.Rename(backup, dbPath)
 }
 
 // shortAge prints a duration as "5m", "3h", "12d" — a single

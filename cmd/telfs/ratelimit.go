@@ -94,6 +94,9 @@ func cmdRateLimit(ctx context.Context, args []string) error {
 		if err := mstore.SetTGRateLimitMode(ctx, args[1]); err != nil {
 			return err
 		}
+		if err := markSettingChanged(ctx, mstore, "rate-limit settings changed"); err != nil {
+			return err
+		}
 		fmt.Printf("rate limit mode: %s — takes effect within 5 s\n", args[1])
 		return nil
 	default:
@@ -128,6 +131,9 @@ func setRateLimits(ctx context.Context, mstore *meta.Store, args []string) error
 		n, err := strconv.Atoi(args[0])
 		if err == nil {
 			if err := mstore.SetTGRateLimitPerMin(ctx, n); err != nil {
+				return err
+			}
+			if err := markSettingChanged(ctx, mstore, "rate-limit settings changed"); err != nil {
 				return err
 			}
 			fmt.Printf("upload rate limit: %s — takes effect within 5 s\n", fmtRL(n))
@@ -179,7 +185,7 @@ func setRateLimits(ctx context.Context, mstore *meta.Store, args []string) error
 		}
 		fmt.Printf("download rate limit: %s — takes effect within 5 s\n", fmtRL(down))
 	}
-	return nil
+	return markSettingChanged(ctx, mstore, "rate-limit settings changed")
 }
 
 // clearRateLimits clears one or both lanes. Bare `clear` zeroes both
@@ -211,5 +217,5 @@ func clearRateLimits(ctx context.Context, mstore *meta.Store, args []string) err
 		}
 		fmt.Println("download rate limit cleared (unlimited)")
 	}
-	return nil
+	return markSettingChanged(ctx, mstore, "rate-limit settings changed")
 }

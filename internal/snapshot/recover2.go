@@ -43,8 +43,11 @@ var ErrNoSnapshot2 = errors.New("no snapshot of this filesystem found")
 // since v1): the anchor's snapshot, then only the journal batches posted
 // after the anchor's boundary — no history scan. Without one: the newest
 // snapshot and the journal by scanning, as before v1. An anchor whose
-// snapshot can't be read falls back to the scan (said through logf).
-// pins is the channel's pinned list.
+// snapshot is gone from the channel or does not decrypt falls back to
+// the scan (said through logf); a failure to download it (the network,
+// Telegram) is returned as it is, so a boot mount waits and retries the
+// anchor's way instead of scanning a history it may not reach the
+// snapshot in. pins is the channel's pinned list.
 func Fetch2(ctx context.Context, ch Channel, keys *wire.Keys, pins []tg.ChannelMessage, logf func(string, ...any)) (*Fetched2, error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -69,6 +72,9 @@ func Fetch2(ctx context.Context, ch Channel, keys *wire.Keys, pins []tg.ChannelM
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if !errors.Is(derr, tg.ErrMessageGone) && !errors.Is(derr, ErrSnapshotUnreadable) {
+			return nil, fmt.Errorf("the anchor's snapshot %d: %w", a.SnapMsg, derr)
 		}
 		logf("warning: the anchor's snapshot %d can't be read (%v) — scanning the channel for the newest snapshot instead", a.SnapMsg, derr)
 		stale = anc.MsgID
@@ -100,37 +106,53 @@ func Fetch2(ctx context.Context, ch Channel, keys *wire.Keys, pins []tg.ChannelM
 // anchor and possibly a pending snap_due: without this the policy would
 // measure from the wrong snapshot. With an anchor, the version registry
 // is the anchor's list (without one, the snapshot's registry stays).
+// One transaction: a half-written record would pair one snapshot with
+// another's seq.
 func RecordRecovered(ctx context.Context, m *meta.Store, loc Located2) error {
-	ints := []kvInt64{{KVCurrentMsgID, int64(loc.SnapMsg)}, {KVCurrentJournalSeq, loc.SnapSeq}}
+	ints := map[string]int64{KVCurrentMsgID: int64(loc.SnapMsg), KVCurrentJournalSeq: loc.SnapSeq}
 	if loc.SnapTS > 0 {
-		ints = append(ints, kvInt64{KVLastSnapUnix, loc.SnapTS})
+		ints[KVLastSnapUnix] = loc.SnapTS
 	}
 	drop := []string{KVSnapDue, KVAnchorDue}
+	var versions []byte
 	if loc.Anchor != nil {
-		ints = append(ints, kvInt64{KVSnapJnlAfter, int64(loc.JnlAfter)},
-			kvInt64{KVAnchorMsgID, int64(loc.Anchor.MsgID)}, kvInt64{KVAnchorSnapID, int64(loc.SnapMsg)})
+		ints[KVSnapJnlAfter] = int64(loc.JnlAfter)
+		ints[KVAnchorMsgID] = int64(loc.Anchor.MsgID)
+		ints[KVAnchorSnapID] = int64(loc.SnapMsg)
+		ints[KVAnchorSnapSeq] = loc.SnapSeq
 		// The anchor is re-posted after every version change; the
 		// snapshot's own registry is as old as the snapshot.
-		if err := StoreVersions(ctx, m, loc.Anchor.Anchor.Versions); err != nil {
+		b, err := EncodeVersions(loc.Anchor.Anchor.Versions)
+		if err != nil {
 			return err
 		}
+		versions = b
 	} else {
 		// Found by scanning: no boundary known (the policy posts an
 		// anchor, or takes one snapshot, at the next mount).
-		drop = append(drop, KVSnapJnlAfter, KVAnchorSnapID)
+		drop = append(drop, KVSnapJnlAfter, KVAnchorSnapID, KVAnchorSnapSeq)
 		if loc.StaleAnchor > 0 {
-			ints = append(ints, kvInt64{KVAnchorMsgID, int64(loc.StaleAnchor)})
+			ints[KVAnchorMsgID] = int64(loc.StaleAnchor)
 		} else {
 			drop = append(drop, KVAnchorMsgID)
 		}
 	}
-	if err := putKVInts(ctx, m, ints...); err != nil {
-		return err
-	}
-	for _, k := range drop {
-		if err := m.DeleteKV(ctx, k); err != nil && !errors.Is(err, meta.ErrNotFound) {
-			return err
+	return m.UpdateKV(ctx, func(k *meta.KVTx) error {
+		for key, v := range ints {
+			if err := putInt(k, key, v); err != nil {
+				return err
+			}
 		}
-	}
-	return RecordSnapID(ctx, m, loc.SnapMsg)
+		for _, key := range drop {
+			if err := k.Delete(key); err != nil {
+				return err
+			}
+		}
+		if versions != nil {
+			if err := k.Put(KVVersions, versions); err != nil {
+				return err
+			}
+		}
+		return RecordSnapIDTx(k, loc.SnapMsg)
+	})
 }

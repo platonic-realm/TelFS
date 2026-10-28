@@ -276,6 +276,16 @@ func TestFormat1Unchanged(t *testing.T) {
 	if !f.manager().Synced(f.ctx) {
 		t.Fatal("format 2: Synced must not wait for a snapshot")
 	}
+	// …unless one is owed (a setting only a snapshot carries).
+	if err := MarkDue(f.ctx, f.m, "trash settings changed"); err != nil {
+		t.Fatal(err)
+	}
+	if f.manager().Synced(f.ctx) {
+		t.Fatal("format 2: not synced while a snapshot is owed")
+	}
+	if err := f.m.DeleteKV(f.ctx, KVSnapDue); err != nil {
+		t.Fatal(err)
+	}
 	seq, _ := f.m.LastJournalSeq(f.ctx)
 	if err := storeCurrentJournalSeq(f.ctx, f.m, seq); err != nil {
 		t.Fatal(err)

@@ -506,9 +506,17 @@ telfs mount ~/External              # files now reflect that state
 ```
 
 Restore is destructive to the current DB; the pre-restore copy beside
-it lets you manually roll forward again. On format 2 the next mount
-takes a snapshot of the rolled-back state at once and pins its anchor,
-so a recovery from the channel brings back the rolled-back state.
+it lets you manually roll forward again. On format 2 the restore itself
+then posts a snapshot of the rolled-back state and pins the anchor
+naming it, so from the moment it returns a recovery from the channel
+brings back the rolled-back state. If that post fails, the restore says
+so (non-zero exit), the next mount posts the snapshot at once, and until
+it lands the filesystem reports "not synced" (`sync`, `status --json`:
+`sync.snapshot_due`); the rolled-back journal also skips one sequence
+number, so a recovery through the old anchor in that window refuses at
+the gap instead of replaying the abandoned state and the new one as one.
+`telfs recover --from-captions` leaves the same gap and owes the same
+snapshot (the next mount takes it).
 
 ## Encryption
 
@@ -717,7 +725,11 @@ telfs trash disable
 ```
 
 Every kernel-issued `unlink`/`rmdir` reroutes into `/.trash/`; a
-background GC actually deletes entries older than the TTL. Restore is
+background GC actually deletes entries older than the TTL. The trash
+settings (like the `telfs ratelimit` pins) live only in the local DB,
+not in the journal: on format 2 a change marks a snapshot owed, which
+the daemon takes within a minute (or the next mount at once), and the
+filesystem is not synced until it is on the channel. Restore is
 just `mv /.trash/<unix-nano>-orig /restored` — the trashed dirent
 points at the same inode, so file content is untouched. Notes: unlinks
 *inside* `/.trash` actually delete; `rm /.trash` itself returns EPERM;

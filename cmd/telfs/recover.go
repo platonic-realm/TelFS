@@ -144,6 +144,24 @@ func cmdRecover(ctx context.Context, args []string) error {
 		if err := seedUsesFromRebuild(ctx, m, res.Stats); err != nil {
 			return err
 		}
+		// The channel's pinned anchor (if any) still names a snapshot of
+		// the state before the rebuild. Until the mount posts a snapshot
+		// of this one (at once: it is owed), a recovery through that
+		// anchor must refuse rather than replay the old journal and this
+		// DB's new ops as one: the journal continues one seq past the
+		// newest the channel holds, and that gap makes it refuse.
+		last, err := m.LastJournalSeq(ctx)
+		if err != nil {
+			return err
+		}
+		if err := m.UpdateKV(ctx, func(k *meta.KVTx) error {
+			if err := k.Put(snapshot.KVSnapDue, []byte("rebuilt from captions ("+time.Now().UTC().Format(time.RFC3339Nano)+")")); err != nil {
+				return err
+			}
+			return k.AdvanceJournalSeq(last + 1)
+		}); err != nil {
+			return err
+		}
 		// The versions found by their captions are the registry (gc
 		// refuses while any exist; the next anchor lists them).
 		if err := snapshot.StoreVersions(ctx, m, res.Versions); err != nil {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // GetKV reads a meta_kv value. Returns ErrNotFound if key doesn't exist.
@@ -67,4 +68,88 @@ func (s *Store) DeleteKV(ctx context.Context, key string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// KVTx is meta_kv access inside one transaction (Store.UpdateKV): a
+// record made of several keys — a snapshot's message id, seq, time and
+// journal boundary; a version registry and the mark that the anchor
+// does not list it yet — lands all together or not at all, and no
+// reader ever sees half of it.
+type KVTx struct {
+	ctx context.Context
+	tx  *sql.Tx
+}
+
+// Get reads a value (ErrNotFound when the key is missing).
+func (k *KVTx) Get(key string) ([]byte, error) {
+	var v []byte
+	err := k.tx.QueryRowContext(k.ctx, `SELECT value FROM meta_kv WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get kv %q: %w", key, err)
+	}
+	return v, nil
+}
+
+// Put upserts a value.
+func (k *KVTx) Put(key string, value []byte) error {
+	if _, err := k.tx.ExecContext(k.ctx,
+		`INSERT INTO meta_kv(key, value) VALUES (?,?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil {
+		return fmt.Errorf("put kv %q: %w", key, err)
+	}
+	return nil
+}
+
+// Delete removes a key; a missing key is not an error.
+func (k *KVTx) Delete(key string) error {
+	if _, err := k.tx.ExecContext(k.ctx, `DELETE FROM meta_kv WHERE key = ?`, key); err != nil {
+		return fmt.Errorf("delete kv %q: %w", key, err)
+	}
+	return nil
+}
+
+// AdvanceJournalSeq is Store.AdvanceJournalSeq inside the transaction.
+func (k *KVTx) AdvanceJournalSeq(seq int64) error {
+	return advanceJournalSeqTx(k.ctx, k.tx, seq)
+}
+
+// UpdateKV runs fn in one transaction (retried on SQLITE_BUSY, so fn
+// must be repeatable): every change it makes lands, or none does.
+func (s *Store) UpdateKV(ctx context.Context, fn func(*KVTx) error) error {
+	return s.WithTx(ctx, func(tx *sql.Tx) error { return fn(&KVTx{ctx: ctx, tx: tx}) })
+}
+
+// GetKVs reads several keys in ONE statement — one consistent view, so a
+// record written by UpdateKV is seen whole or not at all. Missing keys
+// are absent from the map.
+func (s *Store) GetKVs(ctx context.Context, keys ...string) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	q := `SELECT key, value FROM meta_kv WHERE key IN (?` + strings.Repeat(",?", len(keys)-1) + `)`
+	args := make([]any, len(keys))
+	for i, k := range keys {
+		args[i] = k
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get kvs: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		var v []byte
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, fmt.Errorf("get kvs: %w", err)
+		}
+		out[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("get kvs: %w", err)
+	}
+	return out, nil
 }

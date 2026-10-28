@@ -12,6 +12,7 @@ import (
 
 	"telfs/internal/config"
 	"telfs/internal/meta"
+	"telfs/internal/snapshot"
 	"telfs/internal/trash"
 )
 
@@ -72,6 +73,18 @@ func openMeta(ctx context.Context) (*meta.Store, error) {
 	return meta.Open(cfg.DBPath())
 }
 
+// markSettingChanged records that a setting kept only in meta_kv (no
+// journal op carries it) changed: on a format-2 filesystem a snapshot is
+// owed, so the change reaches the channel at the daemon's next policy
+// check (within a minute when mounted) or at the next mount — not with
+// whatever snapshot comes days later.
+func markSettingChanged(ctx context.Context, m *meta.Store, what string) error {
+	if err := snapshot.MarkDue(ctx, m, what); err != nil {
+		return fmt.Errorf("%s, but marking a snapshot owed failed: %w", what, err)
+	}
+	return nil
+}
+
 func cmdTrashEnable(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("trash enable", flag.ContinueOnError)
 	ttlStr := fs.String("ttl", "", "retention (e.g. 7d, 24h, 2h30m). Empty = 7 days (default).")
@@ -96,6 +109,9 @@ func cmdTrashEnable(ctx context.Context, args []string) error {
 	if err := mstore.SetTrashEnabled(ctx, true); err != nil {
 		return err
 	}
+	if err := markSettingChanged(ctx, mstore, "trash settings changed"); err != nil {
+		return err
+	}
 	// Bootstrap the dir up-front so the next mount doesn't need to do
 	// it. Also makes `trash status` see it immediately.
 	if _, err := trash.EnsureRootDir(ctx, mstore); err != nil {
@@ -116,6 +132,9 @@ func cmdTrashDisable(ctx context.Context, args []string) error {
 	}
 	defer mstore.Close()
 	if err := mstore.SetTrashEnabled(ctx, false); err != nil {
+		return err
+	}
+	if err := markSettingChanged(ctx, mstore, "trash settings changed"); err != nil {
 		return err
 	}
 	fmt.Println("Trash disabled. /.trash kept in place; run `telfs trash empty` to purge.")

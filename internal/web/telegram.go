@@ -624,6 +624,15 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 			bits = append(bits, fmt.Sprintf("download %d req/min", downN))
 		}
 	}
+	if len(bits) > 0 {
+		// Kept only in meta_kv (no journal op): a format-2 filesystem
+		// owes a snapshot so the change reaches the channel soon.
+		if err := snapshot.MarkDue(r.Context(), mstore, "rate-limit settings changed"); err != nil {
+			SetFlash(w, "error", "applied, but marking a snapshot owed failed: "+err.Error())
+			http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+			return
+		}
+	}
 	if len(bits) == 0 {
 		SetFlash(w, "ok", "no changes — both fields were empty")
 	} else {

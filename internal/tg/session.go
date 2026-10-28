@@ -79,6 +79,11 @@ type Session struct {
 // ErrReadOnly: a channel write was attempted on a read-only session.
 var ErrReadOnly = errors.New("read-only mount: TelFS does not write to the channel")
 
+// ErrMessageGone: the channel answered, and the message is not there —
+// deleted, never existed, or without a document. A failure to ask (the
+// network, Telegram) is a different error: retrying it may succeed.
+var ErrMessageGone = errors.New("tg: message deleted or without a document")
+
 // SetReadOnly turns the channel-write guard on or off.
 func (s *Session) SetReadOnly(on bool) { s.readOnly.Store(on) }
 
@@ -937,10 +942,10 @@ func (s *Session) getMessage(ctx context.Context, msgID int) (*tg.Message, error
 				return mm, nil
 			}
 		case *tg.MessageEmpty:
-			return nil, fmt.Errorf("message %d is empty (deleted?)", msgID)
+			return nil, fmt.Errorf("%w: message %d is empty (deleted?)", ErrMessageGone, msgID)
 		}
 	}
-	return nil, fmt.Errorf("message %d not found in channel", msgID)
+	return nil, fmt.Errorf("%w: message %d not found in channel", ErrMessageGone, msgID)
 }
 
 // fetchDocument retrieves the document attached to a channel message.
@@ -970,11 +975,11 @@ func (s *Session) refreshDocument(ctx context.Context, msgID int) (*tg.Document,
 	}
 	media, ok := msg.Media.(*tg.MessageMediaDocument)
 	if !ok {
-		return nil, fmt.Errorf("message %d has no document (media=%T)", msgID, msg.Media)
+		return nil, fmt.Errorf("%w: message %d has no document (media=%T)", ErrMessageGone, msgID, msg.Media)
 	}
 	doc, ok := media.Document.(*tg.Document)
 	if !ok {
-		return nil, fmt.Errorf("message %d document is %T (expected *tg.Document)", msgID, media.Document)
+		return nil, fmt.Errorf("%w: message %d document is %T (expected *tg.Document)", ErrMessageGone, msgID, media.Document)
 	}
 	s.docCache.Store(int64(msgID), &docCacheEntry{doc: doc, fetchedAt: time.Now()})
 	// Amortized expiry sweep: entries were TTL-checked on read but

@@ -174,21 +174,26 @@ func (s *Store) AdvanceJournalSeq(ctx context.Context, seq int64) error {
 	if seq <= 0 {
 		return nil
 	}
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE sqlite_sequence SET seq = ? WHERE name = 'journal' AND seq < ?`, seq, seq)
-		if err != nil {
-			return fmt.Errorf("advance journal seq: %w", err)
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			return nil
-		}
-		var cur sql.NullInt64
-		err = tx.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name = 'journal'`).Scan(&cur)
-		if errors.Is(err, sql.ErrNoRows) {
-			_, err = tx.ExecContext(ctx, `INSERT INTO sqlite_sequence(name, seq) VALUES ('journal', ?)`, seq)
-		}
-		return err
-	})
+	return s.WithTx(ctx, func(tx *sql.Tx) error { return advanceJournalSeqTx(ctx, tx, seq) })
+}
+
+func advanceJournalSeqTx(ctx context.Context, tx *sql.Tx, seq int64) error {
+	if seq <= 0 {
+		return nil
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE sqlite_sequence SET seq = ? WHERE name = 'journal' AND seq < ?`, seq, seq)
+	if err != nil {
+		return fmt.Errorf("advance journal seq: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+	var cur sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name = 'journal'`).Scan(&cur)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = tx.ExecContext(ctx, `INSERT INTO sqlite_sequence(name, seq) VALUES ('journal', ?)`, seq)
+	}
+	return err
 }
 
 // UnpostedUpTo counts the journal rows up to seq that have not been posted

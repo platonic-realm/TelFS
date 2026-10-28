@@ -134,13 +134,15 @@ func (m *Manager) setBaseline(counter int64) {
 // it never recorded is a baseline it can't vouch for. Cheap (one KV
 // read + one MAX(seq) + one atomic), fine on a 2 s poll.
 //
-// Format 2: always true. Its journal carries every change, chunk
-// placements included, so no snapshot is needed for the channel to be
-// complete — the caller's queue check (uploads + unposted journal) is
-// the whole condition.
+// Format 2: its journal carries every change, chunk placements
+// included, so no snapshot is needed for the channel to be complete —
+// the caller's queue check (uploads + unposted journal) is the whole
+// condition, unless a snapshot is owed (Owed: the local DB holds
+// something only a snapshot carries, or the channel's snapshot chain
+// describes another state).
 func (m *Manager) Synced(ctx context.Context) bool {
 	if m.Keys != nil {
-		return true
+		return Owed(ctx, m.Meta) == ""
 	}
 	lastCounter, have := m.baseline()
 	if !have || m.Meta.WriteCounter() != lastCounter {
@@ -247,7 +249,10 @@ func channelLostHint(err error) string {
 // `telfs init`, a secret change) and posts the anchor naming it.
 func (m *Manager) Once(ctx context.Context) error {
 	if m.Keys != nil {
-		_, err := m.once2(ctx)
+		id, aerr, err := m.once2(ctx)
+		if aerr != nil {
+			m.logger().Printf("[snapshot] snapshot %d is posted, its anchor is not (retried): %v", id, aerr)
+		}
 		return err
 	}
 	currentSeq, err := m.Meta.LastJournalSeq(ctx)

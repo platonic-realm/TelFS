@@ -2456,6 +2456,23 @@ func classify2(cm tg.ChannelMessage, keys *wire.Keys) (tg.ChannelMessage, string
 	return out, c.K
 }
 
+// journalPruneBound is the highest journal seq gc may prune up to (-1:
+// none). minRetained is the lowest seq of the retained snapshots the scan
+// saw. The anchored snapshot may lie beyond the scanned history (a newer
+// snapshot whose anchor post failed), and the journal after ITS seq is
+// what a recovery replays: bound by its recorded seq (anchorSeq), or
+// prune nothing when that is unknown (-1). As before, a scan that saw no
+// retained snapshot prunes nothing.
+func journalPruneBound(minRetained int64, anchorSnap int, anchorSeen bool, anchorSeq int64) int64 {
+	if minRetained < 0 || anchorSnap <= 0 || anchorSeen {
+		return minRetained
+	}
+	if anchorSeq < 0 {
+		return -1
+	}
+	return min(minRetained, anchorSeq)
+}
+
 // gcVersionsRefusal refuses gc on a filesystem with versions (spec v1
 // §2): v1 has no version-aware reclamation, and a chunk the live tree no
 // longer references may still be one a version needs — gc would call it
@@ -2538,10 +2555,17 @@ func cmdGC(ctx context.Context, args []string) error {
 		}
 	}
 	// Format 2: the snapshot the pinned anchor names is what a recovery
-	// starts from — never stale, even when a newer one exists.
+	// starts from — never stale, even when a newer one exists — and the
+	// journal after its seq is what the recovery replays.
+	anchorSeq := int64(-1) // unknown
 	if v, err := metaStore.GetKV(ctx, snapshot.KVAnchorSnapID); err == nil {
 		if id, err := strconv.Atoi(string(v)); err == nil {
 			anchorSnap = id
+		}
+	}
+	if v, err := metaStore.GetKV(ctx, snapshot.KVAnchorSnapSeq); err == nil {
+		if n, err := strconv.ParseInt(string(v), 10, 64); err == nil {
+			anchorSeq = n
 		}
 	}
 
@@ -2576,6 +2600,7 @@ func cmdGC(ctx context.Context, args []string) error {
 		}
 		var journalMsgs []jnlMsg
 		minRetainedSeq := int64(-1) // min Seq across our retained snapshots
+		anchorSeen := false         // the anchored snapshot was among the messages scanned
 		var versionMsgs []int       // version messages (the registry may have lost them)
 		ageCutoff := time.Now().Add(-*minAge).Unix()
 		fmt.Printf("Scanning channel (up to %d pages of 100 messages)…\n", *pages)
@@ -2625,6 +2650,9 @@ func cmdGC(ctx context.Context, args []string) error {
 						minRetainedSeq = seq
 					}
 				}
+				if anchorSnap > 0 && cm.ID == anchorSnap {
+					anchorSeen = true
+				}
 				if cm.ID == currentSnap || (anchorSnap > 0 && cm.ID == anchorSnap) {
 					keepSnap(cm.SnapCap.Seq)
 					return nil
@@ -2662,6 +2690,14 @@ func cmdGC(ctx context.Context, args []string) error {
 		// to replay them. If the scan saw no retained snapshot of ours,
 		// prune nothing — those messages may be the only recovery
 		// record there is.
+		// The anchored snapshot may lie beyond the scanned history (a
+		// newer snapshot whose anchor post failed): the journal after its
+		// seq is still what a recovery replays. Bound by its recorded
+		// seq; when that is unknown, prune no journal at all.
+		if anchorSnap > 0 && !anchorSeen && anchorSeq < 0 {
+			fmt.Printf("The anchored snapshot (message %d) is beyond the scanned history and its seq is not recorded — no journal batch is pruned.\n", anchorSnap)
+		}
+		minRetainedSeq = journalPruneBound(minRetainedSeq, anchorSnap, anchorSeen, anchorSeq)
 		var staleJournal []int
 		if minRetainedSeq >= 0 {
 			for _, jm := range journalMsgs {

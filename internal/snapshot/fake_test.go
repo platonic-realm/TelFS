@@ -27,6 +27,9 @@ type fakeChannel struct {
 
 	failPin  bool
 	onUpload func(caption string) // runs once, before the next upload gets its id
+	// failDownload, when set for a message, is what downloading it
+	// returns (a network failure, say).
+	failDownload map[int]error
 
 	fullWalks  int   // WalkChannelMessages / …Exhaust calls (history scans)
 	afterWalks []int // WalkChannelMessagesAfter min ids
@@ -92,9 +95,15 @@ func (f *fakeChannel) UploadDocument(ctx context.Context, r io.Reader, filename,
 }
 
 func (f *fakeChannel) DownloadDocument(ctx context.Context, msgID int, w io.Writer) (int64, error) {
+	f.mu.Lock()
+	ferr := f.failDownload[msgID]
+	f.mu.Unlock()
+	if ferr != nil {
+		return 0, ferr
+	}
 	m, ok := f.get(msgID)
 	if !ok || !m.hasDoc {
-		return 0, fmt.Errorf("message %d not found in channel", msgID)
+		return 0, fmt.Errorf("%w: message %d not found in channel", tg.ErrMessageGone, msgID)
 	}
 	n, err := w.Write(m.body)
 	return int64(n), err

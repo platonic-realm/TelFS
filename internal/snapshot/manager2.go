@@ -129,9 +129,12 @@ func (m *Manager) step2(ctx context.Context, now time.Time) (Action, error) {
 		}
 	}
 	logger.Printf("[snapshot] taking a snapshot: %s", why)
-	id, err := m.once2(ctx)
+	id, aerr, err := m.once2(ctx)
 	if err != nil {
 		return act, err
+	}
+	if aerr != nil {
+		logger.Printf("[snapshot] snapshot %d is posted, its anchor is not (retried): %v", id, aerr)
 	}
 	m.dueSince = time.Time{}
 	logger.Printf("[snapshot] snapshot %d posted", id)
@@ -140,10 +143,11 @@ func (m *Manager) step2(ctx context.Context, now time.Time) (Action, error) {
 
 // once2 takes a format-2 snapshot, records it, prunes the local journal
 // it covers, posts the anchor naming it and applies retention. A failed
-// anchor is logged, not returned: the snapshot stands, the policy loop
-// posts the anchor later, and until then the previous anchor (whose
-// snapshot retention keeps) still recovers everything.
-func (m *Manager) once2(ctx context.Context) (int, error) {
+// anchor is returned apart (anchorErr), not as the error: the snapshot
+// stands, the policy loop posts the anchor later, and until then the
+// previous anchor (whose snapshot retention keeps) still recovers
+// everything.
+func (m *Manager) once2(ctx context.Context) (id int, anchorErr, err error) {
 	ch := m.ch()
 	// The journal boundary, read BEFORE the snapshot is taken: a batch
 	// holding an op the snapshot lacks is posted after this point, so
@@ -151,43 +155,116 @@ func (m *Manager) once2(ctx context.Context) (int, error) {
 	// uploads, whose ids are smaller than the snapshot's own.
 	after, err := ch.LatestMessageID(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("newest message id: %w", err)
+		return 0, nil, fmt.Errorf("newest message id: %w", err)
+	}
+	// The mark that a snapshot is owed, as it is before the snapshot is
+	// taken: only that mark is cleared by recording it (MarkDue makes
+	// every mark unique, so a change marked while this snapshot was
+	// being taken keeps its mark and gets the next one).
+	due, derr := m.Meta.GetKV(ctx, KVSnapDue)
+	if derr != nil && !errors.Is(derr, meta.ErrNotFound) {
+		return 0, nil, derr
 	}
 	snap, err := Take(ctx, m.Meta)
 	if err != nil {
-		return 0, fmt.Errorf("take: %w", err)
+		return 0, nil, fmt.Errorf("take: %w", err)
 	}
 	ts := time.Now().Unix()
 	body, err := m.Keys.SealMeta("snap", snap.Bytes)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	capt, err := m.Keys.SealCaption(wire.Caption{K: wire.KindSnapshot, Seq: snap.JournalSeq,
 		TS: ts, DBSz: int64(len(snap.Bytes))})
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	id, err := ch.UploadDocument(ctx, bytes.NewReader(body), wire.DocName, capt)
+	id, err = ch.UploadDocument(ctx, bytes.NewReader(body), wire.DocName, capt)
 	if err != nil {
-		return 0, fmt.Errorf("upload: %w", err)
+		return 0, nil, fmt.Errorf("upload: %w", err)
 	}
-	if err := putKVInts(ctx, m.Meta, kvInt64{KVCurrentMsgID, int64(id)}, kvInt64{KVCurrentJournalSeq, snap.JournalSeq},
-		kvInt64{KVLastSnapUnix, ts}, kvInt64{KVSnapJnlAfter, int64(after)}); err != nil {
-		return id, fmt.Errorf("record snapshot %d: %w", id, err)
-	}
-	if err := m.Meta.DeleteKV(ctx, KVSnapDue); err != nil && !errors.Is(err, meta.ErrNotFound) {
-		return id, err
+	// One transaction: a reader (an anchor being posted for a version)
+	// or a crash never sees this snapshot's id with the previous one's
+	// seq or journal boundary.
+	if err := m.Meta.UpdateKV(context.WithoutCancel(ctx), func(k *meta.KVTx) error {
+		for _, kv := range []struct {
+			key string
+			v   int64
+		}{{KVCurrentMsgID, int64(id)}, {KVCurrentJournalSeq, snap.JournalSeq}, {KVLastSnapUnix, ts}, {KVSnapJnlAfter, int64(after)}} {
+			if err := putInt(k, kv.key, kv.v); err != nil {
+				return err
+			}
+		}
+		if derr == nil {
+			now, err := k.Get(KVSnapDue)
+			if err == nil && bytes.Equal(now, due) {
+				return k.Delete(KVSnapDue)
+			}
+		}
+		return nil
+	}); err != nil {
+		return id, nil, fmt.Errorf("record snapshot %d: %w", id, err)
 	}
 	m.pruneLocalJournal(ctx, snap.JournalSeq)
 	logger := m.logger()
 	if _, err := PostAnchor(ctx, ch, m.Meta, m.Keys, logger.Printf); err != nil {
-		logger.Printf("[snapshot] snapshot %d is posted, its anchor is not (retried): %v", id, err)
+		anchorErr = err
 	}
 	if err := m.pruneRetention2(ctx, id); err != nil {
 		logger.Printf("[snapshot] retention prune: %v", err)
 	}
 	m.setBaseline(m.Meta.WriteCounter())
+	return id, anchorErr, nil
+}
+
+// SnapshotAndAnchor takes a format-2 snapshot and posts the anchor naming
+// it, and fails unless both are on the channel: for a command that makes
+// the local DB a new state the channel's anchor must not keep naming the
+// old one (`telfs snapshot restore`).
+func (m *Manager) SnapshotAndAnchor(ctx context.Context) (int, error) {
+	if m.Keys == nil {
+		return 0, errors.New("snapshot and anchor: format 2 only")
+	}
+	id, aerr, err := m.once2(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if aerr != nil {
+		return id, fmt.Errorf("snapshot %d is posted, the anchor naming it is not: %w", id, aerr)
+	}
 	return id, nil
+}
+
+// MarkDue records that a snapshot is owed: the local DB holds something
+// the channel's snapshot chain does not and no journal op carries (a
+// setting kept only in meta_kv). The daemon takes the snapshot at its
+// next policy check, the next mount at once; until it lands the
+// filesystem is not synced. Format 1 (its 5-minute cadence snapshots
+// whatever changed) is left alone. Each mark is unique (the time is
+// part of it), so a snapshot taken while a mark is being made never
+// clears the newer mark.
+func MarkDue(ctx context.Context, m *meta.Store, reason string) error {
+	if f, err := m.Format(ctx); err != nil || f != 2 {
+		return err
+	}
+	return m.PutKV(ctx, KVSnapDue, []byte(fmt.Sprintf("%s (%s)", reason, time.Now().UTC().Format(time.RFC3339Nano))))
+}
+
+// Owed says why the channel does not describe the local DB of a format-2
+// filesystem until a snapshot is taken ("" when it does): snap_due is set
+// (`snapshot restore` whose own snapshot failed, a rebuild from captions,
+// a setting change).
+func Owed(ctx context.Context, m *meta.Store) string {
+	v, err := m.GetKV(ctx, KVSnapDue)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		return ""
+	case err != nil:
+		return "the snapshot state can't be read: " + err.Error()
+	case len(v) == 0:
+		return "a snapshot is due"
+	}
+	return "a snapshot is due: " + string(v)
 }
 
 // pruneRetention2 keeps the newest Retention snapshots from the local

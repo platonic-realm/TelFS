@@ -136,13 +136,23 @@ func FindLatestSnapshot2(ctx context.Context, ch Channel, keys *wire.Keys) (*Fou
 	return found, err
 }
 
-// DownloadSnapshot2 fetches and decrypts a snapshot body (gzipped DB).
+// ErrSnapshotUnreadable: a snapshot message was downloaded and does not
+// open under the filesystem's keys (damaged, or not a snapshot).
+var ErrSnapshotUnreadable = errors.New("the snapshot does not decrypt")
+
+// DownloadSnapshot2 fetches and decrypts a snapshot body (gzipped DB). A
+// message that is gone wraps tg.ErrMessageGone, one that does not open
+// ErrSnapshotUnreadable; anything else is a failure to fetch it.
 func DownloadSnapshot2(ctx context.Context, ch Channel, keys *wire.Keys, msgID int) ([]byte, error) {
 	var buf bytes.Buffer
 	if _, err := ch.DownloadDocument(ctx, msgID, &buf); err != nil {
 		return nil, fmt.Errorf("download snapshot %d: %w", msgID, err)
 	}
-	return keys.OpenMeta("snap", buf.Bytes())
+	db, err := keys.OpenMeta("snap", buf.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("%w: snapshot %d: %w", ErrSnapshotUnreadable, msgID, err)
+	}
+	return db, nil
 }
 
 // journalBody2 is the plaintext of a format-2 journal batch.
@@ -307,6 +317,10 @@ func loadSnapIDs(ctx context.Context, m *meta.Store) []int {
 	if err != nil {
 		return nil
 	}
+	return parseSnapIDs(v)
+}
+
+func parseSnapIDs(v []byte) []int {
 	var out []int
 	for _, f := range strings.Split(string(v), ",") {
 		if n, err := strconv.Atoi(strings.TrimSpace(f)); err == nil && n > 0 {
@@ -316,22 +330,35 @@ func loadSnapIDs(ctx context.Context, m *meta.Store) []int {
 	return out
 }
 
-func storeSnapIDs(ctx context.Context, m *meta.Store, ids []int) error {
+func formatSnapIDs(ids []int) []byte {
 	parts := make([]string, len(ids))
 	for i, id := range ids {
 		parts[i] = strconv.Itoa(id)
 	}
-	return m.PutKV(ctx, KVSnapMsgIDs, []byte(strings.Join(parts, ",")))
+	return []byte(strings.Join(parts, ","))
+}
+
+func storeSnapIDs(ctx context.Context, m *meta.Store, ids []int) error {
+	return m.PutKV(ctx, KVSnapMsgIDs, formatSnapIDs(ids))
 }
 
 // RecordSnapID appends a snapshot message id (recovery uses it to note
 // the snapshot it restored, which that snapshot can't contain itself).
 func RecordSnapID(ctx context.Context, m *meta.Store, id int) error {
-	ids := loadSnapIDs(ctx, m)
+	return m.UpdateKV(ctx, func(k *meta.KVTx) error { return RecordSnapIDTx(k, id) })
+}
+
+// RecordSnapIDTx is RecordSnapID inside a meta_kv transaction.
+func RecordSnapIDTx(k *meta.KVTx, id int) error {
+	v, err := k.Get(KVSnapMsgIDs)
+	if err != nil && !errors.Is(err, meta.ErrNotFound) {
+		return err
+	}
+	ids := parseSnapIDs(v)
 	for _, x := range ids {
 		if x == id {
 			return nil
 		}
 	}
-	return storeSnapIDs(ctx, m, append(ids, id))
+	return k.Put(KVSnapMsgIDs, formatSnapIDs(append(ids, id)))
 }

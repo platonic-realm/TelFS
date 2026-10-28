@@ -70,6 +70,10 @@ type statusSync struct {
 	PendingBytes      int64 `json:"pending_bytes"`
 	JournalUnposted   int64 `json:"journal_unposted"`
 	OldestPendingAgeS int64 `json:"oldest_pending_age_s"`
+	// SnapshotDue says why a snapshot is owed before the channel holds
+	// the filesystem (format 2: after `snapshot restore` whose own
+	// snapshot failed, a rebuild from captions, a setting change).
+	SnapshotDue string `json:"snapshot_due,omitempty"`
 }
 
 type statusSnapshot struct {
@@ -297,10 +301,19 @@ func (d *daemonCtl) status(ctx context.Context) statusV1 {
 		st.Sync.OldestPendingAgeS = int64(now.Sub(oldest).Seconds())
 	}
 	// Format 2 journals every change, chunk placements included, so an
-	// empty queue + a posted journal = the channel holds everything; a
-	// format-1 filesystem also needs a snapshot covering the DB.
-	st.Sync.Synced = d.readOnly || (open == 0 && unposted == 0 &&
-		(d.format == 2 || (d.snapMgr != nil && d.snapMgr.Synced(ctx))))
+	// empty queue + a posted journal = the channel holds everything,
+	// unless a snapshot is owed; a format-1 filesystem also needs a
+	// snapshot covering the DB.
+	snapOK := false
+	if d.format == 2 {
+		if !d.readOnly {
+			st.Sync.SnapshotDue = snapshot.Owed(ctx, d.meta)
+		}
+		snapOK = st.Sync.SnapshotDue == ""
+	} else {
+		snapOK = d.snapMgr != nil && d.snapMgr.Synced(ctx)
+	}
+	st.Sync.Synced = d.readOnly || (open == 0 && unposted == 0 && snapOK)
 	st.Staging = statusStaging{Dir: d.cfg.StagingDir(), PendingBytes: staged, CapBytes: capBytes, Blocked: blocked}
 	if d.version != "" {
 		// A version mount stages nothing; the key check and the use
@@ -357,9 +370,10 @@ func unixOrZero(t time.Time) int64 {
 type syncReply struct {
 	Token           uint64 `json:"token,omitempty"`
 	Synced          bool   `json:"synced"`
-	Phase           string `json:"phase,omitempty"` // uploads | journal
+	Phase           string `json:"phase,omitempty"` // uploads | journal | snapshot
 	PendingUploads  int    `json:"pending_uploads"`
 	JournalUnposted int64  `json:"journal_unposted"`
+	SnapshotDue     string `json:"snapshot_due,omitempty"`
 	Error           string `json:"error,omitempty"`
 }
 
@@ -392,6 +406,13 @@ func (d *daemonCtl) syncCheck(ctx context.Context, t *syncTok) syncReply {
 		}
 		return syncReply{Phase: "journal", JournalUnposted: n}
 	}
+	// A snapshot owed (format 2): the channel's snapshot chain does not
+	// describe this DB until the policy loop has posted one.
+	if d.format == 2 {
+		if why := snapshot.Owed(ctx, d.meta); why != "" {
+			return syncReply{Phase: "snapshot", SnapshotDue: why}
+		}
+	}
 	return syncReply{Synced: true}
 }
 
@@ -409,7 +430,7 @@ func (d *daemonCtl) handler() http.Handler {
 	// GET /sync: synced right now (everything, not just a barrier).
 	mux.HandleFunc("GET /sync", func(w http.ResponseWriter, r *http.Request) {
 		st := d.status(r.Context())
-		writeJSON(w, http.StatusOK, syncReply{Synced: st.Sync.Synced, PendingUploads: st.Sync.PendingUploads, JournalUnposted: st.Sync.JournalUnposted})
+		writeJSON(w, http.StatusOK, syncReply{Synced: st.Sync.Synced, PendingUploads: st.Sync.PendingUploads, JournalUnposted: st.Sync.JournalUnposted, SnapshotDue: st.Sync.SnapshotDue})
 	})
 	mux.HandleFunc("POST /sync/begin", func(w http.ResponseWriter, r *http.Request) {
 		if d.format != 2 {
@@ -532,7 +553,12 @@ func offlineStatus(ctx context.Context, cfg *config.Config) (statusV1, error) {
 	defer m.Close()
 	fillFromDB(ctx, &st, m)
 	st.Sync.JournalUnposted, _ = m.UnpostedUpTo(ctx, 1<<62)
-	st.Sync.Synced = files == 0 && st.Sync.JournalUnposted == 0 && (st.Format == 2 || st.Snapshot.JournalOpsSince == 0)
+	snapOK := st.Snapshot.JournalOpsSince == 0
+	if st.Format == 2 {
+		st.Sync.SnapshotDue = snapshot.Owed(ctx, m)
+		snapOK = st.Sync.SnapshotDue == ""
+	}
+	st.Sync.Synced = files == 0 && st.Sync.JournalUnposted == 0 && snapOK
 	return st, nil
 }
 
@@ -620,6 +646,9 @@ func cmdSync(ctx context.Context, args []string) error {
 			return err
 		}
 		if !rep.Synced {
+			if rep.SnapshotDue != "" {
+				return fmt.Errorf("%w: %d upload(s) pending, %d journal op(s) unposted; %s", errNotSynced, rep.PendingUploads, rep.JournalUnposted, rep.SnapshotDue)
+			}
 			return fmt.Errorf("%w: %d upload(s) pending, %d journal op(s) unposted", errNotSynced, rep.PendingUploads, rep.JournalUnposted)
 		}
 		fmt.Println("synced")

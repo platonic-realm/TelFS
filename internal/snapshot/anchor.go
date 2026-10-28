@@ -26,13 +26,20 @@ const (
 	// KVAnchorSnapID is the snapshot that anchor names. Retention and
 	// gc never delete it.
 	KVAnchorSnapID = "anchor_snap_id"
+	// KVAnchorSnapSeq is that snapshot's journal seq: gc keeps every
+	// journal batch after it, even when the snapshot itself lies beyond
+	// the history it scans. Missing on DBs from before it was recorded.
+	KVAnchorSnapSeq = "anchor_snap_seq"
 	// KVSnapJnlAfter is the newest snapshot's journal boundary (the
 	// anchor's jnl_after): the channel's newest message id read just
 	// before the snapshot was taken. Missing on snapshots from before v1.
 	KVSnapJnlAfter = "snap_jnl_after"
 	// KVSnapDue, when set, says the channel's snapshot chain does not
-	// describe the local DB (e.g. after `telfs snapshot restore`): the
-	// next mount takes a snapshot at once. Its value is the reason.
+	// describe the local DB (after `telfs snapshot restore` whose own
+	// snapshot failed, a rebuild from captions, a setting that only a
+	// snapshot carries): the daemon takes a snapshot at its next policy
+	// check, the next mount at once, and until then the filesystem is
+	// not synced. Its value is the reason (unique per mark, see MarkDue).
 	KVSnapDue = "snap_due"
 )
 
@@ -108,41 +115,50 @@ func putKVInt(ctx context.Context, m *meta.Store, key string, n int64) error {
 	return m.PutKV(ctx, key, []byte(strconv.FormatInt(n, 10)))
 }
 
-type kvInt64 struct {
-	key string
-	v   int64
+func putInt(k *meta.KVTx, key string, n int64) error {
+	return k.Put(key, []byte(strconv.FormatInt(n, 10)))
 }
 
-func putKVInts(ctx context.Context, m *meta.Store, kvs ...kvInt64) error {
-	for _, kv := range kvs {
-		if err := putKVInt(ctx, m, kv.key, kv.v); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// anchorFromDB builds the anchor for the snapshot recorded in m.
-func anchorFromDB(ctx context.Context, m *meta.Store, fsUUID string) (wire.Anchor, error) {
-	a := wire.Anchor{V: wire.AnchorVersionV1, FS: fsUUID, Versions: []wire.AnchorVersion{}}
-	a.SnapMsg = int(kvInt(ctx, m, KVCurrentMsgID))
-	if a.SnapMsg <= 0 {
-		return a, errors.New("anchor: no snapshot recorded")
-	}
-	if _, err := m.GetKV(ctx, KVSnapJnlAfter); err != nil {
-		return a, fmt.Errorf("anchor: snapshot %d has no journal boundary recorded", a.SnapMsg)
-	}
-	a.JnlAfter = int(kvInt(ctx, m, KVSnapJnlAfter))
-	a.SnapSeq = kvInt(ctx, m, KVCurrentJournalSeq)
-	a.SnapTS = kvInt(ctx, m, KVLastSnapUnix)
-	vs, err := LoadVersions(ctx, m)
+func parseInt(v []byte) int64 {
+	n, err := strconv.ParseInt(string(v), 10, 64)
 	if err != nil {
-		return a, err
+		return 0
+	}
+	return n
+}
+
+// anchorFromDB builds the anchor for the snapshot recorded in m. The
+// record and the registry are read in one statement: a snapshot being
+// recorded at the same moment is seen whole or not at all (an anchor
+// naming the new snapshot with the old one's seq would make a recovery
+// replay ops the snapshot already holds). raw is the registry value
+// read, for PostAnchor's check that the anchor still lists it.
+func anchorFromDB(ctx context.Context, m *meta.Store, fsUUID string) (a wire.Anchor, raw []byte, err error) {
+	a = wire.Anchor{V: wire.AnchorVersionV1, FS: fsUUID, Versions: []wire.AnchorVersion{}}
+	kv, err := m.GetKVs(ctx, KVCurrentMsgID, KVSnapJnlAfter, KVCurrentJournalSeq, KVLastSnapUnix, KVVersions)
+	if err != nil {
+		return a, nil, err
+	}
+	a.SnapMsg = int(parseInt(kv[KVCurrentMsgID]))
+	if a.SnapMsg <= 0 {
+		return a, nil, errors.New("anchor: no snapshot recorded")
+	}
+	jnl, ok := kv[KVSnapJnlAfter]
+	if !ok {
+		return a, nil, fmt.Errorf("anchor: snapshot %d has no journal boundary recorded", a.SnapMsg)
+	}
+	a.JnlAfter = int(parseInt(jnl))
+	a.SnapSeq = parseInt(kv[KVCurrentJournalSeq])
+	a.SnapTS = parseInt(kv[KVLastSnapUnix])
+	raw = kv[KVVersions]
+	vs, err := DecodeVersions(raw)
+	if err != nil {
+		return a, nil, err
 	}
 	if vs != nil {
 		a.Versions = vs
 	}
-	return a, nil
+	return a, raw, nil
 }
 
 // anchorMu serializes PostAnchor in this process: the snapshot policy and
@@ -163,7 +179,7 @@ var anchorMu sync.Mutex
 func PostAnchor(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys, logf func(string, ...any)) (int, error) {
 	anchorMu.Lock()
 	defer anchorMu.Unlock()
-	a, err := anchorFromDB(ctx, m, keys.FSUUID)
+	a, _, err := anchorFromDB(ctx, m, keys.FSUUID)
 	if err != nil {
 		return 0, err
 	}
@@ -179,14 +195,22 @@ func PostAnchor(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys,
 		_ = ch.DeleteChannelMessages(ctx, id) // an unpinned anchor finds nothing
 		return 0, fmt.Errorf("pin anchor: %w", err)
 	}
-	prev := int(kvInt(ctx, m, KVAnchorMsgID))
-	if err := putKVInt(ctx, m, KVAnchorMsgID, int64(id)); err != nil {
-		return id, err
-	}
-	if err := putKVInt(ctx, m, KVAnchorSnapID, int64(a.SnapMsg)); err != nil {
-		return id, err
-	}
-	if err := m.DeleteKV(ctx, KVAnchorDue); err != nil && !errors.Is(err, meta.ErrNotFound) {
+	// The anchor is pinned: record it, whatever ctx does now (an
+	// unrecorded anchor would be posted again and the old one kept).
+	bg := context.WithoutCancel(ctx)
+	prev := int(kvInt(bg, m, KVAnchorMsgID))
+	if err := m.UpdateKV(bg, func(k *meta.KVTx) error {
+		if err := putInt(k, KVAnchorMsgID, int64(id)); err != nil {
+			return err
+		}
+		if err := putInt(k, KVAnchorSnapID, int64(a.SnapMsg)); err != nil {
+			return err
+		}
+		if err := putInt(k, KVAnchorSnapSeq, a.SnapSeq); err != nil {
+			return err
+		}
+		return k.Delete(KVAnchorDue)
+	}); err != nil {
 		return id, err
 	}
 	old := map[int]bool{}
