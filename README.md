@@ -357,8 +357,15 @@ telfs unmount /mnt/daily
   0 once the version is on the channel; 4 when the sync did not finish
   within `--timeout` (nothing was posted); 5 without a running mount; 6
   when Telegram failed. Names: 1–64 characters of `A-Z a-z 0-9 . _ -`,
-  unique (a duplicate exits 1). Changes made *while* create runs may be
-  caught half-way — create a version once the writer (rsync) is done.
+  unique (a duplicate exits 1). The database is copied only while no
+  upload is in flight and checked: a version never holds a file with
+  its size but without all its chunks (no journal follows a version to
+  fill them in later). If writes are still landing, create syncs again
+  and takes it again — up to 5 times, within `--timeout` — and then
+  exits 4 naming the files, with nothing posted. Create a version once
+  the writer (rsync) is done. A create stopped while it syncs (SIGTERM,
+  ^C) gives its request up, so a retry of the same name is not refused;
+  one that is posting finishes on the mount's side.
 - **list** asks the running mount, else reads the local registry
   (read-only, no secret). `--json` prints `{"versions": [{name, msg_id,
   created_unix, seq, size, sha256, mountpoint}]}`, oldest first;
@@ -370,8 +377,10 @@ telfs unmount /mnt/daily
 - **mount --readonly --version NAME** downloads the version once into
   `<profile>/versions/NAME.sqlite` (kept and reused while it matches the
   registry's size and SHA-256), opens it immutable and serves it
-  read-only, with its own cache (`NAME.cache/`), lock and control
-  socket. It writes nothing to the channel, nor to the live
+  read-only, with its own cache (`NAME.cache/`, emptied when it was
+  filled for another version of that name), lock and control socket. A
+  version that does not decrypt or is not the database the registry
+  describes exits 7 (an integrity problem: a restart would not help). It writes nothing to the channel, nor to the live
   filesystem's database, staging directory or cache, and the
   one-writer guard ignores it (its mount source ends in `:v=NAME`): it
   runs next to the live read-write mount, and never blocks the boot

@@ -49,6 +49,12 @@ type Snapshot struct {
 // copy. For metadata-sized DBs (typically < 100 MiB) this is well under
 // a second; concurrent writers block briefly.
 func Take(ctx context.Context, m *meta.Store) (*Snapshot, error) {
+	return takeChecked(ctx, m, nil)
+}
+
+// takeChecked is Take with check run on the uncompressed copy before it
+// is compressed (nil: none); a check error fails the take.
+func takeChecked(ctx context.Context, m *meta.Store, check func(ctx context.Context, path string) error) (*Snapshot, error) {
 	uuid, err := m.FSUUID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: fetch fs_uuid: %w", err)
@@ -70,6 +76,11 @@ func Take(ctx context.Context, m *meta.Store) (*Snapshot, error) {
 	// as a string literal in the SQL.
 	if _, err := m.DB().ExecContext(ctx, fmt.Sprintf("VACUUM INTO %s", sqlString(tmpPath))); err != nil {
 		return nil, fmt.Errorf("snapshot: VACUUM INTO: %w", err)
+	}
+	if check != nil {
+		if err := check(ctx, tmpPath); err != nil {
+			return nil, fmt.Errorf("snapshot: check the copy: %w", err)
+		}
 	}
 
 	src, err := os.Open(tmpPath)

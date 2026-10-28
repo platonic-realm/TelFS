@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,11 +54,29 @@ func ValidateVersionName(name string) error {
 	return nil
 }
 
+// readErr remembers the error its reader failed with (io.EOF aside).
+type readErr struct {
+	r   io.Reader
+	err error
+}
+
+func (r *readErr) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
+}
+
 // Errors of the version operations.
 var (
-	ErrVersionExists  = errors.New("a version with this name already exists")
-	ErrNoVersion      = errors.New("no version with this name")
-	ErrVersionFormat1 = errors.New("versions need a format-2 filesystem (format 1 keeps working as in v0.22, without versions; move the data to a new filesystem made by `telfs init`)")
+	// ErrVersionIntegrity: a downloaded version does not decrypt, or is
+	// not the DB the registry describes (size, SHA-256, no filesystem id)
+	// — an integrity problem (exit 7), not a reason to retry.
+	ErrVersionIntegrity = errors.New("the version's data is damaged or not what the registry says")
+	ErrVersionExists    = errors.New("a version with this name already exists")
+	ErrNoVersion        = errors.New("no version with this name")
+	ErrVersionFormat1   = errors.New("versions need a format-2 filesystem (format 1 keeps working as in v0.22, without versions; move the data to a new filesystem made by `telfs init`)")
 	// ErrChannel wraps a failure of Telegram or the channel (exit 6 in
 	// the v1 interface).
 	ErrChannel = errors.New("Telegram or the channel failed")
@@ -117,14 +136,114 @@ func FindVersion(vs []wire.AnchorVersion, name string) (wire.AnchorVersion, bool
 // versionsMu serializes registry changes in this process.
 var versionsMu sync.Mutex
 
+// UploadGate is the part of the daemon's upload pool a version looks at:
+// registrations are numbered (chunk.UploadPool), and a file's size is
+// committed only AFTER its chunks' uploads were registered.
+type UploadGate interface {
+	LastRegistered() uint64
+	OpenUpTo(seq uint64) int
+}
+
+// ErrVersionIncomplete: the version could not be taken complete — uploads
+// were in flight, or files have a size without all their chunks. Nothing
+// was posted; the caller syncs again and retries (spec v1 §3: exit 4 when
+// it never comes out complete).
+var ErrVersionIncomplete = errors.New("the version would not be complete")
+
+// IncompleteError says why a version was not taken.
+type IncompleteError struct {
+	Open  int      // uploads in flight when (or while) it was taken
+	Files []string // files whose chunks do not cover their size (the first ones)
+	Count int      // how many such files
+}
+
+func (e *IncompleteError) Error() string {
+	if e.Count > 0 {
+		more := ""
+		if e.Count > len(e.Files) {
+			more = fmt.Sprintf(" and %d more", e.Count-len(e.Files))
+		}
+		return fmt.Sprintf("%v: %d file(s) have a size without all their chunks (%s%s)", ErrVersionIncomplete, e.Count, strings.Join(e.Files, ", "), more)
+	}
+	return fmt.Sprintf("%v: %d upload(s) in flight while it was taken", ErrVersionIncomplete, e.Open)
+}
+
+func (e *IncompleteError) Unwrap() error { return ErrVersionIncomplete }
+
+// incompleteListed is how many incomplete files an IncompleteError names.
+const incompleteListed = 20
+
+// takeVersion takes the version's snapshot only while nothing is in
+// flight, and checks the copy: a version is immutable, and no journal
+// follows it to fill in a chunk that lands later — a file caught with
+// its new size and without (all) its new chunks would read as lost data,
+// or as old blocks under a new size, forever. gate nil: no upload pool
+// (the check of the copy still runs).
+func takeVersion(ctx context.Context, m *meta.Store, gate UploadGate) (*Snapshot, error) {
+	var r0 uint64
+	if gate != nil {
+		r0 = gate.LastRegistered()
+		if open := gate.OpenUpTo(r0); open > 0 {
+			return nil, &IncompleteError{Open: open}
+		}
+	}
+	var inc *IncompleteError
+	snap, err := takeChecked(ctx, m, func(ctx context.Context, path string) error {
+		c, err := meta.OpenReadOnly(path, true)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		reps, err := c.ScanPartialFiles(ctx, nil)
+		if err != nil {
+			return err
+		}
+		dirs := map[int64]string{}
+		for _, r := range reps {
+			if r.NewSize >= r.OldSize {
+				continue // stray rows past the end: nothing is missing
+			}
+			if inc == nil {
+				inc = &IncompleteError{}
+			}
+			inc.Count++
+			if len(inc.Files) < incompleteListed {
+				p, ok := c.PathOfCached(ctx, r.Ino, dirs)
+				if !ok {
+					p = fmt.Sprintf("(ino %d)", r.Ino)
+				}
+				inc.Files = append(inc.Files, p)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// A registration made while the copy was taken: a file's new size
+	// may be in it without the chunk that upload places.
+	if gate != nil {
+		if now := gate.LastRegistered(); now != r0 {
+			return nil, &IncompleteError{Open: gate.OpenUpTo(now)}
+		}
+	}
+	if inc != nil {
+		return nil, inc
+	}
+	return snap, nil
+}
+
 // CreateVersion takes a snapshot of m and posts it as version name: the
 // sealed body, a caption of kind "v", then the registry entry and an
 // anchor listing it. The caller has synced first (everything written
 // before the request is on the channel), so the version and the channel
-// agree. The version is on the channel when this returns without error;
-// warn is non-empty when the anchor could not be re-posted (it is marked
-// due and the daemon's policy loop retries it).
-func CreateVersion(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys, name string, logf func(string, ...any)) (v wire.AnchorVersion, warn string, err error) {
+// agree. The snapshot is taken only while no upload is in flight (gate)
+// and no file of it lacks chunks; otherwise nothing is posted and the
+// error is an *IncompleteError (ErrVersionIncomplete). The version is on
+// the channel when this returns without error; warn is non-empty when the
+// anchor could not be re-posted (it is marked due and the daemon's policy
+// loop retries it).
+func CreateVersion(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys, name string, gate UploadGate, logf func(string, ...any)) (v wire.AnchorVersion, warn string, err error) {
 	if err := ValidateVersionName(name); err != nil {
 		return v, "", err
 	}
@@ -142,8 +261,11 @@ func CreateVersion(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Ke
 	if _, dup := FindVersion(vs, name); dup {
 		return v, "", fmt.Errorf("%w: %q (telfs versions list)", ErrVersionExists, name)
 	}
-	snap, err := Take(ctx, m)
+	snap, err := takeVersion(ctx, m, gate)
 	if err != nil {
+		if errors.Is(err, ErrVersionIncomplete) {
+			return v, "", err
+		}
 		return v, "", fmt.Errorf("take: %w", err)
 	}
 	v = wire.AnchorVersion{Name: name, Seq: snap.JournalSeq, Created: time.Now().Unix(),
@@ -157,12 +279,33 @@ func CreateVersion(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Ke
 		return v, "", fmt.Errorf("%w: upload version %q: %w", ErrChannel, name, err)
 	}
 	v.Msg = id
-	if err := StoreVersions(ctx, m, append(vs, v)); err != nil {
+	// The version is on the channel: record it whatever ctx does now
+	// (a stop must not leave an unlisted version message, which would
+	// block gc for good), with the mark that the anchor does not list it
+	// yet IN THE SAME transaction — a stop or crash before the anchor is
+	// posted leaves the mark, and the policy loop posts it.
+	bg := context.WithoutCancel(ctx)
+	if err := storeVersionsDue(bg, m, append(vs, v)); err != nil {
 		// Unrecorded, the message would be a version nobody lists.
-		_ = ch.DeleteChannelMessages(ctx, id)
+		_ = ch.DeleteChannelMessages(bg, id)
 		return v, "", fmt.Errorf("record version %q: %w", name, err)
 	}
-	return v, repostAnchor(ctx, ch, m, keys, logf), nil
+	return v, repostAnchor(bg, ch, m, keys, logf), nil
+}
+
+// storeVersionsDue replaces the registry and marks the anchor due, in one
+// transaction (PostAnchor clears the mark once an anchor lists it).
+func storeVersionsDue(ctx context.Context, m *meta.Store, vs []wire.AnchorVersion) error {
+	b, err := EncodeVersions(vs)
+	if err != nil {
+		return err
+	}
+	return m.UpdateKV(ctx, func(k *meta.KVTx) error {
+		if err := k.Put(KVVersions, b); err != nil {
+			return err
+		}
+		return k.Put(KVAnchorDue, []byte("the version list changed"))
+	})
 }
 
 // DeleteVersion deletes version name: its message, then its registry
@@ -187,18 +330,18 @@ func DeleteVersion(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Ke
 			kept = append(kept, x)
 		}
 	}
-	if err := StoreVersions(ctx, m, kept); err != nil {
+	bg := context.WithoutCancel(ctx)
+	if err := storeVersionsDue(bg, m, kept); err != nil {
 		return v, "", fmt.Errorf("version %q: its message is deleted, the registry is not updated: %w", name, err)
 	}
-	return v, repostAnchor(ctx, ch, m, keys, logf), nil
+	return v, repostAnchor(bg, ch, m, keys, logf), nil
 }
 
-// repostAnchor posts an anchor carrying the current registry; on failure
-// it marks the anchor due (the policy loop re-posts it) and returns the
-// warning to show.
+// repostAnchor posts an anchor carrying the current registry (the caller
+// has marked it due; a successful post clears the mark) and returns the
+// warning to show when it fails (the policy loop re-posts it).
 func repostAnchor(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys, logf func(string, ...any)) string {
 	if _, err := PostAnchor(ctx, ch, m, keys, logf); err != nil {
-		_ = m.PutKV(ctx, KVAnchorDue, []byte("the version list changed"))
 		return fmt.Sprintf("the pinned anchor does not list the change yet (the mount re-posts it): %v", err)
 	}
 	return ""
@@ -243,7 +386,7 @@ func DownloadVersion(ctx context.Context, ch Channel, keys *wire.Keys, v wire.An
 	}
 	gz, err := keys.OpenVersion(buf.Bytes())
 	if err != nil {
-		return fmt.Errorf("version %q (message %d): %w", v.Name, v.Msg, err)
+		return fmt.Errorf("%w: version %q (message %d): %w", ErrVersionIntegrity, v.Name, v.Msg, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return err
@@ -255,12 +398,12 @@ func DownloadVersion(ctx context.Context, ch Channel, keys *wire.Keys, v wire.An
 	}
 	vm, err := meta.OpenReadOnly(tmp, true)
 	if err != nil {
-		return fmt.Errorf("version %q: %w", v.Name, err)
+		return fmt.Errorf("%w: version %q: %w", ErrVersionIntegrity, v.Name, err)
 	}
 	_, err = vm.FSUUID(ctx)
 	vm.Close()
 	if err != nil {
-		return fmt.Errorf("version %q: no filesystem id in the DB: %w", v.Name, err)
+		return fmt.Errorf("%w: version %q: no filesystem id in the DB: %w", ErrVersionIntegrity, v.Name, err)
 	}
 	for _, sidecar := range []string{dbPath + "-wal", dbPath + "-shm"} {
 		if err := os.Remove(sidecar); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -275,7 +418,7 @@ func DownloadVersion(ctx context.Context, ch Channel, keys *wire.Keys, v wire.An
 func writeGunzipped(gz []byte, path string, v wire.AnchorVersion) error {
 	gr, err := gzip.NewReader(bytes.NewReader(gz))
 	if err != nil {
-		return fmt.Errorf("gunzip: %w", err)
+		return fmt.Errorf("%w: gunzip: %w", ErrVersionIntegrity, err)
 	}
 	defer gr.Close()
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -283,18 +426,23 @@ func writeGunzipped(gz []byte, path string, v wire.AnchorVersion) error {
 		return err
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), gr)
+	rr := &readErr{r: gr}
+	n, err := io.Copy(io.MultiWriter(f, h), rr)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
+		if rr.err != nil {
+			// The gzip stream itself is damaged, not the local disk.
+			return fmt.Errorf("%w: gunzip: %w", ErrVersionIntegrity, rr.err)
+		}
 		return fmt.Errorf("write: %w", err)
 	}
 	if v.Size > 0 && n != v.Size {
-		return fmt.Errorf("the DB has %d bytes, the registry says %d", n, v.Size)
+		return fmt.Errorf("%w: the DB has %d bytes, the registry says %d", ErrVersionIntegrity, n, v.Size)
 	}
 	if v.SHA256 != "" && hex.EncodeToString(h.Sum(nil)) != v.SHA256 {
-		return errors.New("the DB's SHA-256 differs from the registry's")
+		return fmt.Errorf("%w: the DB's SHA-256 differs from the registry's", ErrVersionIntegrity)
 	}
 	return nil
 }

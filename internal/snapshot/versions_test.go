@@ -96,7 +96,7 @@ func TestCreateVersion(t *testing.T) {
 	f, _ := snapshotted(t)
 	oldAnchor := f.ch.kinds(f.keys, wire.KindAnchor)[0]
 	seq, _ := f.m.LastJournalSeq(f.ctx)
-	v, warn, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "daily-1", nil)
+	v, warn, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "daily-1", nil, nil)
 	if err != nil || warn != "" {
 		t.Fatalf("create: %v (warning %q)", err, warn)
 	}
@@ -170,10 +170,10 @@ func TestCreateVersion(t *testing.T) {
 
 	// A name is unique; a bad name posts nothing.
 	n := len(f.ch.idsDesc(0))
-	if _, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "daily-1", nil); !errors.Is(err, ErrVersionExists) {
+	if _, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "daily-1", nil, nil); !errors.Is(err, ErrVersionExists) {
 		t.Fatalf("duplicate: %v", err)
 	}
-	if _, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "a/b", nil); err == nil {
+	if _, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "a/b", nil, nil); err == nil {
 		t.Fatal("bad name accepted")
 	}
 	if got := len(f.ch.idsDesc(0)); got != n {
@@ -185,11 +185,11 @@ func TestCreateVersion(t *testing.T) {
 // listing go; the other versions stay.
 func TestDeleteVersion(t *testing.T) {
 	f, _ := snapshotted(t)
-	v1, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "one", nil)
+	v1, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "one", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v2, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "two", nil)
+	v2, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "two", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestDeleteVersion(t *testing.T) {
 func TestVersionAnchorRetry(t *testing.T) {
 	f, mgr := snapshotted(t)
 	f.ch.failPin = true
-	v, warn, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "weekly", nil)
+	v, warn, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "weekly", nil, nil)
 	if err != nil || warn == "" {
 		t.Fatalf("create with the pin refused: %v, warning %q", err, warn)
 	}
@@ -251,7 +251,7 @@ func TestVersionAnchorRetry(t *testing.T) {
 // restores is older than the version (its own registry is empty).
 func TestRecoveryRestoresVersionRegistry(t *testing.T) {
 	f, _ := snapshotted(t)
-	v, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "monthly", nil)
+	v, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "monthly", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestCreateVersionRefusesFormat1(t *testing.T) {
 	if err := f.m.PutKV(f.ctx, meta.KVFormat, []byte("1")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "x", nil); !errors.Is(err, ErrVersionFormat1) {
+	if _, _, err := CreateVersion(f.ctx, f.ch, f.m, f.keys, "x", nil, nil); !errors.Is(err, ErrVersionFormat1) {
 		t.Fatalf("format 1: %v", err)
 	}
 }

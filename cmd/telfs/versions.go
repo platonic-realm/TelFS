@@ -89,13 +89,41 @@ const (
 // versionJob is one `versions create` in the daemon: the sync barrier
 // first (advanced by the client's waits — nobody waiting, nothing
 // posted), then the post, which runs to its end on the daemon's context.
+// A post that finds uploads in flight or files without all their chunks
+// posts nothing and goes back to syncing (at most versionAttempts takes).
 type versionJob struct {
-	name    string
-	tok     *syncTok
-	created time.Time
-	state   string
-	rep     versionReply  // the result once done or failed
-	done    chan struct{} // closed when the post ends
+	name     string
+	tok      *syncTok
+	created  time.Time
+	state    string
+	rep      versionReply  // the result once done or failed
+	done     chan struct{} // closed when the post ends
+	attempts int           // takes that came out incomplete
+	// A job lives as long as a client waits for it (not by the clock):
+	// waiters is the number of /versions/wait calls running, lastSeen
+	// when one last started or ended, gone that the last one ended
+	// because its client went away.
+	waiters  int
+	lastSeen time.Time
+	gone     bool
+}
+
+// versionAttempts bounds the takes of one `versions create`: each one
+// that is not complete syncs again first; after the last the create
+// fails with exit 4, nothing posted.
+const versionAttempts = 5
+
+// versionIdle is how long a job no client waits for is kept (a client
+// polls without pause; one that has not come back for this long is gone).
+const versionIdle = 2 * time.Minute
+
+// abandoned: no client waits for the job, and the last one went away (or
+// none has come for versionIdle). A job being posted is never abandoned.
+func (j *versionJob) abandoned(now time.Time) bool {
+	if j.state == verPosting || j.waiters > 0 {
+		return false
+	}
+	return j.gone || now.Sub(j.lastSeen) > versionIdle
 }
 
 // versionsList is the body of GET /versions and of `versions list --json`.
@@ -137,6 +165,8 @@ func errKind(err error) string {
 		return "missing"
 	case errors.Is(err, snapshot.ErrVersionFormat1):
 		return "refused"
+	case errors.Is(err, snapshot.ErrVersionIncomplete):
+		return "incomplete"
 	}
 	return ""
 }
@@ -214,8 +244,12 @@ func (d *daemonCtl) versionCreate(w http.ResponseWriter, r *http.Request) {
 	if d.verJobs == nil {
 		d.verJobs = map[uint64]*versionJob{}
 	}
+	now := time.Now()
+	// Jobs no client waits for any more go (a create whose client was
+	// killed must not block its name, nor a long sync be purged while
+	// its client still waits).
 	for id, j := range d.verJobs {
-		if j.state != verPosting && time.Since(j.created) > time.Hour {
+		if j.abandoned(now) {
 			delete(d.verJobs, id)
 		}
 	}
@@ -228,8 +262,8 @@ func (d *daemonCtl) versionCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	d.verNext++
 	id := d.verNext
-	d.verJobs[id] = &versionJob{name: name, tok: &syncTok{reg: reg, created: time.Now()}, created: time.Now(),
-		state: verSyncing, done: make(chan struct{})}
+	d.verJobs[id] = &versionJob{name: name, tok: &syncTok{reg: reg, created: now}, created: now,
+		state: verSyncing, done: make(chan struct{}), lastSeen: now}
 	d.verMu.Unlock()
 	if d.poster != nil {
 		d.poster.Kick()
@@ -265,10 +299,39 @@ func (d *daemonCtl) advanceVersion(ctx context.Context, j *versionJob) versionRe
 	return versionReply{State: verPosting}
 }
 
+// uploadGate is the upload pool a version checks (nil without one).
+func (d *daemonCtl) uploadGate() snapshot.UploadGate {
+	if d.pool == nil {
+		return nil
+	}
+	return d.pool
+}
+
 // postVersion posts the version (snapshot, message, registry, anchor).
+// A take that was not complete posted nothing: the job syncs again — up
+// to the uploads registered by now — and takes it again.
 func (d *daemonCtl) postVersion(j *versionJob) {
-	v, warn, err := snapshot.CreateVersion(d.daemonCtx(), d.ch, d.meta, d.keys, j.name, d.logf)
+	v, warn, err := snapshot.CreateVersion(d.daemonCtx(), d.ch, d.meta, d.keys, j.name, d.uploadGate(), d.logf)
 	d.verMu.Lock()
+	var inc *snapshot.IncompleteError
+	if errors.As(err, &inc) && j.attempts+1 < versionAttempts {
+		j.attempts++
+		var reg uint64
+		if d.pool != nil {
+			reg = d.pool.LastRegistered()
+		}
+		j.tok = &syncTok{reg: reg, created: time.Now()}
+		j.state = verSyncing
+		d.verMu.Unlock()
+		d.logf("[versions] version %q not taken (%v) — syncing again (take %d of %d)", j.name, err, j.attempts+1, versionAttempts)
+		if d.poster != nil {
+			d.poster.Kick()
+		}
+		return
+	}
+	if inc != nil {
+		err = fmt.Errorf("%w (after %d takes)", err, versionAttempts)
+	}
 	if err != nil {
 		j.state = verFailed
 		j.rep = versionReply{State: verFailed, Error: err.Error(), Kind: errKind(err)}
@@ -297,6 +360,17 @@ func (d *daemonCtl) versionWait(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, versionReply{Error: "unknown or expired version token"})
 		return
 	}
+	d.verMu.Lock()
+	j.waiters++
+	j.lastSeen, j.gone = time.Now(), false
+	d.verMu.Unlock()
+	defer func() {
+		d.verMu.Lock()
+		j.waiters--
+		j.lastSeen = time.Now()
+		j.gone = r.Context().Err() != nil // the client went away mid-wait
+		d.verMu.Unlock()
+	}()
 	maxWait, err := time.ParseDuration(r.URL.Query().Get("max"))
 	if err != nil || maxWait <= 0 || maxWait > 5*time.Minute {
 		maxWait = 30 * time.Second
@@ -397,6 +471,36 @@ func versionCacheDir(cfg *config.Config, name string) string {
 	return filepath.Join(versionsDir(cfg), name+".cache")
 }
 
+// versionCacheID is what a version cache holds the chunks of: the
+// version's message and DB SHA-256 (a version deleted and made again
+// under the same name is another version).
+const versionCacheID = ".version"
+
+// prepareVersionCache returns version v's cache directory, emptied when
+// it was filled for another version of that name: the cache holds
+// plaintext by (inode, index) and is not re-checked on a hit.
+func prepareVersionCache(cfg *config.Config, v wire.AnchorVersion) (string, error) {
+	dir := versionCacheDir(cfg, v.Name)
+	id := fmt.Sprintf("%d %s %d\n", v.Msg, v.SHA256, v.Size)
+	if b, err := os.ReadFile(filepath.Join(dir, versionCacheID)); err == nil && string(b) == id {
+		return dir, nil
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return "", fmt.Errorf("version cache %s: %w", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("version cache %s: %w", dir, err)
+	}
+	tmp := filepath.Join(dir, versionCacheID+".tmp")
+	if err := os.WriteFile(tmp, []byte(id), 0o600); err != nil {
+		return "", fmt.Errorf("version cache %s: %w", dir, err)
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, versionCacheID)); err != nil {
+		return "", fmt.Errorf("version cache %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
 // removeVersionCopy deletes a deleted version's local copy and cache.
 func removeVersionCopy(cfg *config.Config, name string) {
 	db := versionDBPath(cfg, name)
@@ -429,8 +533,11 @@ func replyErr(rep versionReply) error {
 	if rep.Error == "" {
 		return nil
 	}
-	if rep.Kind == "telegram" {
+	switch rep.Kind {
+	case "telegram":
 		return fmt.Errorf("%w: %s", errTelegram, strings.TrimPrefix(rep.Error, snapshot.ErrChannel.Error()+": "))
+	case "incomplete":
+		return fmt.Errorf("%w: %s — no version was created", errNotSynced, rep.Error)
 	}
 	return errors.New(rep.Error)
 }
@@ -472,6 +579,18 @@ func cmdVersionsCreate(ctx context.Context, args []string) error {
 	}
 	long := ctlClient(cfg, 0)
 	posting := false
+	// Stopped (SIGTERM, ^C) while syncing: give the job up, so a retry
+	// of the same name is not answered "being created". A fresh context:
+	// ctx is the one that ended.
+	defer func() {
+		if ctx.Err() == nil || posting {
+			return
+		}
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var rep versionReply
+		_ = ctlCall(cctx, short, cfg, http.MethodPost, fmt.Sprintf("/versions/cancel?token=%d", begin.Token), &rep)
+	}()
 	for {
 		poll := 30 * time.Second
 		if !deadline.IsZero() && !posting {
@@ -499,6 +618,9 @@ func cmdVersionsCreate(ctx context.Context, args []string) error {
 		}
 		var rep versionReply
 		if err := ctlCall(ctx, long, cfg, http.MethodGet, fmt.Sprintf("/versions/wait?token=%d&max=%s", begin.Token, poll), &rep); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return err
 		}
 		switch {
@@ -512,6 +634,12 @@ func cmdVersionsCreate(ctx context.Context, args []string) error {
 		case rep.State == verPosting && !posting:
 			posting = true
 			fmt.Fprintln(os.Stderr, "Synced. Posting the version…")
+		case rep.State == verSyncing && posting:
+			// The take found uploads in flight or files without all
+			// their chunks: nothing posted, syncing again (--timeout
+			// applies again).
+			posting = false
+			fmt.Fprintln(os.Stderr, "Writes were still landing — syncing again before the version is taken…")
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()

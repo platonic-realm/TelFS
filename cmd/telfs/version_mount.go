@@ -85,6 +85,19 @@ func versionToMount(ctx context.Context, cfg *config.Config, name string) (*meta
 	return live, v, fsUUID, nil
 }
 
+// versionDownloadErr gives a failed version download its exit code: 7
+// when the version is damaged or not what the registry says (a restart
+// would download the same), 6 when Telegram or the network failed.
+func versionDownloadErr(err error) error {
+	switch {
+	case errors.Is(err, snapshot.ErrVersionIntegrity):
+		return fmt.Errorf("%w: %w", errIntegrity, err)
+	case errors.Is(err, snapshot.ErrChannel) || retriable(err):
+		return fmt.Errorf("%w: %w", errTelegram, err)
+	}
+	return err
+}
+
 // mountVersion is `telfs mount --readonly --version NAME <mp>` (spec v1
 // §2): the version's DB is downloaded into <profile>/versions/NAME.sqlite
 // (kept, and reused while it matches the registry's size and SHA-256),
@@ -153,10 +166,7 @@ func mountVersion(signalCtx context.Context, cfg *config.Config, o versionMountO
 			if errors.Is(err, context.Canceled) {
 				return nil
 			}
-			if errors.Is(err, snapshot.ErrChannel) || retriable(err) {
-				return fmt.Errorf("%w: %w", errTelegram, err)
-			}
-			return err
+			return versionDownloadErr(err)
 		}
 	}
 	vstore, err := meta.OpenReadOnly(dbPath, true)
@@ -238,7 +248,12 @@ func mountVersion(signalCtx context.Context, cfg *config.Config, o versionMountO
 		return fmt.Errorf("mount preflight: %w: %w", errTelegram, verr)
 	}
 
-	err = serveVersion(signalCtx, cfg, o, sess, vstore, wc, codec, chunkSize, fsUUID, v, svc)
+	cacheDir, err := prepareVersionCache(cfg, v)
+	if err != nil {
+		stop()
+		return err
+	}
+	err = serveVersion(signalCtx, cfg, o, sess, vstore, wc, codec, chunkSize, fsUUID, v, cacheDir, svc)
 	stop()
 	if errors.Is(err, context.Canceled) {
 		return nil
@@ -249,15 +264,16 @@ func mountVersion(signalCtx context.Context, cfg *config.Config, o versionMountO
 // serveVersion mounts the version's DB read-only and serves it until the
 // stop signal.
 func serveVersion(signalCtx context.Context, cfg *config.Config, o versionMountOpts, sess *tg.Session, vstore *meta.Store,
-	wc chunk.WireCodec, codec compress.Codec, chunkSize int64, fsUUID string, v wire.AnchorVersion, svc *service) error {
+	wc chunk.WireCodec, codec compress.Codec, chunkSize int64, fsUUID string, v wire.AnchorVersion, cacheDir string, svc *service) error {
 	fetcher := &chunk.TGFetcher{Session: sess}
 	capBytes, err := cacheCapFrom(o.cacheCap, cfg)
 	if err != nil {
 		return err
 	}
 	// Its own cache: the cache is keyed by (inode, index), and the
-	// version's inode 5 may hold other content than the live tree's.
-	cache, err := chunk.NewCacheWire(versionCacheDir(cfg, o.name), capBytes, fetcher, wc)
+	// version's inode 5 may hold other content than the live tree's
+	// (prepareVersionCache empties it when it was another version's).
+	cache, err := chunk.NewCacheWire(cacheDir, capBytes, fetcher, wc)
 	if err != nil {
 		return err
 	}

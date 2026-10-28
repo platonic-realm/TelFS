@@ -179,7 +179,7 @@ var anchorMu sync.Mutex
 func PostAnchor(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys, logf func(string, ...any)) (int, error) {
 	anchorMu.Lock()
 	defer anchorMu.Unlock()
-	a, _, err := anchorFromDB(ctx, m, keys.FSUUID)
+	a, rawVersions, err := anchorFromDB(ctx, m, keys.FSUUID)
 	if err != nil {
 		return 0, err
 	}
@@ -209,7 +209,17 @@ func PostAnchor(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys,
 		if err := putInt(k, KVAnchorSnapSeq, a.SnapSeq); err != nil {
 			return err
 		}
-		return k.Delete(KVAnchorDue)
+		// anchor_due is cleared only when this anchor lists the registry
+		// as it is now: a version change recorded while it was being
+		// posted keeps its mark (the next anchor carries it).
+		now, err := k.Get(KVVersions)
+		if err != nil && !errors.Is(err, meta.ErrNotFound) {
+			return err
+		}
+		if bytes.Equal(now, rawVersions) {
+			return k.Delete(KVAnchorDue)
+		}
+		return nil
 	}); err != nil {
 		return id, err
 	}
