@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 
 	"telfs/internal/config"
@@ -45,6 +48,9 @@ type Client struct {
 	// encrypted session.enc (internal/sessionstore); the caller opens
 	// it with the profile's secret and passes it in.
 	storage session.Storage
+	// dials spaces out connection attempts after failures (every
+	// connection of the client: main and upload pool).
+	dials *dialGate
 }
 
 // ErrNotAuthorized is returned by RunSession when no valid local session
@@ -72,6 +78,7 @@ func New(cfg *config.Config, storage session.Storage) (*Client, error) {
 		byteLimit: NewByteLimiter(up.MaxRate),
 		upload:    up,
 		storage:   storage,
+		dials:     newDialGate(nil),
 	}, nil
 }
 
@@ -121,6 +128,10 @@ func (c *Client) newTG() *telegram.Client {
 		SessionStorage: storage,
 		Middlewares:    c.middlewares(),
 	}
+	if c.dials != nil {
+		// gotd's default resolver, dialing through the gate.
+		opts.Resolver = dcs.Plain(dcs.PlainOptions{Dial: c.dials.Dial})
+	}
 	if c.cfg.DC != 0 {
 		opts.DC = c.cfg.DC
 	}
@@ -162,21 +173,87 @@ func (c *Client) wrapUploadInvoker(raw tg.Invoker) *tg.Client {
 // main connection's authorization). Once closed, its errors read as
 // ErrNotConnected, which UploadDocument retries — on the next cycle's
 // pool or on the main connection.
+//
+// A call that gets no answer within callTimeout (no connection of the
+// pool could be made or none answered — gotd's pool keeps redialing
+// inside the call) suspends the pool: uploads use the main connection
+// for a while (1 min, doubling to 10 min while it keeps failing; a
+// call that succeeds ends it), so they do not stall behind connections
+// that cannot be opened while the main one works.
 type uploadPool struct {
-	inv    telegram.CloseInvoker
-	closed atomic.Bool
+	inv         telegram.CloseInvoker
+	closed      atomic.Bool
+	callTimeout time.Duration // 0 = uploadPoolCallTimeout
+
+	mu        sync.Mutex
+	until     time.Time     // suspended until
+	suspendIn time.Duration // the next suspension's length
 }
+
+// Upload pool breaker.
+const (
+	uploadPoolCallTimeout = 2 * time.Minute
+	uploadPoolSuspendMin  = time.Minute
+	uploadPoolSuspendMax  = 10 * time.Minute
+)
 
 // Invoke implements tg.Invoker.
 func (p *uploadPool) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 	if p.closed.Load() {
 		return ErrNotConnected
 	}
-	err := p.inv.Invoke(ctx, input, output)
-	if err != nil && p.closed.Load() {
+	limit := p.callTimeout
+	if limit <= 0 {
+		limit = uploadPoolCallTimeout
+	}
+	cctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	err := p.inv.Invoke(cctx, input, output)
+	switch {
+	case err == nil:
+		p.answered()
+		return nil
+	case p.closed.Load():
 		return fmt.Errorf("%w (upload connections closed: %v)", ErrNotConnected, err)
+	case ctx.Err() == nil && cctx.Err() != nil:
+		// Our bound, not the caller's: nothing of the pool answered.
+		d := p.suspend()
+		return fmt.Errorf("%w (no upload connection answered within %s; uploads use the main connection for %s)", ErrNotConnected, limit, d)
 	}
 	return err
+}
+
+// usable reports whether uploads may go through the pool now.
+func (p *uploadPool) usable() bool {
+	if p.closed.Load() {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !time.Now().Before(p.until)
+}
+
+func (p *uploadPool) suspend() time.Duration {
+	p.mu.Lock()
+	d := p.suspendIn
+	if d < uploadPoolSuspendMin {
+		d = uploadPoolSuspendMin
+	}
+	p.suspendIn = min(2*d, uploadPoolSuspendMax)
+	newly := !time.Now().Before(p.until)
+	p.until = time.Now().Add(d)
+	p.mu.Unlock()
+	if newly {
+		fmt.Fprintf(os.Stderr, "[upload] no upload connection answers; uploads use the main connection for %s\n", d)
+	}
+	return d
+}
+
+func (p *uploadPool) answered() {
+	p.mu.Lock()
+	p.suspendIn = 0
+	p.until = time.Time{}
+	p.mu.Unlock()
 }
 
 // Close closes the pool's connections (waits for them to end).

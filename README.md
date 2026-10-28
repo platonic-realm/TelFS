@@ -826,7 +826,12 @@ upload limit for accounts without Premium — `FLOOD_PREMIUM_WAIT_X`;
 TelFS waits the X seconds and goes on, and names each wait in the log
 (`[flood-wait] …: FLOOD_PREMIUM_WAIT — …`). Repeated premium waits mean
 the rate is above what the account is allowed: lower `max_rate` or
-`connections`.
+`connections`. When connections cannot be made (network cut, firewall,
+out of file descriptors) TelFS spaces its attempts out — 0.2 s after a
+failure, doubling to 5 s, until a server answers — instead of redialing
+in a loop; and when no upload connection has answered a part for 2
+minutes, uploads go over the main connection for a while (1 min,
+doubling to 10 min while that repeats; the log says so).
 
 **Snapshots (format 2).** The journal holds every change, including
 where each chunk lives, so the newest snapshot plus the journal after it

@@ -110,9 +110,9 @@ func (m *SessionManager) Run(ctx context.Context, onFirstConnect func() error) e
 					case err != nil:
 						fmt.Fprintf(os.Stderr, "[upload] no upload connections this session (%v); uploads use the main connection\n", err)
 					case pool != nil:
-						m.session.swapUploadAPI(upAPI)
+						m.session.swapUploadAPI(upAPI, pool)
 						defer func() {
-							m.session.swapUploadAPI(nil)
+							m.session.swapUploadAPI(nil, nil)
 							closePoolBounded(pool, uploadPoolCloseWait)
 						}()
 					}

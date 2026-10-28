@@ -54,6 +54,9 @@ type Session struct {
 	// pool ([upload] connections; nil = no pool now, parts go over api).
 	// Guarded by apiMu like api.
 	upAPI *tg.Client
+	// upPool is that pool (nil: none, or a test's bare API): while it is
+	// suspended (its connections don't answer) uploads use api.
+	upPool *uploadPool
 	// uploadThreads is the parts in flight per upload on the pool
 	// ([upload] parts_per_upload).
 	uploadThreads int
@@ -144,10 +147,14 @@ func (s *Session) swapAPI(api *tg.Client) {
 }
 
 // swapUploadAPI installs the API of a connection cycle's upload pool, or
-// nil when the cycle ends (uploads then use the main connection).
-func (s *Session) swapUploadAPI(api *tg.Client) {
+// nil when the cycle ends (uploads then use the main connection). pool
+// (nil: none to consult) is asked per upload: a suspended pool is skipped.
+func (s *Session) swapUploadAPI(api *tg.Client, pool *uploadPool) {
 	s.apiMu.Lock()
-	s.upAPI = api
+	s.upAPI, s.upPool = api, pool
+	if api == nil {
+		s.upPool = nil
+	}
 	s.apiMu.Unlock()
 }
 
@@ -157,9 +164,9 @@ func (s *Session) swapUploadAPI(api *tg.Client) {
 // connection also carries downloads, journal posts and everything else).
 func (s *Session) partsAPI(main *tg.Client) (*tg.Client, int) {
 	s.apiMu.RLock()
-	up := s.upAPI
+	up, pool := s.upAPI, s.upPool
 	s.apiMu.RUnlock()
-	if up == nil {
+	if up == nil || (pool != nil && !pool.usable()) {
 		return main, 1
 	}
 	if s.uploadThreads < 1 {

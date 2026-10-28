@@ -210,7 +210,7 @@ func TestUploadDocumentPartsGoThroughPool(t *testing.T) {
 	poolTG := &fakeTelegram{partDelay: 20 * time.Millisecond}
 	s := uploadTestSession(2)
 	s.swapAPI(tg.NewClient(mainTG))
-	s.swapUploadAPI(tg.NewClient(poolTG))
+	s.swapUploadAPI(tg.NewClient(poolTG), nil)
 	body := bytes.Repeat([]byte{1}, 6*uploadPartMax+100) // 7 parts
 	id, err := s.UploadDocument(context.Background(), bytes.NewReader(body), "blob", "c")
 	if err != nil || id != 77 {
@@ -232,7 +232,7 @@ func TestUploadDocumentPartsGoThroughPool(t *testing.T) {
 
 	// The cycle ends: the pool is unbound, uploads fall back to the main
 	// connection, one part at a time (as before v1).
-	s.swapUploadAPI(nil)
+	s.swapUploadAPI(nil, nil)
 	mainTG.partDelay = 5 * time.Millisecond
 	if _, err := s.UploadDocument(context.Background(), bytes.NewReader(body), "blob", "c"); err != nil {
 		t.Fatal(err)
@@ -252,7 +252,7 @@ func TestUploadDocumentPartsGoThroughPool(t *testing.T) {
 	for _, size := range []int{2 * uploadPartMax, 10} {
 		f := &fakeTelegram{}
 		s.swapAPI(tg.NewClient(f))
-		s.swapUploadAPI(tg.NewClient(f))
+		s.swapUploadAPI(tg.NewClient(f), nil)
 		if _, err := s.UploadDocument(context.Background(), bytes.NewReader(make([]byte, size)), "blob", "c"); err != nil {
 			t.Fatal(err)
 		}
