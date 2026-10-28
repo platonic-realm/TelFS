@@ -104,7 +104,7 @@ func (s *Store) ReplayOp(ctx context.Context, op JournalOp) error {
 			return nil // inode unlinked later in the journal
 		}
 		return err
-	case OpRef:
+	case OpRef, OpChunk:
 		err := s.PutChunk(ctx, Chunk{Ino: op.Ino, Idx: op.Idx, TGMessageID: op.MsgID,
 			Size: op.ChunkLen, PackOffset: op.PackOffset, PackSize: op.PackSize, Hash: op.Hash})
 		if IsFKViolation(err) {

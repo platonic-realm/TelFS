@@ -317,6 +317,22 @@ the empty file, the symlink, the second link name, the later rename).
   after a recovery the local journal sequence stayed at the snapshot's —
   the next change reused sequence numbers already on the channel, and a
   later recovery would apply old ops twice. Recovery now advances it.
+- **Where the chunks went was not journaled either.** The 1M-file scale
+  test held snapshots back, then recovered from an old snapshot plus a
+  journal of 4.75 million ops: every name and size came back, but no
+  file uploaded after the snapshot had its chunk rows (`chunk_map` was
+  never journaled — the design leaned on snapshots for it), and the
+  mount's crash repair "fixed" 921,691 files by emptying them. At that
+  scale it is not an exotic case: the final snapshot at unmount has 10
+  seconds and a 100 MB snapshot cannot make it. Format 2 now journals a
+  `chunk` op for every placement (message, pack offset and size, length,
+  keyed hash) in the same transaction as the row, and replays it like a
+  dedup `ref`. And a mount that has just recovered runs the repair as a
+  dry run first: if it would shorten any file, the mount refuses, names
+  every such file in `recovery-incomplete-<time>.tsv`, and drops the
+  restored DB — `recover --from-captions` is the way on from there. A
+  normal crash repair still cuts a file back to what reached the
+  channel, but never quietly: count, paths, and `repair-<time>.tsv`.
 - **One writer, and drills that write nothing.** The mount source became
   `telfs:<profile>:<fs_uuid>`, so `telfs mount` can refuse a second daemon
   for a profile and a second writer for a filesystem on the same machine

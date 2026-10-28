@@ -22,13 +22,18 @@ package meta
 //   - rename: Rename      — moves a dirent
 //   - setsize: SetSize    — explicit truncate (size change)
 //   - ref:    a format-2 dedup hit referencing an existing chunk
+//   - chunk:  a format-2 chunk placement (PutChunk: ino, idx → message,
+//     pack offset/size, length, keyed hash)
 //   - setattr / setxattr / rmxattr: format 2 only (chmod, chown,
 //     utimes, xattrs) — format 1 posts its journal in clear, so its
 //     ops stay as in v0.22
 //
-// Not journaled (yet): xattr ops, generic SetAttrs, chunk_map updates.
-// Chunks are independently recoverable from the channel itself; xattrs
-// and posix attrs degrade gracefully when missing on replay.
+// Format 1 journals none of chunk placements, xattrs or generic
+// SetAttrs: there, a recovery is complete only up to the newest
+// snapshot. Format 2 journals them all, so the newest snapshot plus the
+// journal after it is the whole filesystem (P1 1M test: without chunk
+// ops, every file uploaded after the snapshot came back without its
+// chunks).
 type JournalOp struct {
 	Op string `json:"op"`
 
@@ -57,7 +62,8 @@ type JournalOp struct {
 	// files keep hole-reads-as-zeros semantics instead of EIO.
 	Sparse bool `json:"sparse,omitempty"`
 
-	// ref: a dedup hit made slot (Ino, Idx) reference an EXISTING
+	// ref / chunk: slot (Ino, Idx) → a chunk message. ref: a dedup hit
+	// made the slot reference an EXISTING
 	// chunk message (format 2, decision N2). Without this op the slot
 	// would exist only in snapshots — a file whose content was entirely
 	// deduplicated posts no message of its own, so neither a journal
@@ -87,6 +93,7 @@ const (
 	OpSetSize      = "setsize"
 	OpSetSparse    = "setsparse"
 	OpRef          = "ref"
+	OpChunk        = "chunk"
 	OpSetAttr      = "setattr"
 	OpSetXattr     = "setxattr"
 	OpRmXattr      = "rmxattr"

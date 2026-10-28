@@ -1,7 +1,9 @@
 package meta
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -220,4 +222,124 @@ func TestSetAttrNoOpsNotJournaled(t *testing.T) {
 	if rep.Mode != live.Mode || rep.Mtime != live.Mtime {
 		t.Fatalf("replayed mode %o mtime %d, live mode %o mtime %d", rep.Mode, rep.Mtime, live.Mode, live.Mtime)
 	}
+}
+
+// Format 2 journals every chunk placement in the same transaction as
+// the row; replay restores it field for field (pack offset/size and the
+// keyed hash included); format 1 journals none.
+func TestChunkOpJournaledAndReplayed(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetJournalV2(true)
+	ino, _ := s.CreateChild(ctx, RootIno, "f", Inode{Kind: KindFile, Mode: 0o100644})
+	c := Chunk{Ino: ino, Idx: 0, TGMessageID: 77, Size: 190, PackOffset: 4096, PackSize: 230, Hash: bytes.Repeat([]byte{7}, 32)}
+	if err := s.PutChunk(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	var ops []JournalOp
+	pend, _ := s.PendingJournal(ctx)
+	for _, e := range pend {
+		op, _ := DecodeOp(e.OpJSON)
+		ops = append(ops, op)
+	}
+	if len(ops) != 2 || ops[1].Op != OpChunk || ops[1].MsgID != 77 || ops[1].PackOffset != 4096 ||
+		ops[1].PackSize != 230 || ops[1].ChunkLen != 190 || !bytes.Equal(ops[1].Hash, c.Hash) {
+		t.Fatalf("journal: %+v", ops)
+	}
+	s2, _ := Open(filepath.Join(t.TempDir(), "db2.sqlite"))
+	defer s2.Close()
+	s2.SetJournalV2(true)
+	for _, op := range ops {
+		if err := s2.ReplayOp(ctx, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s2.GetChunk(ctx, ino, 0)
+	if err != nil || got.TGMessageID != 77 || got.PackOffset != 4096 || got.PackSize != 230 || got.Size != 190 || !bytes.Equal(got.Hash, c.Hash) {
+		t.Fatalf("replayed row %+v, %v", got, err)
+	}
+	if pend, _ := s2.PendingJournal(ctx); len(pend) != 0 {
+		t.Fatalf("replay journaled %d op(s)", len(pend))
+	}
+	s1, _ := Open(filepath.Join(t.TempDir(), "db1.sqlite")) // format 1
+	defer s1.Close()
+	ino1, _ := s1.CreateChild(ctx, RootIno, "f", Inode{Kind: KindFile, Mode: 0o100644})
+	s1.PutChunk(ctx, Chunk{Ino: ino1, Idx: 0, TGMessageID: 5, Size: 10})
+	pend1, _ := s1.PendingJournal(ctx)
+	for _, e := range pend1 {
+		if op, _ := DecodeOp(e.OpJSON); op.Op == OpChunk {
+			t.Fatal("format 1 must not journal chunk placements")
+		}
+	}
+}
+
+// The P1 1M-test scenario in miniature: a snapshot taken BEFORE files
+// were uploaded, plus the journal after it, must give back every chunk
+// (it used to give back sizes without chunks, and the startup repair
+// emptied the files).
+func TestSnapshotPlusJournalHoldsEveryChunk(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "live.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetJournalV2(true)
+	d, _ := s.CreateChild(ctx, RootIno, "d", Inode{Kind: KindDir, Mode: 0o40755})
+	snapSeq, _ := s.LastJournalSeq(ctx)
+	if _, err := s.DB().ExecContext(ctx, `VACUUM INTO ?`, filepath.Join(dir, "snap.sqlite")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		ino, err := s.CreateChild(ctx, d, fmt.Sprintf("f%d", i), Inode{Kind: KindFile, Mode: 0o100644, ChunkSize: 1 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for idx := int32(0); idx < 2; idx++ {
+			if err := s.PutChunk(ctx, Chunk{Ino: ino, Idx: idx, TGMessageID: int64(100 + i), Size: 1 << 20,
+				PackOffset: int64(idx) << 20, PackSize: 1<<20 + 40, Hash: bytes.Repeat([]byte{byte(i)}, 32)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.SetSize(ctx, ino, 2<<20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := Open(filepath.Join(dir, "snap.sqlite")) // the "restored snapshot"
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	pend, _ := s.PendingJournal(ctx)
+	for _, e := range pend {
+		if e.Seq <= snapSeq {
+			continue
+		}
+		op, _ := DecodeOp(e.OpJSON)
+		if err := r.ReplayOp(ctx, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if scan, err := s.ScanPartialFiles(ctx, nil); err != nil || len(scan) != 0 {
+		t.Fatalf("live DB needs repair (bad test data): %+v, %v", scan, err)
+	}
+	if scan, err := r.ScanPartialFiles(ctx, nil); err != nil || len(scan) != 0 {
+		t.Fatalf("recovered DB needs repair: %+v, %v", scan, err)
+	}
+	if a, b := countChunks(t, s), countChunks(t, r); a != 10 || b != a {
+		t.Fatalf("chunk rows: live %d, recovered %d", a, b)
+	}
+}
+
+func countChunks(t *testing.T, s *Store) int {
+	var n int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM chunk_map`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

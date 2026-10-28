@@ -16,22 +16,45 @@ import (
 // For packed chunks the caller fills Chunk.PackOffset and PackSize too;
 // for unpacked chunks they stay zero and the row stores SQL NULL so
 // pre-packer rows decode identically.
+//
+// Format 2 journals the placement (a `chunk` op) in the SAME transaction,
+// so the newest snapshot plus the journal after it always holds every
+// chunk the filesystem references. Replay and rebuild don't journal.
 func (s *Store) PutChunk(ctx context.Context, c Chunk) error {
-	packOff, packSize := nullablePackFields(c)
-	_, err := s.execWithRetry(ctx,
-		`INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size, hash)
+	var err error
+	if s.journalV2.Load() && !s.replaying.Load() {
+		err = s.WithTx(ctx, func(tx *sql.Tx) error {
+			if err := putChunk(ctx, tx, c); err != nil {
+				return err
+			}
+			_, err := s.appendJournalTx(ctx, tx, JournalOp{Op: OpChunk, Ino: c.Ino, Idx: c.Idx, MsgID: c.TGMessageID,
+				PackOffset: c.PackOffset, PackSize: c.PackSize, ChunkLen: c.Size, Hash: c.Hash})
+			return err
+		})
+	} else {
+		packOff, packSize := nullablePackFields(c)
+		_, err = s.execWithRetry(ctx, putChunkSQL,
+			c.Ino, c.Idx, c.TGMessageID, c.Size, packOff, packSize, nullableHash(c.Hash))
+	}
+	if err != nil {
+		return fmt.Errorf("put chunk %d/%d: %w", c.Ino, c.Idx, err)
+	}
+	return nil
+}
+
+const putChunkSQL = `INSERT INTO chunk_map(ino, idx, tg_message_id, size, pack_offset, pack_size, hash)
 		   VALUES (?,?,?,?,?,?,?)
 		 ON CONFLICT(ino, idx) DO UPDATE SET
 		   tg_message_id = excluded.tg_message_id,
 		   size          = excluded.size,
 		   pack_offset   = excluded.pack_offset,
 		   pack_size     = excluded.pack_size,
-		   hash          = excluded.hash`,
-		c.Ino, c.Idx, c.TGMessageID, c.Size, packOff, packSize, nullableHash(c.Hash))
-	if err != nil {
-		return fmt.Errorf("put chunk %d/%d: %w", c.Ino, c.Idx, err)
-	}
-	return nil
+		   hash          = excluded.hash`
+
+func putChunk(ctx context.Context, tx *sql.Tx, c Chunk) error {
+	packOff, packSize := nullablePackFields(c)
+	_, err := tx.ExecContext(ctx, putChunkSQL, c.Ino, c.Idx, c.TGMessageID, c.Size, packOff, packSize, nullableHash(c.Hash))
+	return err
 }
 
 // chunkCols is the column list every chunk_map read uses; scanChunk

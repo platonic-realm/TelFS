@@ -708,6 +708,16 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}
 	}
 
+	// A recovery this mount refuses (checkRecoveredDB below) leaves no
+	// DB behind. Registered before the store's Close so it runs after it.
+	dropRestored := false
+	defer func() {
+		if dropRestored {
+			for _, sfx := range []string{"", "-wal", "-shm"} {
+				_ = os.Remove(cfg.DBPath() + sfx)
+			}
+		}
+	}()
 	metaStore, err := meta.Open(cfg.DBPath())
 	if err != nil {
 		return err
@@ -749,13 +759,31 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}
 	}
 	stagedChecker := func(ino int64, idx int32) bool { return stagedSet[ino][idx] }
+	// Format 2, just recovered: the repair may not shorten anything —
+	// refuse the mount instead, naming the files (see repair.go).
+	if dbMissing {
+		if f, _ := metaStore.Format(signalCtx); f == 2 {
+			if err := checkRecoveredDB(signalCtx, metaStore, os.Stderr, cfg.DataDir, stagedChecker); err != nil {
+				dropRestored = true
+				return fmt.Errorf("recovery: %w", err)
+			}
+		}
+	}
 	if repaired, err := metaStore.RepairPartialFiles(signalCtx, stagedChecker); err != nil {
 		fmt.Fprintln(os.Stderr, "[repair] warning:", err)
 	} else if len(repaired) > 0 {
-		fmt.Printf("Repaired %d partial file(s) from a prior crash:\n", len(repaired))
-		for _, r := range repaired {
-			fmt.Printf("  ino %d: size %d → %d (had %d chunks, first gap at idx %d, kept %d)\n",
-				r.Ino, r.OldSize, r.NewSize, r.OldChunks, r.FirstGapAt, r.NewChunks)
+		// Never shorten a file without saying so: count, the first
+		// paths here, every path in the report file.
+		if cut := shortened(repaired); len(cut) > 0 {
+			fmt.Fprintf(os.Stderr, "[repair] %d file(s) left inconsistent by an earlier crash were cut to the part that reached the channel; the rest of their content is NOT on the channel:\n", len(cut))
+			if path, err := writeRepairReport(signalCtx, metaStore, os.Stderr, cfg.DataDir, "repair", cut); err != nil {
+				fmt.Fprintln(os.Stderr, "[repair] report not written:", err)
+			} else {
+				fmt.Fprintln(os.Stderr, "[repair] every file:", path)
+			}
+		}
+		if n := len(repaired) - len(shortened(repaired)); n > 0 {
+			fmt.Printf("[repair] dropped stray chunk rows past the end of %d file(s) (no data lost)\n", n)
 		}
 	}
 

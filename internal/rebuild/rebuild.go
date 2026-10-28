@@ -214,7 +214,7 @@ func Run(ctx context.Context, src Source, keys *wire.Keys, m *meta.Store, opt Op
 	}
 
 	// 2. Journal replay on the original inode numbers.
-	refAt := map[slot]int{} // slot → journal batch message id of its newest ref
+	refAt := map[slot]int{} // slot → journal batch message id of its newest ref or chunk op
 	created := map[int64]bool{}
 	if opt.UseJournal && len(batches) > 0 {
 		type seqOp struct {
@@ -275,7 +275,7 @@ func Run(ctx context.Context, src Source, keys *wire.Keys, m *meta.Store, opt Op
 			switch o.op.Op {
 			case meta.OpCreateChild:
 				created[o.op.Ino] = true
-			case meta.OpRef:
+			case meta.OpRef, meta.OpChunk:
 				refAt[slot{o.op.Ino, o.op.Idx}] = o.msgID
 			}
 		}

@@ -641,13 +641,22 @@ data.
 - **One read-write mounter per channel.** Enforced on one machine (see
   [Mount options](#mount-options)); across machines it is your
   discipline until a channel-side writer lease exists.
-- **≤5 s recovery window.** A background journal poster (v0.13) drains
-  the local `journal` table every 5 s and posts each pending op to the
-  channel; recovery restores the latest snapshot then replays journal
-  ops with seq > snapshot.seq. Currently journaled: `CreateChild`,
-  `Link`, `Unlink`, `Rename`, `SetSize`. Setattr/xattr/chunk-map
-  mutations aren't journaled yet (chunks themselves are independently
-  recoverable).
+- **≤5 s recovery window.** A background journal poster drains the
+  local `journal` table every 5 s and posts the pending ops to the
+  channel; recovery restores the latest snapshot, then replays the
+  journal ops after it. Format 2 journals every change, including
+  attributes, xattrs and where each chunk was uploaded, so the latest
+  snapshot plus the journal is the whole filesystem. Format 1 journals
+  only the namespace (`create`, `link`, `unlink`, `rename`, `setsize`):
+  there, files uploaded after the latest snapshot come back without
+  their content.
+- **A recovery never empties files.** If a file comes back from the
+  channel with a size but without all its chunks, the mount refuses,
+  lists the files (`<profile>/recovery-incomplete-<time>.tsv`) and keeps
+  nothing of that recovery; `telfs recover --from-captions` then
+  rebuilds the chunk placements from the captions. The crash repair of
+  a normal mount still cuts a file back to what reached the channel,
+  and says so: count, paths, and `<profile>/repair-<time>.tsv`.
 - **Encryption metadata leakage is bounded, not zero.** Snapshots are
   TFSE ciphertext, but chunk count, chunk size to ~chunk-size
   resolution, and snapshot cadence remain visible.

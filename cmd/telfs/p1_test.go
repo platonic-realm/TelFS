@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -123,5 +124,42 @@ func TestPrintDefaultsExceptHidesFlag(t *testing.T) {
 	printDefaultsExcept(fs, "snapshot-interval")
 	if out := b.String(); strings.Contains(out, "snapshot-interval") || !strings.Contains(out, "-readonly") {
 		t.Fatalf("help output:\n%s", out)
+	}
+}
+
+// After a recovery, a file with a size but missing chunks makes the
+// mount refuse: the file is named (output + report file) and nothing is
+// changed. A complete DB passes.
+func TestCheckRecoveredDB(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	m, err := meta.Open(filepath.Join(dir, "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	d, _ := m.CreateChild(ctx, meta.RootIno, "docs", meta.Inode{Kind: meta.KindDir, Mode: 0o40755})
+	ok, _ := m.CreateChild(ctx, d, "whole.txt", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	m.PutChunk(ctx, meta.Chunk{Ino: ok, Idx: 0, TGMessageID: 9, Size: 100})
+	m.SetSize(ctx, ok, 100)
+	var out strings.Builder
+	if err := checkRecoveredDB(ctx, m, &out, dir, nil); err != nil || out.Len() != 0 {
+		t.Fatalf("complete DB: %v, output %q", err, out.String())
+	}
+	bad, _ := m.CreateChild(ctx, d, "lost.txt", meta.Inode{Kind: meta.KindFile, Mode: 0o100644})
+	m.SetSize(ctx, bad, 190)
+	err = checkRecoveredDB(ctx, m, &out, dir, nil)
+	if err == nil || !strings.Contains(err.Error(), "1 file(s)") || !strings.Contains(out.String(), "/docs/lost.txt: 190 → 0 bytes") {
+		t.Fatalf("incomplete DB: %v, output %q", err, out.String())
+	}
+	if in, _ := m.GetInode(ctx, bad); in.Size != 190 {
+		t.Fatalf("the check changed the file: size %d", in.Size)
+	}
+	reports, _ := filepath.Glob(filepath.Join(dir, "recovery-incomplete-*.tsv"))
+	if len(reports) != 1 {
+		t.Fatalf("report files: %v", reports)
+	}
+	if b, _ := os.ReadFile(reports[0]); !strings.Contains(string(b), "/docs/lost.txt\t") {
+		t.Fatalf("report:\n%s", b)
 	}
 }
