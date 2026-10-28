@@ -15,9 +15,9 @@ import (
 // and gauge providers (cache size, pending uploads) reflect that
 // daemon's live state — there is no IPC.
 //
-// Bind addr is up to the caller; 127.0.0.1:9090 is the default in
-// `telfs mount --metrics-addr`. Off by default; opt-in keeps the
-// surface of the mount daemon small.
+// Bind addr is up to the caller (`telfs mount --metrics-addr`, e.g.
+// 127.0.0.1:9090). Off by default: status, sync and the web console use
+// the profile's owner-only control socket (internal/control).
 //
 // Extra handlers (e.g. /telegram for the request log) can be added
 // via RegisterHandler — composes nicely with the daemon's

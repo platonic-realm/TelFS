@@ -297,6 +297,16 @@ func (p *Packer) SubmitStaged(ino int64, idx int32, plaintextSize int32, wireLen
 		hash: hash, codec: codec, fileSize: fileSize, staged: true, wireLen: wireLen, onDone: onDone})
 }
 
+// SubmitRecovered is SubmitStaged for wires found at mount (recovery):
+// done (may be nil) runs once the wire has landed or was dropped.
+func (p *Packer) SubmitRecovered(ino int64, idx int32, plaintextSize int32, wireLen int64, pendingPath string, hash []byte, done func()) {
+	p.SubmitStaged(ino, idx, plaintextSize, wireLen, pendingPath, hash, "", 0, func(packResult) {
+		if done != nil {
+			done()
+		}
+	})
+}
+
 // complete delivers a request's outcome: onDone for staged requests, the
 // result channel otherwise (a zero result = done, row not wanted).
 func (p *Packer) complete(r packReq, res packResult) {

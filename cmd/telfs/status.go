@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io/fs"
 	"os"
@@ -25,10 +26,18 @@ import (
 // last snapshot, and any TelFS FUSE mounts visible in /proc/mounts.
 // Intended as the "what state am I in" command — purely local; never
 // hits the network.
-func cmdStatus(ctx context.Context, _ []string) error {
+func cmdStatus(ctx context.Context, args []string) error {
+	fset := flag.NewFlagSet("status", flag.ContinueOnError)
+	jsonOut := fset.Bool("json", false, "one JSON object (schema 1, spec v1 §3) for scripts and monitoring; needs no secret")
+	if err := fset.Parse(args); err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	if *jsonOut {
+		return statusJSON(ctx, cfg)
 	}
 
 	active := config.ActiveProfile()

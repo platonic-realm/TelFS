@@ -44,7 +44,7 @@ func classifyHealth(state tgPageData) (kind, label, tip string) {
 	// Labels are terse panel-lamp captions; the colored dot itself is
 	// drawn by CSS (.pill::before), so no emoji here.
 	if !state.Online {
-		return "err", "link down", "Daemon /telegram endpoint unreachable. Start a mount with --metrics-addr."
+		return "err", "link down", "No running mount for this profile answers on its control socket."
 	}
 	q := state.State.Queue
 	// Red conditions first — they win over yellow.

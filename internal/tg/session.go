@@ -80,6 +80,13 @@ func (s *Session) SetReadOnly(on bool) { s.readOnly.Store(on) }
 // ReadOnly reports whether channel writes are refused.
 func (s *Session) ReadOnly() bool { return s.readOnly.Load() }
 
+// Connected reports whether the session currently has a live connection.
+func (s *Session) Connected() bool {
+	s.apiMu.RLock()
+	defer s.apiMu.RUnlock()
+	return s.api != nil
+}
+
 type docCacheEntry struct {
 	doc       *tg.Document
 	fetchedAt time.Time

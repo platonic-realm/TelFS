@@ -70,7 +70,7 @@ type cacheLiveStats struct {
 // Returns nil on any failure (network, JSON, non-200) — the caller
 // treats nil as "fall back to on-disk stats from dirStats".
 func fetchCacheLive() *cacheLiveStats {
-	resp, err := httpClient.Get("http://127.0.0.1:9090/cache")
+	resp, err := daemonGet("/cache")
 	if err != nil {
 		return nil
 	}

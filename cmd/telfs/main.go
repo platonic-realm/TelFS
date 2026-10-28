@@ -35,6 +35,7 @@ import (
 
 	"telfs/internal/chunk"
 	"telfs/internal/config"
+	"telfs/internal/control"
 	"telfs/internal/crypto"
 	telfsfs "telfs/internal/fs"
 	"telfs/internal/meta"
@@ -180,6 +181,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return nil
 	case "versions":
 		return cmdVersions(ctx, args[2:])
+	case "sync":
+		return cmdSync(ctx, args[2:])
 	case "login":
 		return cmdLogin(ctx, args[2:])
 	case "channel":
@@ -546,8 +549,9 @@ func humanBytes(n int64) string {
 // afterward — escalating to SIGKILL + lazy unmount only if it wedges.
 func cmdUnmount(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("unmount", flag.ContinueOnError)
+	timeout := fs.Duration("timeout", 2*time.Minute, "how long to wait for the daemon to finish its orderly shutdown and exit")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: telfs unmount <mountpoint | profile-name>")
+		fmt.Fprintln(os.Stderr, "usage: telfs unmount [--timeout D] <mountpoint | profile-name>")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -579,6 +583,16 @@ func cmdUnmount(_ context.Context, args []string) error {
 		return fmt.Errorf("unmount: %q is not a fuse.telfs mountpoint or a mounted profile\nactive telfs mounts: %s", target, strings.Join(mounts, ", "))
 	}
 
+	// A v1 daemon is asked over its control socket and the command waits
+	// for THAT process to exit (no SIGKILL): "unmounted" means the daemon
+	// is gone, not just the FUSE mount (spec v1 §3).
+	if done, err := unmountViaControl(mountpoint, *timeout); done {
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Unmounted %s\n", mountpoint)
+		return nil
+	}
 	if pid > 0 {
 		fmt.Printf("Stopping mount daemon (pid %d) for %s — waiting for orderly shutdown…\n", pid, mountpoint)
 	} else {
@@ -608,7 +622,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	allowOther := fs.Bool("allow-other", false, "allow other users to access the mount (FUSE -o allow_other; requires user_allow_other in /etc/fuse.conf)")
 	debug := fs.Bool("debug", false, "log every FUSE op")
 	noRecover := fs.Bool("no-recover", false, "skip cold-mount recovery from channel snapshot (starts with an empty DB if local DB is missing)")
-	metricsAddr := fs.String("metrics-addr", "127.0.0.1:9090", "bind the daemon debug HTTP endpoint (/metrics, /telegram, /cache) here. The web UI reads live Telegram stats from the default; pass an empty value (--metrics-addr=) to disable.")
+	metricsAddr := fs.String("metrics-addr", "", "also serve Prometheus /metrics (and /telegram, /cache) over TCP at this address, e.g. 127.0.0.1:9090. Off by default: status, sync and the web console use the profile's owner-only control socket.")
 	cacheCap := fs.String("cache-cap", "", "override the LRU disk-cache size cap (e.g. 8GiB, 512MiB, 2GB). Flag wins over config; empty falls through to config.toml's cache_cap; that falls through to 1 GiB.")
 	prefetchWindow := fs.Int("prefetch-window", 0, "how many chunks past the current read cursor to speculatively warm (0 = default 8). Bigger = more parallel reads in flight for sequential streams; smaller = less wasted bandwidth on random reads.")
 	prefetchConcurrency := fs.Int("prefetch-concurrency", 0, "max prefetchOne goroutines (0 = default 4). Each one can issue 4 concurrent upload.getFile RPCs through the parallel ranged fetcher.")
@@ -778,7 +792,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		if f, _ := metaStore.Format(signalCtx); f == 2 {
 			if err := checkRecoveredDB(signalCtx, metaStore, os.Stderr, cfg.DataDir, stagedChecker); err != nil {
 				dropRestored = true
-				return fmt.Errorf("recovery: %w", err)
+				return fmt.Errorf("recovery: %w: %w", errIntegrity, err)
 			}
 		}
 	}
@@ -1181,6 +1195,22 @@ func cmdMount(signalCtx context.Context, args []string) error {
 				fmt.Printf("Telegram log: http://%s/telegram\n", metricsSrv.Addr())
 			}
 		}
+		// The control socket is created BEFORE the FUSE mount: failing
+		// here must not leave a mounted filesystem without its daemon.
+		// It is served once everything it reports on exists (below).
+		ctlPath := control.Path(cfg.DataDir)
+		ctlLn, err := control.Listen(ctlPath)
+		if err != nil {
+			return err
+		}
+		ctlServed := false
+		defer func() {
+			if !ctlServed {
+				ctlLn.Close()
+				_ = os.Remove(ctlPath)
+			}
+		}()
+
 		server, err := telfsfs.Mount(telfsfs.MountOptions{
 			MountPoint: mountpoint,
 			AllowOther: *allowOther,
@@ -1363,7 +1393,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		if *readonly {
 			fmt.Fprintln(os.Stderr, "read-only: no snapshots, no journal, no uploads — nothing is written to the channel")
 		} else {
-			go recoverPending(signalCtx, pendingDir, packer, metaStore, pendingIndex, stagingGate)
+			go recoverPending(signalCtx, pendingDir, packer, metaStore, pendingIndex, pool)
 		}
 
 		// Stall watchdog: if there's chunk work pending but no
@@ -1401,6 +1431,17 @@ func cmdMount(signalCtx context.Context, args []string) error {
 				}
 			}()
 		}
+
+		// The control socket (spec v1 §3): status, sync, unmount and the
+		// web console talk to this daemon through it, owner-only. The S9
+		// services depend on it, so a mount without one is refused.
+		ctl := &daemonCtl{cfg: cfg, mountpoint: mountpoint, readOnly: *readonly, format: pipe.format,
+			meta: metaStore, sess: sess, pool: pool, poster: journalPoster, snapMgr: snapMgr, counters: pipe.counters,
+			telegram: telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore, adaptive, snapMgr),
+			cache:    cacheJSONHandler(cache)}
+		ctlServed = true
+		go control.Serve(signalCtx, ctlLn, ctlPath, ctl.handler())
+		go ctl.sampleRate(signalCtx)
 
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		<-signalCtx.Done()
@@ -1848,7 +1889,7 @@ func checkFusermount() {
 // Runs in a goroutine so it doesn't delay the "Mounted at" message.
 // Errors from individual entries are logged but don't abort the
 // recovery — leftover entries will be retried on the next startup.
-func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstore *meta.Store, pendingIndex *chunk.PendingIndex, gate *chunk.DiskGate) {
+func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstore *meta.Store, pendingIndex *chunk.PendingIndex, pool *chunk.UploadPool) {
 	entries, err := chunk.ScanPending(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pending: scan:", err)
@@ -1946,8 +1987,12 @@ func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstor
 		// (and, after a restart, re-found here). Format 2 keeps the
 		// content hash (the wire's AAD) in the staged file's name; it
 		// must reach chunk_map with the row.
-		gate.Add(info.Size())
-		packer.SubmitStaged(e.Ino, e.Idx, e.PlaintextSize, info.Size(), e.Path, e.Hash, "", 0, nil)
+		// Registered like a fresh write: `telfs sync` waits for it, and
+		// opening this file for writing waits until it has landed (a
+		// stale recovered wire must never overwrite a newer write).
+		pool.Disk.Add(info.Size())
+		res := pool.Register(e.Ino)
+		packer.SubmitRecovered(e.Ino, e.Idx, e.PlaintextSize, info.Size(), e.Path, e.Hash, res.Release)
 	}
 }
 
@@ -2560,4 +2605,46 @@ func lockProfile(cfg *config.Config) (*os.File, error) {
 		return nil, fmt.Errorf("mount: another telfs daemon for profile %s is starting or running (profile lock held)", cfg.ProfileName())
 	}
 	return f, nil
+}
+
+// unmountViaControl stops the daemon of mountpoint through its profile's
+// control socket and waits up to timeout for the process to exit. done is
+// false when there is no such daemon to talk to (fall back to signals).
+func unmountViaControl(mountpoint string, timeout time.Duration) (done bool, err error) {
+	var profile string
+	for _, m := range mountctl.ScanMounts() {
+		if m.Point == mountpoint {
+			profile, _ = mountctl.ProfileOf(m)
+		}
+	}
+	if profile == "" {
+		return false, nil
+	}
+	dir, derr := config.ProfileDir(profile)
+	if derr != nil {
+		return false, nil
+	}
+	resp, perr := control.Client(control.Path(dir), 10*time.Second).Post(control.BaseURL+"/stop", "application/json", nil)
+	if perr != nil {
+		return false, nil
+	}
+	var body struct {
+		PID int `json:"pid"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	fmt.Printf("Stopping mount daemon (pid %d) for %s — waiting for it to finish and exit…\n", body.PID, mountpoint)
+	deadline := time.Now().Add(timeout)
+	for syscall.Kill(body.PID, 0) == nil {
+		if time.Now().After(deadline) {
+			return true, fmt.Errorf("unmount: the daemon (pid %d) is still running after %s — its log says why; `telfs unmount --timeout` waits longer", body.PID, timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if mountctl.IsMounted(mountpoint) {
+		if err := mountctl.LazyUnmount(mountpoint); err != nil {
+			return true, fmt.Errorf("unmount: daemon exited but %s is still mounted: %w", mountpoint, err)
+		}
+	}
+	return true, nil
 }

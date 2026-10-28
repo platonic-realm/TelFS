@@ -222,6 +222,47 @@ from mounting the same channel read-write — two writers would silently
 lose each other's changes. Mount read-write in one place only; drill
 elsewhere with `--readonly`.
 
+## Talking to a running mount: status, sync, unmount
+
+Every mount serves its profile's **control socket**,
+`<profile>/daemon.sock`: mode 0600 inside the 0700 profile directory,
+and it answers only processes of the daemon's own user. These commands
+use it and need no secret — a backup or monitoring job never sees one:
+
+```sh
+telfs status --json            # one JSON object (schema 1); works mounted or not
+telfs sync                     # exit 0 if the channel holds everything now, 4 if not
+telfs sync --wait --timeout 6h # block until everything written before this call is on the channel
+telfs unmount <mountpoint|profile>   # returns when the daemon has exited
+```
+
+**What `sync --wait` guarantees when it returns 0:** every change made
+through the mount whose call had returned (`write`/`close`/`fsync`/
+`rename`, …) before `sync` was called is on the channel — its data
+uploaded and its journal ops posted, including where each chunk lives —
+so a cold recovery from the channel alone brings back at least that
+state, file for file. It does not promise a new snapshot (recovery
+replays the journal after the newest one) and says nothing about later
+changes. Format 2 only. Data of a file still open for writing counts
+once it is closed.
+
+`status --json` (schema 1 — fields are only ever added): `profile`,
+`fs_uuid`, `format`, `mounted`, `read_only`, `mountpoint`, `pid`,
+`link` (state ok/busy/down/fault), `sync` (synced, pending uploads and
+bytes, unposted journal ops, oldest pending age), `snapshot`,
+`versions`, `upload`, `staging` (dir, pending bytes, cap, blocked),
+`key_header`, `crypto_uses`, `last_error`. Without a running mount it
+reports from local state, with the live-only fields null.
+
+Exit codes, the same for every command: 0 ok · 1 usage or other error ·
+2 secret source unavailable · 3 wrong secret · 4 timeout / not synced
+yet · 5 not mounted · 6 Telegram or the channel unreachable or refused ·
+7 integrity problem (fsck findings, a recovery refused or incomplete).
+
+The TCP endpoint of earlier versions (`127.0.0.1:9090`) is off now;
+`--metrics-addr 127.0.0.1:9090` still serves Prometheus `/metrics` (and
+the JSON pages) for those who scrape it.
+
 ## Recovery
 
 Lose the local DB? The next `telfs mount` scans the channel for the

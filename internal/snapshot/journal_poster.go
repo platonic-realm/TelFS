@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gotd/td/tgerr"
@@ -73,6 +74,23 @@ type Poster struct {
 	// meta key, `blob` document, encrypted caption (decision D3 — the
 	// journal carried names, folders and sizes in clear before).
 	Keys *wire.Keys
+
+	kickOnce sync.Once
+	kick     chan struct{}
+}
+
+func (p *Poster) kickCh() chan struct{} {
+	p.kickOnce.Do(func() { p.kick = make(chan struct{}, 1) })
+	return p.kick
+}
+
+// Kick asks the poster to drain now instead of at its next tick
+// (`telfs sync` waits for the journal; it should not sit out 5 s).
+func (p *Poster) Kick() {
+	select {
+	case p.kickCh() <- struct{}{}:
+	default:
+	}
 }
 
 // Run drains the local journal periodically until ctx is canceled.
@@ -110,6 +128,13 @@ func (p *Poster) Run(ctx context.Context) error {
 			}
 			cancel()
 			return nil
+		case <-p.kickCh():
+			if time.Now().Before(lostUntil) {
+				continue
+			}
+			if err := p.drainOnce(ctx); err != nil && !channelLost(err) {
+				logger.Printf("[journal-poster] drain: %v", err)
+			}
 		case <-t.C:
 			if time.Now().Before(lostUntil) {
 				continue

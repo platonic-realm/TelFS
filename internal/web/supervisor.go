@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"telfs/internal/config"
+	"telfs/internal/control"
 	"telfs/internal/mountctl"
 	"telfs/internal/secret"
 )
@@ -165,19 +166,12 @@ type StartOpts struct {
 	Readonly   bool
 	AllowOther bool
 	Debug      bool
-	// MetricsAddr binds the daemon's debug HTTP endpoint (/metrics,
-	// /telegram). Empty falls back to DefaultMetricsAddr — that's the
-	// URL the web's Telegram tab fetches from, so the default just
-	// works for a single supervised mount. Multi-profile setups must
-	// pick distinct ports here (the kernel can't share a TCP listen).
+	// MetricsAddr, when set, also serves the daemon's Prometheus
+	// /metrics (and /telegram, /cache) over TCP. Empty = off: the
+	// console reads the daemon over the profile's control socket, so
+	// several profiles can be mounted at once without port clashes.
 	MetricsAddr string
 }
-
-// DefaultMetricsAddr is the daemon's debug HTTP bind when StartOpts
-// doesn't override. Matches the URL the web's Telegram tab fetches
-// from (internal/web/telegram.go), so the Telegram tab "just works"
-// after a default-options Start.
-const DefaultMetricsAddr = "127.0.0.1:9090"
 
 // Start spawns `telfs mount <mountpoint>` for the given profile,
 // captures stdout/stderr to a per-profile log file, and tracks the
@@ -260,11 +254,11 @@ func (s *Supervisor) Start(opts StartOpts) (*MountProcess, error) {
 	if opts.Debug {
 		args = append(args, "--debug")
 	}
-	metricsAddr := opts.MetricsAddr
-	if metricsAddr == "" {
-		metricsAddr = DefaultMetricsAddr
+	// The daemon's control socket serves the console; TCP metrics only
+	// when explicitly asked for.
+	if opts.MetricsAddr != "" {
+		args = append(args, "--metrics-addr", opts.MetricsAddr)
 	}
-	args = append(args, "--metrics-addr", metricsAddr)
 	var secretR, secretW *os.File
 	if opts.Passphrase != "" {
 		r, w, perr := os.Pipe()
@@ -615,7 +609,7 @@ func adoptFromProc(mountpoint string) *MountProcess {
 		}
 	}
 	if mp.LogPath == "" {
-		if st, err := fetchDaemonStatus(DefaultMetricsAddr); err == nil && st.Mountpoint == mountpoint {
+		if st, err := fetchDaemonStatus(mp.Profile); err == nil && st.Mountpoint == mountpoint {
 			mp.LogPath = st.LogPath
 		}
 	}
@@ -631,10 +625,13 @@ type daemonStatus struct {
 	Format     int    `json:"format"`
 }
 
-func fetchDaemonStatus(addr string) (daemonStatus, error) {
+func fetchDaemonStatus(profile string) (daemonStatus, error) {
 	var st daemonStatus
-	c := http.Client{Timeout: 2 * time.Second}
-	resp, err := c.Get("http://" + addr + "/status")
+	dir, err := config.ProfileDir(profile)
+	if err != nil {
+		return st, err
+	}
+	resp, err := control.Client(control.Path(dir), 2*time.Second).Get(control.BaseURL + "/status")
 	if err != nil {
 		return st, err
 	}

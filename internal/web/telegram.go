@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"telfs/internal/config"
+	"telfs/internal/control"
 	"telfs/internal/meta"
 	"telfs/internal/snapshot"
 	"telfs/internal/tg"
@@ -245,11 +246,8 @@ func loadOfflineSync(ctx context.Context, data *tgPageData) {
 }
 
 // telegramPage renders the connection-state + request-log view. Data
-// comes from the mount daemon's /telegram HTTP endpoint
-// (--metrics-addr), so the daemon must be running with metrics
-// enabled. We default to 127.0.0.1:9090 — the same default as
-// `telfs mount --metrics-addr`. Configurable via the
-// TELFS_METRICS_URL env var the daemon's wrapper might set.
+// comes from the active profile's mount daemon, over its control socket
+// (a `source=` URL reads a daemon started with --metrics-addr instead).
 func (s *Server) telegramPage(w http.ResponseWriter, r *http.Request) {
 	data := s.fetchTelegramState(w, r)
 	// Parse the partial alongside the page so {{template
@@ -275,7 +273,7 @@ func (s *Server) telegramPartial(w http.ResponseWriter, r *http.Request) {
 // poll doesn't consume the flash or rotate CSRF. The partial
 // template doesn't reference any pageBase fields anyway.
 func (s *Server) fetchTelegramStatePartial(r *http.Request) tgPageData {
-	url := "http://127.0.0.1:9090/telegram"
+	url := controlSource
 	if v, ok := sanitizeSourceURL(r.URL.Query().Get("source")); ok {
 		url = v
 	}
@@ -357,7 +355,7 @@ func sanitizeSourceURL(v string) (string, bool) {
 // fetchTelegramState pulls + parses the daemon's /telegram JSON for
 // the full-page render (CSRF + flash needed for the form).
 func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPageData {
-	url := "http://127.0.0.1:9090/telegram"
+	url := controlSource
 	if v, ok := sanitizeSourceURL(r.URL.Query().Get("source")); ok {
 		url = v
 	}
@@ -382,7 +380,13 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 // fetchTelegramStatePartial (htmx fragment) can share the network
 // step without dragging in basePage's CSRF/flash side effects.
 func populateTGState(data *tgPageData, url string) {
-	resp, err := httpClient.Get(url)
+	var resp *http.Response
+	var err error
+	if url == controlSource {
+		resp, err = daemonGet("/telegram")
+	} else {
+		resp, err = httpClient.Get(url)
+	}
 	if err != nil {
 		data.Online = false
 		data.FetchError = err.Error()
@@ -422,6 +426,21 @@ func populateTGState(data *tgPageData, url string) {
 // is local and trivial; if it doesn't respond in 2 s, the daemon
 // itself is wedged and the user needs to know.
 var httpClient = &http.Client{Timeout: 2 * time.Second}
+
+// controlSource is the default daemon source: the active profile's
+// owner-only control socket (spec v1 §3). A `source=` URL (loopback only)
+// still reads a daemon started with --metrics-addr over TCP.
+const controlSource = "the profile's control socket"
+
+// daemonGet fetches path from the active profile's running daemon over its
+// control socket.
+func daemonGet(path string) (*http.Response, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	return control.Client(control.Path(cfg.DataDir), 2*time.Second).Get(control.BaseURL + path)
+}
 
 // openMetaExisting opens the active profile's meta DB ONLY if the
 // file already exists. meta.Open bootstraps schema + a fresh fs_uuid

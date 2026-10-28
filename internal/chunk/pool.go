@@ -76,6 +76,11 @@ type UploadPool struct {
 	// back from disk. Nil keeps the in-memory pipeline (tests, mocks).
 	Disk *DiskGate
 
+	// Registrations by number (Register → Release), for `telfs sync`.
+	regMu   sync.Mutex
+	regNext uint64
+	regOpen map[uint64]time.Time
+
 	qmu       sync.Mutex
 	queue     []*stagedJob
 	qsignal   chan struct{}
@@ -278,6 +283,7 @@ func (p *UploadPool) Cap() int { return cap(p.sem) }
 type Reservation struct {
 	pool        *UploadPool
 	ino         int64
+	seq         uint64
 	semHeld     bool
 	pendingHeld bool
 }
@@ -303,6 +309,9 @@ func (r *Reservation) Release() {
 		return
 	}
 	r.pendingHeld = false
+	r.pool.regMu.Lock()
+	delete(r.pool.regOpen, r.seq)
+	r.pool.regMu.Unlock()
 	r.pool.Pending.End(r.ino)
 	r.pool.wg.Done()
 }
@@ -316,7 +325,51 @@ func (r *Reservation) Release() {
 func (p *UploadPool) Register(ino int64) *Reservation {
 	p.wg.Add(1)
 	p.Pending.Begin(ino)
-	return &Reservation{pool: p, ino: ino, pendingHeld: true}
+	p.regMu.Lock()
+	p.regNext++
+	seq := p.regNext
+	if p.regOpen == nil {
+		p.regOpen = map[uint64]time.Time{}
+	}
+	p.regOpen[seq] = time.Now()
+	p.regMu.Unlock()
+	return &Reservation{pool: p, ino: ino, seq: seq, pendingHeld: true}
+}
+
+// LastRegistered is the number of the newest registration (0 = none yet).
+// `telfs sync` takes it as its barrier: every upload registered up to it
+// was dispatched before the sync was asked for (spec v1, §3).
+func (p *UploadPool) LastRegistered() uint64 {
+	p.regMu.Lock()
+	defer p.regMu.Unlock()
+	return p.regNext
+}
+
+// OpenUpTo counts the registrations up to seq that have not been released
+// (their upload has not landed).
+func (p *UploadPool) OpenUpTo(seq uint64) int {
+	p.regMu.Lock()
+	defer p.regMu.Unlock()
+	n := 0
+	for s := range p.regOpen {
+		if s <= seq {
+			n++
+		}
+	}
+	return n
+}
+
+// OpenStats reports the open registrations and when the oldest was made
+// (zero time when none).
+func (p *UploadPool) OpenStats() (open int, oldest time.Time) {
+	p.regMu.Lock()
+	defer p.regMu.Unlock()
+	for _, t := range p.regOpen {
+		if oldest.IsZero() || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	return len(p.regOpen), oldest
 }
 
 // AcquireSem blocks until an upload concurrency slot frees (or a ctx

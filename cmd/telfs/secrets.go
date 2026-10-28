@@ -83,6 +83,14 @@ func exitCode(err error) int {
 		return 2
 	case errors.Is(err, crypto.ErrWrongSecret):
 		return 3
+	case errors.Is(err, errNotSynced):
+		return 4
+	case errors.Is(err, errNotMounted):
+		return 5
+	case errors.Is(err, errTelegram):
+		return 6
+	case errors.Is(err, errIntegrity):
+		return 7
 	default:
 		return 1
 	}

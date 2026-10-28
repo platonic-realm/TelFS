@@ -29,6 +29,9 @@ const KVCurrentMsgID = "snap_msg_id"
 // value.
 const KVCurrentJournalSeq = "snap_journal_seq"
 
+// KVLastSnapUnix is when the newest snapshot was taken (unix seconds).
+const KVLastSnapUnix = "snap_last_unix"
+
 // DefaultInterval is how often the cadence goroutine snapshots.
 const DefaultInterval = 5 * time.Minute
 
@@ -273,6 +276,8 @@ func (m *Manager) Once(ctx context.Context) error {
 	if err := storeCurrentJournalSeq(ctx, m.Meta, snap.JournalSeq); err != nil {
 		return fmt.Errorf("persist new snap journal seq: %w", err)
 	}
+	// When it was taken (`telfs status --json`: snapshot.last_unix).
+	_ = m.Meta.PutKV(ctx, KVLastSnapUnix, []byte(strconv.FormatInt(time.Now().Unix(), 10)))
 	// Local journal pruning: rows with seq <= this snapshot's seq that
 	// have ALSO been posted to the channel are superseded — their
 	// effects are inside the snapshot we just uploaded, and channel-

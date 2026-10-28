@@ -190,3 +190,11 @@ func (s *Store) AdvanceJournalSeq(ctx context.Context, seq int64) error {
 		return err
 	})
 }
+
+// UnpostedUpTo counts the journal rows up to seq that have not been posted
+// to the channel yet (`telfs sync`).
+func (s *Store) UnpostedUpTo(ctx context.Context, seq int64) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal WHERE seq <= ? AND posted_at IS NULL`, seq).Scan(&n)
+	return n, err
+}
