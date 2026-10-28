@@ -22,6 +22,10 @@ type MountOptions struct {
 	// daemon hides — and the single-writer guard can see them.
 	Profile string
 	FSUUID  string
+	// Version, when set, marks a mount of that version of the filesystem
+	// (source "telfs:<profile>:<fs_uuid>:v=<name>"); the single-writer
+	// guard ignores such mounts.
+	Version string
 	// ReadOnly adds the kernel "ro" option (the backend refuses writes
 	// with EROFS too); visible in /proc/mounts.
 	ReadOnly bool
@@ -48,6 +52,9 @@ func Mount(opts MountOptions, b *Backend) (*serverHandle, error) {
 	fuseOpts.MountOptions.FsName = "telfs"
 	if opts.Profile != "" {
 		fuseOpts.MountOptions.FsName = mountctl.SourceFor(opts.Profile, opts.FSUUID)
+		if opts.Version != "" {
+			fuseOpts.MountOptions.FsName = mountctl.SourceForVersion(opts.Profile, opts.FSUUID, opts.Version)
+		}
 	}
 	if opts.ReadOnly {
 		fuseOpts.MountOptions.Options = append(fuseOpts.MountOptions.Options, "ro")

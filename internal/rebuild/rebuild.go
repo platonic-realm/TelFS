@@ -91,6 +91,10 @@ type Result struct {
 	// if any chunk used it).
 	ChunkSizes map[int64]int
 	Codecs     map[string]int
+	// Versions are the version messages found (their captions name
+	// them), oldest first: the rebuilt filesystem's version registry —
+	// telfs gc must keep refusing while they exist.
+	Versions []wire.AnchorVersion
 }
 
 type chunkObs struct {
@@ -169,12 +173,15 @@ func Run(ctx context.Context, src Source, keys *wire.Keys, m *meta.Store, opt Op
 			batches = append(batches, jbatch{msgID: msg.ID, cap: c})
 		case wire.KindSnapshot:
 			res.Stats.Snapshots++
+		case wire.KindVersion:
+			res.Versions = append(res.Versions, wire.VersionFromCaption(c, msg.ID))
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	sort.SliceStable(res.Versions, func(i, j int) bool { return res.Versions[i].Msg < res.Versions[j].Msg })
 	logf("Reading %d pack index(es)…", len(packs))
 	for _, p := range packs {
 		raw, err := src.ReadRange(ctx, p.msgID, p.cap.IO, p.cap.IL)

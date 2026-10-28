@@ -1,6 +1,6 @@
 // Package control is the daemon's control socket (spec v1, rows 5 and 10):
 // an HTTP server on a Unix socket in the profile directory, through which
-// `telfs status`, `sync`, `unmount` (and later `versions`, `fsck --quick`)
+// `telfs status`, `sync`, `unmount`, `versions` (and later `fsck --quick`)
 // talk to the running mount — without the secret, which only the daemon
 // holds. Owner-only: the socket is mode 0600 inside the 0700 profile
 // directory, and every connection's peer uid (SO_PEERCRED) must be the
@@ -9,6 +9,8 @@ package control
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -27,6 +29,15 @@ const BaseURL = "http://telfs"
 
 // Path is the control socket of the profile whose data dir is dir.
 func Path(dir string) string { return filepath.Join(dir, SocketName) }
+
+// VersionPath is the control socket of the mount of version name of the
+// profile whose data dir is dir: in its versions directory, named by a
+// hash of the version name (a socket path is limited to 107 bytes; a
+// version name may be 64 characters long).
+func VersionPath(dir, name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return filepath.Join(dir, "versions", "v-"+hex.EncodeToString(sum[:8])+".sock")
+}
 
 // ErrBusy: a live daemon already serves the socket.
 var ErrBusy = errors.New("another telfs daemon serves this profile's control socket")

@@ -58,6 +58,7 @@ type PolicyState struct {
 	Due          string    // a snapshot is owed now (snap_due), the reason
 	HaveJnlAfter bool      // its journal boundary is recorded (not for snapshots from before v1)
 	AnchorSnap   int       // the snapshot the posted anchor names (0: no anchor)
+	AnchorDue    bool      // the posted anchor's version list is out of date (anchor_due)
 }
 
 // Action is what the policy asks for.
@@ -118,6 +119,9 @@ func (p Policy) Decide(st PolicyState, now time.Time) (Action, string) {
 	if st.AnchorSnap != st.SnapMsg {
 		return ActAnchor, "the anchor does not name the newest snapshot"
 	}
+	if st.AnchorDue {
+		return ActAnchor, "the anchor's version list is out of date"
+	}
 	return ActNone, ""
 }
 
@@ -157,5 +161,10 @@ func LoadPolicyState(ctx context.Context, m *meta.Store) (PolicyState, error) {
 	_, err = m.GetKV(ctx, KVSnapJnlAfter)
 	st.HaveJnlAfter = err == nil
 	st.AnchorSnap = int(kvInt(ctx, m, KVAnchorSnapID))
+	if _, err := m.GetKV(ctx, KVAnchorDue); err == nil {
+		st.AnchorDue = true
+	} else if !errors.Is(err, meta.ErrNotFound) {
+		return st, err
+	}
 	return st, nil
 }

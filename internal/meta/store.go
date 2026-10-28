@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -138,6 +139,39 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("meta: init schema: %w", err)
 	}
 	return s, nil
+}
+
+// OpenReadOnly opens an EXISTING metadata DB for reading only: SQLite
+// refuses every write (mode=ro), a missing file is an error — never
+// created, never given a schema or an fs_uuid — and the schema is not
+// touched. immutable additionally tells SQLite the file cannot change
+// while open (no locks, no -wal/-shm): only for a file nothing else
+// writes, such as a downloaded version. Without it, a DB a running
+// daemon writes can be read concurrently, as with Open.
+func OpenReadOnly(path string, immutable bool) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("meta: %w", err)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("meta: %w", err)
+	}
+	q := "?mode=ro"
+	if immutable {
+		q += "&immutable=1"
+	}
+	dsn := (&url.URL{Scheme: "file", Path: abs}).String() + q + "&_pragma=busy_timeout(60000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("meta: open %s: %w", path, err)
+	}
+	db.SetMaxOpenConns(8)
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM meta_kv`).Scan(&n); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("meta: %s is not a TelFS metadata DB: %w", path, err)
+	}
+	return &Store{db: db}, nil
 }
 
 // Close releases the database handle. Safe to call multiple times.

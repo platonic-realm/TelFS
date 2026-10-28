@@ -602,7 +602,10 @@ func adoptFromProc(mountpoint string) *MountProcess {
 		LogPath:    mountctl.ResolveStdoutLog(pid),
 	}
 	for _, m := range mountctl.ScanMounts() {
-		if m.Point == mountpoint {
+		// A version mount is not its profile's mount: it is tracked
+		// under its mountpoint, so stopping the profile never stops it
+		// (nor does it hide the live mount).
+		if m.Point == mountpoint && mountctl.VersionOf(m) == "" {
 			if p, ok := mountctl.ProfileOf(m); ok {
 				mp.Profile = p
 			}

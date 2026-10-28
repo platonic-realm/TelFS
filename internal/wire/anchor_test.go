@@ -55,8 +55,8 @@ func TestAnchorSealOpen(t *testing.T) {
 	}
 }
 
-// The versions list is always present in the JSON (filled later by the
-// versions feature), and an anchor naming no snapshot, another
+// The versions list is always present in the JSON (empty when the
+// filesystem has no versions), and an anchor naming no snapshot, another
 // filesystem or a newer version is refused.
 func TestAnchorChecks(t *testing.T) {
 	k, _ := testKeys(t)

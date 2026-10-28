@@ -448,3 +448,43 @@ func attrTree(t *testing.T, m *meta.Store) map[string]string {
 	walk(meta.RootIno, "")
 	return out
 }
+
+// Version messages are found by their captions and become the rebuilt
+// filesystem's registry (oldest first); deleted ones are gone.
+func TestRebuildKeepsVersions(t *testing.T) {
+	ctx := context.Background()
+	f := newFS(t)
+	f.write(meta.RootIno, "a.txt", rnd(5000))
+	f.postJournal()
+	post := func(v wire.AnchorVersion) int {
+		body, capt, err := f.keys.SealVersion(v, []byte("db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := f.ch.UploadDocument(ctx, bytes.NewReader(body), wire.DocName, capt)
+		return id
+	}
+	daily := wire.AnchorVersion{Name: "daily", Seq: 3, Created: 1761650000, Size: 4096, SHA256: strings.Repeat("01", 32)}
+	daily.Msg = post(daily)
+	gone := post(wire.AnchorVersion{Name: "gone", Seq: 4, Created: 1761650100, Size: 4096})
+	weekly := wire.AnchorVersion{Name: "weekly", Seq: 5, Created: 1761650200, Size: 8192}
+	weekly.Msg = post(weekly)
+	f.ch.mu.Lock()
+	f.ch.msgs[gone-1].data = nil // `versions delete`
+	f.ch.mu.Unlock()
+	m2, err := meta.Open(filepath.Join(t.TempDir(), "rebuilt.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Close()
+	res, err := Run(ctx, f.ch, f.keys, m2, Options{UseJournal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Versions) != 2 || res.Versions[0] != daily || res.Versions[1] != weekly {
+		t.Fatalf("versions %+v, want [%+v %+v]", res.Versions, daily, weekly)
+	}
+	if _, err := m2.Lookup(ctx, meta.RootIno, "a.txt"); err != nil {
+		t.Fatalf("the file must be rebuilt next to the versions: %v", err)
+	}
+}

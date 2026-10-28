@@ -123,3 +123,64 @@ func TestWriterConflict(t *testing.T) {
 		}
 	}
 }
+
+// A version mount's source names the profile, the filesystem and the
+// version; a live mount's names no version.
+func TestVersionSource(t *testing.T) {
+	const fs = "8f14e45f-ceea"
+	v := Mount{Source: SourceForVersion("backup", fs, "daily-2026-10-28"), Point: "/mnt/v"}
+	if v.Source != "telfs:backup:8f14e45f-ceea:v=daily-2026-10-28" {
+		t.Fatalf("source %q", v.Source)
+	}
+	if p, ok := ProfileOf(v); !ok || p != "backup" || FSUUIDOf(v) != fs || VersionOf(v) != "daily-2026-10-28" {
+		t.Fatalf("version source → %q %v %q %q", p, ok, FSUUIDOf(v), VersionOf(v))
+	}
+	for _, src := range []string{SourceFor("backup", fs), SourceFor("backup", ""), "telfs"} {
+		if got := VersionOf(Mount{Source: src}); got != "" {
+			t.Fatalf("%q: version %q", src, got)
+		}
+	}
+}
+
+// The single-writer guard ignores version mounts: a version mount never
+// blocks the boot (read-write) mount of its profile and filesystem, nor
+// a read-only drill; the live mount still blocks a second live mount.
+func TestWriterConflictIgnoresVersionMounts(t *testing.T) {
+	const fs = "8f14e45f-0000"
+	ver := Mount{Source: SourceForVersion("backup", fs, "weekly"), Point: "/mnt/weekly", ReadOnly: true}
+	ver2 := Mount{Source: SourceForVersion("backup", fs, "monthly"), Point: "/mnt/monthly", ReadOnly: true}
+	live := Mount{Source: SourceFor("backup", fs), Point: "/srv/backup"}
+	for _, ro := range []bool{false, true} {
+		for _, f := range []string{"", fs} {
+			if c := writerConflict([]Mount{ver, ver2}, "backup", f, ro); c != "" {
+				t.Errorf("ro=%v fs=%q: blocked by version mounts: %s", ro, f, c)
+			}
+		}
+	}
+	if c := writerConflict([]Mount{ver, live}, "backup", fs, false); c == "" {
+		t.Error("the live mount must still block a second live mount")
+	}
+}
+
+// `telfs unmount <profile>` stops the live mount, never a version mount;
+// the safety checks see version mounts too (they use the session).
+func TestFindByProfileVersionMounts(t *testing.T) {
+	const fs = "8f14e45f-0000"
+	ver := Mount{Source: SourceForVersion("backup", fs, "weekly"), Point: "/definitely/not/v"}
+	live := Mount{Source: SourceFor("backup", fs), Point: "/definitely/not/live"}
+	if _, mp, ok, err := findByProfile([]Mount{ver, live}, "backup", false); !ok || err != nil || mp != live.Point {
+		t.Fatalf("any: %q %v %v, want the live mount", mp, ok, err)
+	}
+	if _, mp, ok, err := findByProfile([]Mount{ver}, "backup", false); !ok || err != nil || mp != ver.Point {
+		t.Fatalf("any, version only: %q %v %v", mp, ok, err)
+	}
+	if _, mp, ok, err := findByProfile([]Mount{ver}, "backup", true); ok || err != nil {
+		t.Fatalf("live only, version only: %q %v %v", mp, ok, err)
+	}
+	if _, mp, ok, _ := findByProfile([]Mount{ver, live}, "backup", true); !ok || mp != live.Point {
+		t.Fatalf("live only: %q %v", mp, ok)
+	}
+	if _, _, ok, _ := findByProfile([]Mount{ver, live}, "other", false); ok {
+		t.Fatal("another profile matched")
+	}
+}

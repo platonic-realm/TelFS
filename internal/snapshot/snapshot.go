@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"io"
@@ -33,6 +34,11 @@ type Snapshot struct {
 	// meta-ops yet, so this is informational (set to LastJournalSeq at
 	// snapshot time).
 	JournalSeq int64
+	// RawSize and RawSHA256 describe the SQLite file itself (before
+	// gzip): what a restore writes. A version records them so a version
+	// mount can tell a local copy is the right one.
+	RawSize   int64
+	RawSHA256 []byte
 }
 
 // Take produces a Snapshot of the DB rooted at the provided meta.Store.
@@ -74,7 +80,9 @@ func Take(ctx context.Context, m *meta.Store) (*Snapshot, error) {
 
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
-	if _, err := io.Copy(gw, src); err != nil {
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(gw, h), src)
+	if err != nil {
 		return nil, fmt.Errorf("snapshot: gzip: %w", err)
 	}
 	if err := gw.Close(); err != nil {
@@ -85,6 +93,8 @@ func Take(ctx context.Context, m *meta.Store) (*Snapshot, error) {
 		Bytes:      buf.Bytes(),
 		FSUUID:     uuid,
 		JournalSeq: seq,
+		RawSize:    n,
+		RawSHA256:  h.Sum(nil),
 	}, nil
 }
 

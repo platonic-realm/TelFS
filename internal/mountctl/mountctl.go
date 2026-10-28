@@ -47,6 +47,17 @@ func SourceFor(profile, fsUUID string) string {
 	return SourcePrefix + profile + ":" + fsUUID
 }
 
+// versionField marks a version mount's source.
+const versionField = "v="
+
+// SourceForVersion is the mount source of a read-only mount of a
+// filesystem's version (spec v1 §2): "telfs:<profile>:<fs_uuid>:v=<name>"
+// (version names have no ':'). Older readers see the profile as before
+// and an fs_uuid that matches no filesystem.
+func SourceForVersion(profile, fsUUID, version string) string {
+	return SourceFor(profile, fsUUID) + ":" + versionField + version
+}
+
 // Mount is one fuse.telfs entry of /proc/mounts.
 type Mount struct {
 	Source   string
@@ -54,14 +65,28 @@ type Mount struct {
 	ReadOnly bool // mounted with the "ro" option
 }
 
+// sourceFields splits a P1+ mount source into profile, fs_uuid, rest.
+func sourceFields(m Mount) []string {
+	if !strings.HasPrefix(m.Source, SourcePrefix) {
+		return nil
+	}
+	return strings.Split(strings.TrimPrefix(m.Source, SourcePrefix), ":")
+}
+
 // FSUUIDOf returns the fs_uuid in a P1+ mount source, or "".
 func FSUUIDOf(m Mount) string {
-	if !strings.HasPrefix(m.Source, SourcePrefix) {
-		return ""
+	if f := sourceFields(m); len(f) >= 2 {
+		return f[1]
 	}
-	parts := strings.SplitN(strings.TrimPrefix(m.Source, SourcePrefix), ":", 2)
-	if len(parts) == 2 {
-		return parts[1]
+	return ""
+}
+
+// VersionOf returns the version a mount serves ("" for a mount of the
+// live filesystem).
+func VersionOf(m Mount) string {
+	f := sourceFields(m)
+	if len(f) >= 3 && strings.HasPrefix(f[2], versionField) {
+		return strings.TrimPrefix(f[2], versionField)
 	}
 	return ""
 }
@@ -229,31 +254,68 @@ func FindDaemonPid(mountpoint string) (int, bool) {
 	return 0, false
 }
 
-// FindByProfile locates the TelFS mount of a profile and its daemon
-// (pid 0 when the mount is orphaned). It FAILS CLOSED: when no mount
-// matches but some mount's profile is unknown, it returns
-// *ErrUnknownMount — the caller is a safety check (delete, reset-auth,
-// logout) and must refuse rather than assume "not mounted".
+// FindByProfile locates a TelFS mount of a profile and its daemon (pid 0
+// when the mount is orphaned): the live filesystem's mount, else a
+// version mount — every mount of the profile uses its session, so a
+// safety check (delete, reset-auth, logout, secret change) must see them
+// all. It FAILS CLOSED: when no mount matches but some mount's profile is
+// unknown, it returns *ErrUnknownMount — the caller must refuse rather
+// than assume "not mounted".
 func FindByProfile(profile string) (pid int, mountpoint string, found bool, err error) {
+	return findByProfile(ScanMounts(), profile, false)
+}
+
+// FindLiveByProfile is FindByProfile for the live filesystem's mount only
+// (version mounts are ignored): the mount `telfs unmount <profile>` stops.
+func FindLiveByProfile(profile string) (pid int, mountpoint string, found bool, err error) {
+	return findByProfile(ScanMounts(), profile, true)
+}
+
+func findByProfile(mounts []Mount, profile string, liveOnly bool) (pid int, mountpoint string, found bool, err error) {
 	if profile == "" {
 		return 0, "", false, nil
 	}
 	var unknown []string
-	for _, m := range ScanMounts() {
+	version := ""
+	for _, m := range mounts {
 		p, ok := ProfileOf(m)
 		if !ok {
 			unknown = append(unknown, m.Point)
 			continue
 		}
-		if p == profile {
+		if p != profile {
+			continue
+		}
+		if VersionOf(m) == "" {
 			pid, _ := FindDaemonPid(m.Point)
 			return pid, m.Point, true, nil
 		}
+		if !liveOnly && version == "" {
+			version = m.Point
+		}
+	}
+	if version != "" {
+		pid, _ := FindDaemonPid(version)
+		return pid, version, true, nil
 	}
 	if len(unknown) > 0 {
 		return 0, "", false, &ErrUnknownMount{Mountpoints: unknown}
 	}
 	return 0, "", false, nil
+}
+
+// VersionMounts returns the mounts of a profile's versions, by version
+// name (one mountpoint each: a version's lock allows one mount).
+func VersionMounts(profile string) map[string]string {
+	out := map[string]string{}
+	for _, m := range ScanMounts() {
+		if p, ok := ProfileOf(m); ok && p == profile {
+			if v := VersionOf(m); v != "" {
+				out[v] = m.Point
+			}
+		}
+	}
+	return out
 }
 
 // ReadEnvVar pulls a single environment variable's value from
@@ -398,6 +460,12 @@ var ErrNoDaemon = errors.New("no telfs mount daemon found")
 //   - fail closed: a TelFS mount whose profile or filesystem cannot be
 //     told (made by an older telfs) blocks a read-write mount.
 //
+// Version mounts are ignored: one serves its own read-only copy of a
+// version (its own DB file, lock and cache) and writes nothing to the
+// channel, so it never blocks the live mount — nor the boot mount it.
+// (A version mount itself is not checked here: its version lock is its
+// guard.)
+//
 // fsUUID may be "" (not known yet, before recovery): then only the
 // profile is checked.
 func WriterConflict(profile, fsUUID string, readOnly bool) string {
@@ -406,6 +474,9 @@ func WriterConflict(profile, fsUUID string, readOnly bool) string {
 
 func writerConflict(mounts []Mount, profile, fsUUID string, readOnly bool) string {
 	for _, m := range mounts {
+		if VersionOf(m) != "" {
+			continue
+		}
 		p, known := ProfileOf(m)
 		if known && p == profile {
 			return fmt.Sprintf("profile %s is already mounted at %s — one daemon per profile (they would share db.sqlite)", profile, m.Point)

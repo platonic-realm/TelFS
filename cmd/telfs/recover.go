@@ -144,12 +144,17 @@ func cmdRecover(ctx context.Context, args []string) error {
 		if err := seedUsesFromRebuild(ctx, m, res.Stats); err != nil {
 			return err
 		}
+		// The versions found by their captions are the registry (gc
+		// refuses while any exist; the next anchor lists them).
+		if err := snapshot.StoreVersions(ctx, m, res.Versions); err != nil {
+			return err
+		}
 		if err := writeReport(*reportPath, res); err != nil {
 			return err
 		}
 		st := res.Stats
-		fmt.Printf("\nRead %d messages: %d chunk captions, %d packs (%d files inside), %d journal batches, %d snapshots (ignored).\n",
-			st.Messages, st.ChunkCaptions, st.Packs, st.PackEntries, st.JournalBatches, st.Snapshots)
+		fmt.Printf("\nRead %d messages: %d chunk captions, %d packs (%d files inside), %d journal batches, %d snapshots (ignored), %d version(s) (kept).\n",
+			st.Messages, st.ChunkCaptions, st.Packs, st.PackEntries, st.JournalBatches, st.Snapshots, len(res.Versions))
 		if *journal == "use" {
 			fmt.Printf("Journal: %d op(s) replayed, %d skipped (their parent folder was unknown); %d deleted file(s) kept deleted.\n",
 				st.JournalOps, st.JournalOpsSkipped, st.DeletedByJournal)

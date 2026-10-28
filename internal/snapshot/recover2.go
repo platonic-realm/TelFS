@@ -98,16 +98,22 @@ func Fetch2(ctx context.Context, ch Channel, keys *wire.Keys, pins []tg.ChannelM
 // replayed) describe the channel. A snapshot's DB is copied before its
 // own record is written, so it names the snapshot BEFORE it, that one's
 // anchor and possibly a pending snap_due: without this the policy would
-// measure from the wrong snapshot.
+// measure from the wrong snapshot. With an anchor, the version registry
+// is the anchor's list (without one, the snapshot's registry stays).
 func RecordRecovered(ctx context.Context, m *meta.Store, loc Located2) error {
 	ints := []kvInt64{{KVCurrentMsgID, int64(loc.SnapMsg)}, {KVCurrentJournalSeq, loc.SnapSeq}}
 	if loc.SnapTS > 0 {
 		ints = append(ints, kvInt64{KVLastSnapUnix, loc.SnapTS})
 	}
-	drop := []string{KVSnapDue}
+	drop := []string{KVSnapDue, KVAnchorDue}
 	if loc.Anchor != nil {
 		ints = append(ints, kvInt64{KVSnapJnlAfter, int64(loc.JnlAfter)},
 			kvInt64{KVAnchorMsgID, int64(loc.Anchor.MsgID)}, kvInt64{KVAnchorSnapID, int64(loc.SnapMsg)})
+		// The anchor is re-posted after every version change; the
+		// snapshot's own registry is as old as the snapshot.
+		if err := StoreVersions(ctx, m, loc.Anchor.Anchor.Versions); err != nil {
+			return err
+		}
 	} else {
 		// Found by scanning: no boundary known (the policy posts an
 		// anchor, or takes one snapshot, at the next mount).

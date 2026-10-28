@@ -40,6 +40,7 @@ func TestPolicyDecide(t *testing.T) {
 		{"anchor names an older snapshot", with(func(s *PolicyState) { s.AnchorSnap = 40 }), ActAnchor},
 		{"no anchor yet", with(func(s *PolicyState) { s.AnchorSnap = 0 }), ActAnchor},
 		{"threshold beats a stale anchor", with(func(s *PolicyState) { s.AnchorSnap = 40; s.CurrentSeq = 5000 }), ActSnapshotQuiet},
+		{"version list changed, anchor not re-posted", with(func(s *PolicyState) { s.AnchorDue = true }), ActAnchor},
 	} {
 		got, why := p.Decide(tc.st, now)
 		if got != tc.want {

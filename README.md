@@ -45,6 +45,7 @@ End-to-end verified on a real Telegram account + private channel:
 | Web management UI: dashboard, login wizard, mount supervisor, file browser | ✓ (`telfs web`) |
 | `telfs trash` — `rm` reroutes to `/.trash`, TTL GC | ✓ |
 | Snapshot history + point-in-time restore (last 12 by default) | ✓ |
+| Versions (format 2): named, immutable whole-filesystem versions, each mountable read-only next to the live mount | ✓ (`telfs versions`) |
 | Content-addressed chunk dedup, keyed hash (format 2; format 1: plaintext + convergent) | ✓ |
 | Multi-mounter coordination | ✗ assume one mount per channel |
 
@@ -201,7 +202,7 @@ the meta DB instead), and tears down the MTProto session.
 ## Mount options
 
 ```
-telfs mount [--readonly] [--allow-other] [--debug] <mountpoint>
+telfs mount [--readonly [--version NAME]] [--allow-other] [--debug] <mountpoint>
 ```
 
 `--allow-other` needs `user_allow_other` in `/etc/fuse.conf`.
@@ -224,6 +225,10 @@ from mounting the same channel read-write — two writers would silently
 lose each other's changes. Mount read-write in one place only; drill
 elsewhere with `--readonly`.
 
+`--readonly --version NAME` mounts a [version](#versions) instead of
+the live tree; it may run next to the live read-write mount of the
+same profile.
+
 ## Talking to a running mount: status, sync, unmount
 
 Every mount serves its profile's **control socket**,
@@ -236,6 +241,7 @@ telfs status --json            # one JSON object (schema 1); works mounted or no
 telfs sync                     # exit 0 if the channel holds everything now, 4 if not
 telfs sync --wait --timeout 6h # block until everything written before this call is on the channel
 telfs unmount <mountpoint|profile>   # returns when the daemon has exited
+telfs versions create NAME     # see Versions
 ```
 
 **What `sync --wait` guarantees when it returns 0:** every change made
@@ -249,12 +255,15 @@ changes. Format 2 only. Data of a file still open for writing counts
 once it is closed.
 
 `status --json` (schema 1 — fields are only ever added): `profile`,
-`fs_uuid`, `format`, `mounted`, `read_only`, `mountpoint`, `pid`,
-`link` (state ok/busy/down/fault), `sync` (synced, pending uploads and
-bytes, unposted journal ops, oldest pending age), `snapshot`,
-`versions`, `upload`, `staging` (dir, pending bytes, cap, blocked),
-`key_header`, `crypto_uses`, `last_error`. Without a running mount it
-reports from local state, with the live-only fields null.
+`fs_uuid`, `format`, `mounted`, `read_only`, `version_mount`,
+`mountpoint`, `pid`, `link` (state ok/busy/down/fault), `sync` (synced,
+pending uploads and bytes, unposted journal ops, oldest pending age),
+`snapshot`, `versions` (count, newest name and creation time),
+`upload`, `staging` (dir, pending bytes, cap, blocked), `key_header`,
+`crypto_uses`, `last_error`. Without a running mount it reports from
+local state, with the live-only fields null. `telfs status --json
+--version NAME` asks that version's mount instead (`version_mount` =
+its name; exit 5 when it is not mounted).
 
 Exit codes, the same for every command: 0 ok · 1 usage or other error ·
 2 secret source unavailable · 3 wrong secret · 4 timeout / not synced
@@ -264,6 +273,58 @@ yet · 5 not mounted · 6 Telegram or the channel unreachable or refused ·
 The TCP endpoint of earlier versions (`127.0.0.1:9090`) is off now;
 `--metrics-addr 127.0.0.1:9090` still serves Prometheus `/metrics` (and
 the JSON pages) for those who scrape it.
+
+## Versions
+
+A version is a whole-filesystem snapshot kept under a name until you
+delete it (format 2). It is immutable by construction: one sealed
+message on the channel that nothing ever edits.
+
+```sh
+telfs versions create daily-2026-10-28 [--timeout 6h]
+telfs versions list [--json]
+telfs versions delete daily-2026-10-28
+telfs mount --readonly --version daily-2026-10-28 /mnt/daily
+telfs unmount /mnt/daily
+```
+
+- **create** talks to the running mount (no secret needed). It first
+  waits exactly like `sync --wait` — everything written through the
+  mount before the call reaches the channel — then uploads an encrypted
+  copy of the database as the version, records it in the local
+  registry and re-posts the pinned anchor with the version list. Exit
+  0 once the version is on the channel; 4 when the sync did not finish
+  within `--timeout` (nothing was posted); 5 without a running mount; 6
+  when Telegram failed. Names: 1–64 characters of `A-Z a-z 0-9 . _ -`,
+  unique (a duplicate exits 1). Changes made *while* create runs may be
+  caught half-way — create a version once the writer (rsync) is done.
+- **list** asks the running mount, else reads the local registry
+  (read-only, no secret). `--json` prints `{"versions": [{name, msg_id,
+  created_unix, seq, size, sha256, mountpoint}]}`, oldest first;
+  `mountpoint` is set while that version is mounted. Retention is the
+  caller's (e.g. the backup job deletes what it no longer keeps).
+- **delete** goes through the running mount: the version's message,
+  its registry entry and its local copy go, and the anchor is
+  re-posted. Refused while the version is mounted.
+- **mount --readonly --version NAME** downloads the version once into
+  `<profile>/versions/NAME.sqlite` (kept and reused while it matches the
+  registry's size and SHA-256), opens it immutable and serves it
+  read-only, with its own cache (`NAME.cache/`), lock and control
+  socket. It writes nothing to the channel, nor to the live
+  filesystem's database, staging directory or cache, and the
+  one-writer guard ignores it (its mount source ends in `:v=NAME`): it
+  runs next to the live read-write mount, and never blocks the boot
+  mount. It needs the profile's local database (for the current key
+  header and the registry) and the secret.
+
+After a recovery from the channel the registry comes from the anchor;
+`recover --from-captions` finds the versions by their captions.
+**`telfs gc` refuses on a filesystem with versions** (and when it finds
+version messages the registry does not list): it only knows the live
+tree, and a chunk the tree no longer uses may be one a version needs. A
+version-aware reclamation comes later; until then nothing a version
+references is ever deleted. Each version costs one database snapshot on
+the channel (~55 MB at 0.5 M files).
 
 ## Recovery
 
@@ -504,8 +565,9 @@ telfs trash enable --ttl 7d      # rm safety-net (see below)
 `gc` finds **orphan chunks** (msg_ids not in `chunk_map` — left behind
 by overwrites/unlinks; see Design choices) and **stale snapshots**
 (beyond the retention window; never the current one nor the one the
-pinned anchor names). The anchor, the key message and any message gc
-does not recognize are never deleted. Default is dry-run.
+pinned anchor names). The anchor, the key message, versions and any
+message gc does not recognize are never deleted. Default is dry-run.
+On a filesystem with [versions](#versions) gc refuses altogether.
 
 ### `telfs trash` — rm safety-net
 

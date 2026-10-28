@@ -29,15 +29,19 @@ import (
 func cmdStatus(ctx context.Context, args []string) error {
 	fset := flag.NewFlagSet("status", flag.ContinueOnError)
 	jsonOut := fset.Bool("json", false, "one JSON object (schema 1, spec v1 §3) for scripts and monitoring; needs no secret")
+	versionName := fset.String("version", "", "with --json: the status of this version's mount (telfs mount --readonly --version NAME); exit 5 when it is not mounted")
 	if err := fset.Parse(args); err != nil {
 		return err
+	}
+	if *versionName != "" && !*jsonOut {
+		return errors.New("status: --version needs --json")
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 	if *jsonOut {
-		return statusJSON(ctx, cfg)
+		return statusJSON(ctx, cfg, *versionName)
 	}
 
 	active := config.ActiveProfile()
@@ -230,6 +234,15 @@ func statusFormat2(ctx context.Context, cfg *config.Config, m *meta.Store) {
 	}
 	if st, err := snapshot.LoadPolicyState(ctx, m); err == nil && st.HaveSnap {
 		fmt.Printf("  journal ops since: %d\n", st.CurrentSeq-st.SnapSeq)
+	}
+	fmt.Println("\n== Versions ==")
+	if vs, err := snapshot.LoadVersions(ctx, m); err != nil {
+		fmt.Printf("  (registry unreadable: %v)\n", err)
+	} else if vst := versionsStatus(vs); vst.Count == 0 {
+		fmt.Println("  none (telfs versions create NAME)")
+	} else {
+		fmt.Printf("  %d — newest %s (%s); telfs versions list\n", vst.Count, vst.Newest.Name,
+			time.Unix(vst.Newest.CreatedUnix, 0).UTC().Format(time.RFC3339))
 	}
 }
 

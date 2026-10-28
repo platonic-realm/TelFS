@@ -27,6 +27,7 @@ const (
 	KindSnapshot = "s"
 	KindJournal  = "j"
 	KindAnchor   = "a" // the pinned anchor naming the newest snapshot (anchor.go)
+	KindVersion  = "v" // a pinned, immutable version: a whole-DB snapshot kept by name
 )
 
 // Caption is the encrypted description every format-2 document carries.
@@ -55,8 +56,10 @@ type Caption struct {
 	IO int64 `json:"io,omitempty"`
 	IL int64 `json:"il,omitempty"`
 
-	// Snapshot (K = "s"), journal batch (K = "j") and anchor (K = "a":
-	// Seq = its snapshot's seq).
+	// Snapshot (K = "s"), journal batch (K = "j"), anchor (K = "a":
+	// Seq = its snapshot's seq) and version (K = "v": Name = the
+	// version's name, Seq = the journal seq it holds, TS = when it was
+	// created, DBSz = the SQLite DB's size, H = the DB's SHA-256).
 	Seq   int64 `json:"seq,omitempty"`
 	TS    int64 `json:"ts,omitempty"`
 	DBSz  int64 `json:"dbsz,omitempty"`

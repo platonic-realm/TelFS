@@ -142,6 +142,9 @@ func fillFromDB(ctx context.Context, st *statusV1, m *meta.Store) {
 			st.Snapshot.JournalOpsSince = last - snapSeq
 		}
 	}
+	if vs, err := snapshot.LoadVersions(ctx, m); err == nil {
+		st.Versions = versionsStatus(vs)
+	}
 	if kc, ok := loadKeyCheck(ctx, m); ok {
 		st.KeyHeader = &statusKeyHeader{PinnedOK: kc.OK, CheckedUnix: kc.TS}
 	}
@@ -151,6 +154,18 @@ func fillFromDB(ctx context.Context, st *statusV1, m *meta.Store) {
 			st.CryptoUses = usesView(u)
 		}
 	}
+}
+
+// versionsStatus is the status's versions block: how many, and the
+// newest by creation time.
+func versionsStatus(vs []wire.AnchorVersion) statusVersions {
+	out := statusVersions{Count: len(vs)}
+	for i := range vs {
+		if out.Newest == nil || vs[i].Created >= out.Newest.CreatedUnix {
+			out.Newest = &statusVersion{Name: vs[i].Name, CreatedUnix: vs[i].Created}
+		}
+	}
+	return out
 }
 
 // daemonCtl is the running mount's control-socket service (spec v1 §3).
@@ -168,12 +183,26 @@ type daemonCtl struct {
 	telegram   http.HandlerFunc // the existing /telegram JSON (web console)
 	cache      http.HandlerFunc // the existing /cache JSON (web console)
 
+	// Versions (format 2, live read-write mounts): the daemon's context
+	// (a version post runs on it, not on a request's), the filesystem's
+	// keys and the channel the version is posted to.
+	ctx  context.Context
+	keys *wire.Keys
+	ch   snapshot.Channel
+	// version is the version a version mount serves ("" for the live
+	// filesystem's mount).
+	version string
+
 	rateMu  sync.Mutex
 	samples []rateSample
 
 	syncMu   sync.Mutex
 	syncNext uint64
 	syncToks map[uint64]*syncTok
+
+	verMu   sync.Mutex
+	verNext uint64
+	verJobs map[uint64]*versionJob
 }
 
 type rateSample struct {
@@ -244,12 +273,19 @@ func (d *daemonCtl) status(ctx context.Context) statusV1 {
 	if lp := ownLogPath(); lp != "" {
 		st.LogPath = &lp
 	}
+	if d.version != "" {
+		v := d.version
+		st.VersionMount = &v
+	}
 	fillFromDB(ctx, &st, d.meta)
 	if d.counters != nil {
 		st.CryptoUses = usesView(usesState{Chunk: d.counters.Chunk.Load(), Meta: d.counters.Meta.Load(), Caption: d.counters.Caption.Load()})
 	}
 	open, oldest, staged, capBytes, blocked := d.queueOpen()
-	unposted, _ := d.meta.UnpostedUpTo(ctx, 1<<62)
+	var unposted int64
+	if d.version == "" { // a version's copy has no journal of its own to post
+		unposted, _ = d.meta.UnpostedUpTo(ctx, 1<<62)
+	}
 	st.Sync = statusSync{PendingUploads: open, PendingBytes: staged, JournalUnposted: unposted}
 	if !oldest.IsZero() {
 		st.Sync.OldestPendingAgeS = int64(now.Sub(oldest).Seconds())
@@ -260,6 +296,12 @@ func (d *daemonCtl) status(ctx context.Context) statusV1 {
 	st.Sync.Synced = d.readOnly || (open == 0 && unposted == 0 &&
 		(d.format == 2 || (d.snapMgr != nil && d.snapMgr.Synced(ctx))))
 	st.Staging = statusStaging{Dir: d.cfg.StagingDir(), PendingBytes: staged, CapBytes: capBytes, Blocked: blocked}
+	if d.version != "" {
+		// A version mount stages nothing; the key check and the use
+		// counts in its copy are as old as the version.
+		st.Staging = statusStaging{}
+		st.KeyHeader, st.CryptoUses = nil, nil
+	}
 	snap := d.sess.Tracker().Snapshot()
 	link := statusLink{State: "ok", LastSuccessUnix: unixOrZero(snap.LastSuccess), FloodWaitUntilUnix: unixOrZero(snap.FloodWaitUntil)}
 	switch {
@@ -335,7 +377,9 @@ func (d *daemonCtl) syncCheck(ctx context.Context, t *syncTok) syncReply {
 		return syncReply{Error: err.Error()}
 	}
 	if n > 0 {
-		d.poster.Kick()
+		if d.poster != nil {
+			d.poster.Kick()
+		}
 		return syncReply{Phase: "journal", JournalUnposted: n}
 	}
 	return syncReply{Synced: true}
@@ -379,7 +423,9 @@ func (d *daemonCtl) handler() http.Handler {
 		id := d.syncNext
 		d.syncToks[id] = &syncTok{reg: reg, created: time.Now()}
 		d.syncMu.Unlock()
-		d.poster.Kick()
+		if d.poster != nil {
+			d.poster.Kick()
+		}
 		writeJSON(w, http.StatusOK, syncReply{Token: id})
 	})
 	// GET /sync/wait?token=N&max=30s: long-poll until synced or max.
@@ -424,6 +470,9 @@ func (d *daemonCtl) handler() http.Handler {
 			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 		}()
 	})
+	if d.version == "" {
+		d.versionsRoutes(mux)
+	}
 	if d.telegram != nil {
 		mux.HandleFunc("GET /telegram", d.telegram)
 	}
@@ -477,9 +526,12 @@ func offlineStatus(ctx context.Context, cfg *config.Config) (statusV1, error) {
 }
 
 // profileMount finds the live mount of a profile (pid 0 when the daemon
-// could not be found).
+// could not be found); version mounts are not it.
 func profileMount(profile string) (mountctl.Mount, int, string, bool) {
 	for _, m := range mountctl.ScanMounts() {
+		if mountctl.VersionOf(m) != "" {
+			continue
+		}
 		if p, ok := mountctl.ProfileOf(m); ok && p == profile {
 			pid, _ := mountctl.FindDaemonPid(m.Point)
 			return m, pid, m.Point, true
@@ -490,13 +542,24 @@ func profileMount(profile string) (mountctl.Mount, int, string, bool) {
 
 // statusJSON prints `telfs status --json`: the daemon's view when it runs,
 // local state otherwise. Exit 0 either way (1 only if the profile can't be
-// read).
-func statusJSON(ctx context.Context, cfg *config.Config) error {
+// read). With version (`--version NAME`): the status of that version's
+// mount, from its daemon — exit 5 when it is not mounted.
+func statusJSON(ctx context.Context, cfg *config.Config, version string) error {
 	var st statusV1
-	resp, err := ctlClient(cfg, 5*time.Second).Get(control.BaseURL + "/status")
+	sock := control.Path(cfg.DataDir)
+	if version != "" {
+		if err := snapshot.ValidateVersionName(version); err != nil {
+			return err
+		}
+		sock = control.VersionPath(cfg.DataDir, version)
+	}
+	resp, err := control.Client(sock, 5*time.Second).Get(control.BaseURL + "/status")
 	if err == nil {
 		defer resp.Body.Close()
 		err = json.NewDecoder(resp.Body).Decode(&st)
+	}
+	if err != nil && version != "" {
+		return fmt.Errorf("%w: version %s of profile %s: %v", errNotMounted, version, cfg.ProfileName(), err)
 	}
 	if err != nil {
 		if st, err = offlineStatus(ctx, cfg); err != nil {

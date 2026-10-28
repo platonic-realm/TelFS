@@ -238,13 +238,16 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 	// Format 2: a snapshot from before a secret change carries the OLD
 	// key header; keep the CURRENT one so the restored DB still opens
 	// with today's secret.
-	var currentHeader, currentAnchor []byte
+	var currentHeader, currentAnchor, currentVersions []byte
 	var currentSeq int64
 	if keys != nil {
 		if m, merr := meta.Open(cfg.DBPath()); merr == nil {
 			_, currentHeader, _ = keyHeaderOf(ctx, m)
 			currentAnchor, _ = m.GetKV(ctx, snapshot.KVAnchorMsgID)
 			currentSeq, _ = m.LastJournalSeq(ctx)
+			// Versions live on the channel, not in the tree: the
+			// rolled-back DB keeps today's registry.
+			currentVersions, _ = m.GetKV(ctx, snapshot.KVVersions)
 			m.Close()
 		}
 	}
@@ -298,6 +301,11 @@ func cmdSnapshotRestore(ctx context.Context, args []string) error {
 				_ = m.PutKV(ctx, snapshot.KVSnapDue, []byte(fmt.Sprintf("restored from snapshot %d", msgID)))
 				if len(currentAnchor) > 0 {
 					_ = m.PutKV(ctx, snapshot.KVAnchorMsgID, currentAnchor)
+				}
+				if len(currentVersions) > 0 {
+					_ = m.PutKV(ctx, snapshot.KVVersions, currentVersions)
+				} else {
+					_ = m.DeleteKV(ctx, snapshot.KVVersions)
 				}
 				m.Close()
 			}

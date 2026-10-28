@@ -11,16 +11,22 @@ import (
 // request (the pinned list) instead of scanning the channel's history.
 // Its caption is an ordinary sealed caption of kind KindAnchor; its body
 // is SealMeta("anchor", JSON). A new anchor is posted after every
-// snapshot (and, later, every version change); the previous one is
-// unpinned and deleted.
+// snapshot and every version change; the previous one is unpinned and
+// deleted.
 
-// AnchorVersion is a version listed in the anchor (filled by the
-// versions feature; the anchor carries the list from the start).
+// AnchorVersion is a version listed in the anchor, and an entry of the
+// local version registry (the same JSON): the version's name, its
+// message, the journal seq it holds, when it was created (unix seconds),
+// and the size and SHA-256 (hex) of its SQLite DB — what a version mount
+// checks a downloaded copy against. Size and SHA256 are empty in entries
+// written before they existed.
 type AnchorVersion struct {
 	Name    string `json:"name"`
 	Msg     int    `json:"msg"`
 	Seq     int64  `json:"seq"`
 	Created int64  `json:"created"`
+	Size    int64  `json:"size,omitempty"`
+	SHA256  string `json:"sha256,omitempty"`
 }
 
 // Anchor is the anchor body's plaintext.

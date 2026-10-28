@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
 
 	"telfs/internal/meta"
 	"telfs/internal/tg"
@@ -134,10 +135,24 @@ func anchorFromDB(ctx context.Context, m *meta.Store, fsUUID string) (wire.Ancho
 	a.JnlAfter = int(kvInt(ctx, m, KVSnapJnlAfter))
 	a.SnapSeq = kvInt(ctx, m, KVCurrentJournalSeq)
 	a.SnapTS = kvInt(ctx, m, KVLastSnapUnix)
+	vs, err := LoadVersions(ctx, m)
+	if err != nil {
+		return a, err
+	}
+	if vs != nil {
+		a.Versions = vs
+	}
 	return a, nil
 }
 
-// PostAnchor posts an anchor naming the snapshot recorded in m, pins it
+// anchorMu serializes PostAnchor in this process: the snapshot policy and
+// a version change may both post one, and each deletes the anchors it
+// replaces — unserialized, one could delete the other's new anchor, or
+// the last anchor posted could carry an older version list.
+var anchorMu sync.Mutex
+
+// PostAnchor posts an anchor naming the snapshot recorded in m and
+// listing the version registry, pins it
 // silently and records it; then it deletes the anchors it replaces: the
 // one recorded before and any other pinned anchor of this filesystem
 // (left by a crash between pin and record). Deleting a message also
@@ -146,6 +161,8 @@ func anchorFromDB(ctx context.Context, m *meta.Store, fsUUID string) (wire.Ancho
 // The returned error is about the new anchor only; a failed cleanup is
 // reported through logf.
 func PostAnchor(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys, logf func(string, ...any)) (int, error) {
+	anchorMu.Lock()
+	defer anchorMu.Unlock()
 	a, err := anchorFromDB(ctx, m, keys.FSUUID)
 	if err != nil {
 		return 0, err
@@ -167,6 +184,9 @@ func PostAnchor(ctx context.Context, ch Channel, m *meta.Store, keys *wire.Keys,
 		return id, err
 	}
 	if err := putKVInt(ctx, m, KVAnchorSnapID, int64(a.SnapMsg)); err != nil {
+		return id, err
+	}
+	if err := m.DeleteKV(ctx, KVAnchorDue); err != nil && !errors.Is(err, meta.ErrNotFound) {
 		return id, err
 	}
 	old := map[int]bool{}

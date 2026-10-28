@@ -74,6 +74,8 @@ Usage:
   telfs mount [flags] <mountpoint>  Mount the filesystem. A missing local DB is
                                       recovered from the channel.
                                       Flags: --readonly --allow-other --debug
+                                      --readonly --version NAME (mount a version,
+                                      next to the live mount)
                                       --key-header FILE (recover with an export)
                                       --service (systemd Type=notify: never
                                       prompts, waits for network/Telegram)
@@ -86,6 +88,11 @@ Usage:
                                       mount (before the call, with --wait) is
                                       on the channel; 4 if not (yet), 5 if not
                                       mounted. Needs no secret.
+  telfs versions create NAME [--timeout D] | list [--json] | delete NAME
+                                    Named, immutable versions (format 2): create
+                                      syncs, then posts the version (through the
+                                      running mount, no secret); 0 on the channel,
+                                      4 timeout, 5 not mounted, 6 Telegram.
   telfs init [--chunk-size N] [--compression none|zstd] [--kdf-memory SIZE]
                                     Create a NEW filesystem (format 2: always
                                       encrypted) on the bound channel; posts and
@@ -101,15 +108,18 @@ Usage:
   telfs recover --from-captions [--journal use|ignore] [--report FILE] [--key-header FILE]
                                     Rebuild the local DB from captions, pack
                                       indexes and journal — no snapshot needed.
-  telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots.
+  telfs gc [--yes] [--pages N]      Reclaim orphan chunks + old snapshots
+                                      (refuses on a filesystem with versions).
   telfs encrypt status              Show the filesystem's encryption state.
   telfs profile {list,show,create,delete,use,reset-auth,export,import}
                                     Manage multiple profiles (accounts/channels).
                                       Each profile is ONE identity; reset-auth
                                       wipes it (session + channel binding).
-  telfs status [--json]             One-screen summary of the active profile;
+  telfs status [--json [--version NAME]]
+                                    One-screen summary of the active profile;
                                       --json: one object (schema 1) for
-                                      scripts, needs no secret.
+                                      scripts, needs no secret; --version:
+                                      that version's mount.
   telfs doctor                      Lint local profile + DB state for known invariants.
   telfs web [--listen ADDR] [--token TOKEN]
                                     HTTP management UI (default 127.0.0.1:8080).
@@ -573,13 +583,14 @@ func cmdUnmount(_ context.Context, args []string) error {
 
 	// Resolve to (pid, mountpoint): try as a mountpoint path first,
 	// then as a profile name (the mount source "telfs:<profile>", or a
-	// v0.22 daemon's TELFS_PROFILE).
+	// v0.22 daemon's TELFS_PROFILE) — its live mount; a version mount
+	// is unmounted by its mountpoint.
 	var mountpoint string
 	var pid int
 	if abs, err := filepath.Abs(target); err == nil && mountctl.IsMounted(abs) {
 		mountpoint = abs
 		pid, _ = mountctl.FindDaemonPid(abs)
-	} else if p, mp, ok, ferr := mountctl.FindByProfile(target); ok {
+	} else if p, mp, ok, ferr := mountctl.FindLiveByProfile(target); ok {
 		pid, mountpoint = p, mp
 	} else if ferr != nil && config.ValidateProfileName(target) == nil {
 		return fmt.Errorf("unmount: %q: %w", target, ferr)
@@ -638,8 +649,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	blobPrefetch := fs.String("blob-prefetch", "", "packed-blob locality prefetch span (e.g. 4MiB): a cold read of one packed small file warms its blob neighbors in one ranged download. Empty = default 4 MiB; 0 disables.")
 	serviceFlag := fs.Bool("service", false, "run as a systemd service (Type=notify): never prompt (the secret comes from a file or systemd credentials), wait and retry while the network or Telegram is unreachable at boot, report READY/STATUS/STOPPING to systemd")
 	keyHeader := fs.String("key-header", "", "recover a format-2 filesystem with this key header export (telfs key export) instead of the channel's pinned key message; only used when the local DB is missing")
+	versionName := fs.String("version", "", "with --readonly: mount this version of the filesystem (telfs versions list) instead of the live tree — its own copy of the version's DB in the profile's versions/ directory; may run next to the live mount")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly] [--allow-other] [--debug] [--metrics-addr ADDR] [--cache-cap SIZE] <mountpoint>")
+		fmt.Fprintln(os.Stderr, "usage: telfs mount [--readonly [--version NAME]] [--allow-other] [--debug] [--metrics-addr ADDR] [--cache-cap SIZE] <mountpoint>")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -659,6 +671,19 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	if fs.NArg() != 1 {
 		fs.Usage()
 		return errors.New("mount: expected exactly one mountpoint argument")
+	}
+	if *versionName != "" {
+		switch {
+		case !*readonly:
+			return errors.New("mount: --version needs --readonly (a version is immutable)")
+		case *keyHeader != "":
+			return errors.New("mount: --key-header recovers the live filesystem's DB; it does not apply to --version")
+		case *metricsAddr != "":
+			return errors.New("mount: --metrics-addr is not available with --version")
+		}
+		if err := snapshot.ValidateVersionName(*versionName); err != nil {
+			return fmt.Errorf("mount: %w", err)
+		}
 	}
 	mountpoint := fs.Arg(0)
 	// Normalize to an absolute path: /proc/mounts records the absolute
@@ -682,6 +707,12 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	}
 	if err := cfg.RequireChannel(); err != nil {
 		return err
+	}
+	if *versionName != "" {
+		return mountVersion(signalCtx, cfg, versionMountOpts{name: *versionName, mountpoint: mountpoint,
+			allowOther: *allowOther, debug: *debug, service: *serviceFlag, cacheCap: *cacheCap,
+			memCacheCap: *memCacheCap, blobPrefetch: *blobPrefetch,
+			prefetchWindow: *prefetchWindow, prefetchConcurrency: *prefetchConcurrency})
 	}
 	// [snapshot] (format 2): checked before anything slow happens.
 	snapEveryOps, snapEvery, err := cfg.SnapshotPolicy()
@@ -990,17 +1021,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// in config is silent (treat as "use default" — config-edit
 		// errors shouldn't fail mount when it would otherwise come
 		// up cleanly).
-		capBytes := chunk.DefaultCacheCapBytes
-		if *cacheCap != "" {
-			n, perr := config.ParseHumanBytes(*cacheCap)
-			if perr != nil {
-				return fmt.Errorf("--cache-cap: %w", perr)
-			}
-			if n > 0 {
-				capBytes = n
-			}
-		} else if n := cfg.CacheCapBytes(); n > 0 {
-			capBytes = n
+		capBytes, err := cacheCapFrom(*cacheCap, cfg)
+		if err != nil {
+			return err
 		}
 		fmt.Fprintf(os.Stderr, "cache cap: %s (%d bytes)\n", humanBytes(capBytes), capBytes)
 		cache, err := chunk.NewCacheWire(cfg.CachePath(), capBytes, fetcher, pipe.wc)
@@ -1010,13 +1033,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// In-RAM hot tier. Default 128 MiB; "0" disables entirely.
 		// Errors on the flag parse abort the mount — operator typo
 		// shouldn't silently degrade to the default.
-		memCap := chunk.DefaultMemCacheCapBytes
-		if *memCacheCap != "" {
-			n, perr := config.ParseHumanBytes(*memCacheCap)
-			if perr != nil {
-				return fmt.Errorf("--mem-cache-cap: %w", perr)
-			}
-			memCap = n
+		memCap, err := memCacheCapFrom(*memCacheCap)
+		if err != nil {
+			return err
 		}
 		if memCap > 0 {
 			cache.SetMemCache(chunk.NewMemCache(memCap))
@@ -1083,13 +1102,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// round trips on cold directory walks (make menuconfig over
 		// ~1,500 Kconfig files) into a handful of span fetches.
 		var blobPF *chunk.BlobPrefetcher
-		blobBudget := chunk.DefaultBlobPrefetchBudget
-		if *blobPrefetch != "" {
-			n, perr := config.ParseHumanBytes(*blobPrefetch)
-			if perr != nil {
-				return fmt.Errorf("--blob-prefetch: %w", perr)
-			}
-			blobBudget = n // 0 disables below
+		blobBudget, err := blobBudgetFrom(*blobPrefetch) // 0 disables below
+		if err != nil {
+			return err
 		}
 		if blobBudget > 0 {
 			blobPF = chunk.NewBlobPrefetcherWire(metaStore, cache, fetcher, pipe.wc, blobBudget)
@@ -1464,7 +1479,8 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		ctl := &daemonCtl{cfg: cfg, mountpoint: mountpoint, readOnly: *readonly, format: pipe.format,
 			meta: metaStore, sess: sess, pool: pool, poster: journalPoster, snapMgr: snapMgr, counters: pipe.counters,
 			telegram: telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore, adaptive, snapMgr),
-			cache:    cacheJSONHandler(cache)}
+			cache:    cacheJSONHandler(cache),
+			ctx:      signalCtx, keys: pipe.keys, ch: sess}
 		ctlServed = true
 		go control.Serve(signalCtx, ctlLn, ctlPath, ctl.handler())
 		go ctl.sampleRate(signalCtx)
@@ -1604,6 +1620,51 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		return nil
 	}
 	return err
+}
+
+// cacheCapFrom resolves the disk-cache cap: --cache-cap wins, then
+// config.toml's cache_cap, then chunk.DefaultCacheCapBytes. A parse
+// error on the flag aborts (operator typo, fail loudly); one in config
+// is silent (treat as "use default").
+func cacheCapFrom(flagVal string, cfg *config.Config) (int64, error) {
+	capBytes := chunk.DefaultCacheCapBytes
+	if flagVal != "" {
+		n, err := config.ParseHumanBytes(flagVal)
+		if err != nil {
+			return 0, fmt.Errorf("--cache-cap: %w", err)
+		}
+		if n > 0 {
+			capBytes = n
+		}
+	} else if n := cfg.CacheCapBytes(); n > 0 {
+		capBytes = n
+	}
+	return capBytes, nil
+}
+
+// memCacheCapFrom resolves the in-RAM hot tier's size: default 128 MiB,
+// "0" disables it; a bad flag aborts.
+func memCacheCapFrom(flagVal string) (int64, error) {
+	if flagVal == "" {
+		return chunk.DefaultMemCacheCapBytes, nil
+	}
+	n, err := config.ParseHumanBytes(flagVal)
+	if err != nil {
+		return 0, fmt.Errorf("--mem-cache-cap: %w", err)
+	}
+	return n, nil
+}
+
+// blobBudgetFrom resolves the packed-blob prefetch span (0 disables).
+func blobBudgetFrom(flagVal string) (int64, error) {
+	if flagVal == "" {
+		return chunk.DefaultBlobPrefetchBudget, nil
+	}
+	n, err := config.ParseHumanBytes(flagVal)
+	if err != nil {
+		return 0, fmt.Errorf("--blob-prefetch: %w", err)
+	}
+	return n, nil
 }
 
 // daemonStatusHandler serves the daemon's identity as JSON. The log
@@ -2289,17 +2350,18 @@ func maybeUnwrapEncrypted(data []byte, sec *secret.Secret) ([]byte, error) {
 }
 
 // classify2 maps a format-2 message onto gc's kinds by decrypting its
-// caption. Anything that doesn't open under OUR caption key — text
-// messages (the key message), format-1 leftovers, foreign documents — is
-// KindUnknown, which gc never touches.
-func classify2(cm tg.ChannelMessage, keys *wire.Keys) tg.ChannelMessage {
+// caption, and returns its caption kind ("" when it has none of ours).
+// Anything that doesn't open under OUR caption key — text messages (the
+// key message), format-1 leftovers, foreign documents — is KindUnknown,
+// which gc never touches; so are the anchor and versions.
+func classify2(cm tg.ChannelMessage, keys *wire.Keys) (tg.ChannelMessage, string) {
 	out := tg.ChannelMessage{ID: cm.ID, Date: cm.Date, HasDoc: cm.HasDoc, RawCaption: cm.RawCaption}
 	if !cm.HasDoc || !wire.LooksLikeCaption(cm.RawCaption) {
-		return out
+		return out, ""
 	}
 	c, err := keys.OpenCaption(cm.RawCaption)
 	if err != nil {
-		return out
+		return out, ""
 	}
 	switch c.K {
 	case wire.KindChunk, wire.KindPack:
@@ -2311,9 +2373,24 @@ func classify2(cm tg.ChannelMessage, keys *wire.Keys) tg.ChannelMessage {
 		out.Kind = tg.KindJournal
 		out.JnlCap = tg.JournalCaption{Kind: tg.MessageKindJournal, FSUUID: c.FS, FirstSeq: c.First, LastSeq: c.Last, Count: c.N}
 	}
-	// Anything else — the pinned anchor, a kind a newer telfs posts —
-	// stays KindUnknown, which gc never deletes.
-	return out
+	// Anything else — the pinned anchor, a version, a kind a newer telfs
+	// posts — stays KindUnknown, which gc never deletes.
+	return out, c.K
+}
+
+// gcVersionsRefusal refuses gc on a filesystem with versions (spec v1
+// §2): v1 has no version-aware reclamation, and a chunk the live tree no
+// longer references may still be one a version needs — gc would call it
+// an orphan and delete it.
+func gcVersionsRefusal(ctx context.Context, m *meta.Store) error {
+	vs, err := snapshot.LoadVersions(ctx, m)
+	if err != nil {
+		return fmt.Errorf("gc: %w", err)
+	}
+	if len(vs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("gc: this filesystem has %d version(s) (newest: %s) — gc would delete chunks they still need (it only knows the live tree's). A version-aware gc comes later; until then gc refuses while versions exist (telfs versions list)", len(vs), versionsStatus(vs).Newest.Name)
 }
 
 // cmdGC walks the channel and removes messages that are no longer
@@ -2365,6 +2442,9 @@ func cmdGC(ctx context.Context, args []string) error {
 	}
 	defer metaStore.Close()
 
+	if err := gcVersionsRefusal(ctx, metaStore); err != nil {
+		return err
+	}
 	referenced, err := metaStore.AllChunkMessageIDs(ctx)
 	if err != nil {
 		return err
@@ -2418,11 +2498,15 @@ func cmdGC(ctx context.Context, args []string) error {
 		}
 		var journalMsgs []jnlMsg
 		minRetainedSeq := int64(-1) // min Seq across our retained snapshots
+		var versionMsgs []int       // version messages (the registry may have lost them)
 		ageCutoff := time.Now().Add(-*minAge).Unix()
 		fmt.Printf("Scanning channel (up to %d pages of 100 messages)…\n", *pages)
 		if err := sess.WalkChannelMessages(ctx, *pages, func(cm tg.ChannelMessage) error {
 			if keys2 != nil {
-				cm = classify2(cm, keys2)
+				var k string
+				if cm, k = classify2(cm, keys2); k == wire.KindVersion {
+					versionMsgs = append(versionMsgs, cm.ID)
+				}
 			}
 			switch cm.Kind {
 			case tg.KindJournal:
@@ -2486,6 +2570,13 @@ func cmdGC(ctx context.Context, args []string) error {
 			return nil
 		}); err != nil {
 			return err
+		}
+
+		// A version the registry does not list (lost with a local DB
+		// rebuilt from an anchor that never got its version list) still
+		// needs its chunks: refuse before deleting anything.
+		if len(versionMsgs) > 0 {
+			return fmt.Errorf("gc: the channel holds %d version message(s) of this filesystem (e.g. message %d) that the local registry does not list — gc would delete chunks they need; refusing (a version-aware gc comes later)", len(versionMsgs), versionMsgs[0])
 		}
 
 		// Journal batches wholly covered by EVERY retained snapshot are
@@ -2651,10 +2742,11 @@ func lockProfile(cfg *config.Config) (*os.File, error) {
 // control socket and waits up to timeout for the process to exit. done is
 // false when there is no such daemon to talk to (fall back to signals).
 func unmountViaControl(mountpoint string, timeout time.Duration) (done bool, err error) {
-	var profile string
+	var profile, version string
 	for _, m := range mountctl.ScanMounts() {
 		if m.Point == mountpoint {
 			profile, _ = mountctl.ProfileOf(m)
+			version = mountctl.VersionOf(m)
 		}
 	}
 	if profile == "" {
@@ -2664,7 +2756,13 @@ func unmountViaControl(mountpoint string, timeout time.Duration) (done bool, err
 	if derr != nil {
 		return false, nil
 	}
-	resp, perr := control.Client(control.Path(dir), 10*time.Second).Post(control.BaseURL+"/stop", "application/json", nil)
+	// A version mount has its own socket: the profile's is the live
+	// mount's, which must not be the one stopped.
+	sock := control.Path(dir)
+	if version != "" {
+		sock = control.VersionPath(dir, version)
+	}
+	resp, perr := control.Client(sock, 10*time.Second).Post(control.BaseURL+"/stop", "application/json", nil)
 	if perr != nil {
 		return false, nil
 	}
