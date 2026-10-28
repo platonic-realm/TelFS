@@ -19,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -576,6 +577,23 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
+// describeUpload is [upload] in words, for the mount's startup lines.
+func describeUpload(u config.UploadSettings) string {
+	conns := "the main connection only"
+	if u.Connections > 0 {
+		parts := "parts"
+		if u.PartsPerUpload == 1 {
+			parts = "part"
+		}
+		conns = fmt.Sprintf("%d connections, %d %s in flight per upload", u.Connections, u.PartsPerUpload, parts)
+	}
+	capText := "no rate cap"
+	if u.MaxRate > 0 {
+		capText = "capped at " + strconv.FormatFloat(math.Round(float64(u.MaxRate)/1e4)/100, 'f', -1, 64) + " MB/s"
+	}
+	return conns + ", " + capText
+}
+
 // cmdUnmount stops a running telfs mount daemon and detaches its
 // mountpoint. Accepts either the mountpoint path or a profile name.
 // Works regardless of who started the daemon (CLI foreground, web
@@ -733,8 +751,13 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			memCacheCap: *memCacheCap, blobPrefetch: *blobPrefetch,
 			prefetchWindow: *prefetchWindow, prefetchConcurrency: *prefetchConcurrency})
 	}
-	// [snapshot] (format 2): checked before anything slow happens.
+	// [snapshot] (format 2) and [upload]: checked before anything slow
+	// happens.
 	snapEveryOps, snapEvery, err := cfg.SnapshotPolicy()
+	if err != nil {
+		return err
+	}
+	uploadCfg, err := cfg.UploadSettings()
 	if err != nil {
 		return err
 	}
@@ -1092,6 +1115,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		stagingGate := chunk.NewDiskGate(pendingDir, stageMax, stageFree)
 		pool.Disk = stagingGate
 		fmt.Printf("Staging: %s (up to %s waiting for upload, keeps %s free)\n", pendingDir, humanBytes(stageMax), humanBytes(stageFree))
+		if !*readonly {
+			fmt.Printf("Upload: %s\n", describeUpload(uploadCfg))
+		}
 		// In-process pending index: accelerates Reader.tryPendingFallback
 		// by skipping the O(N) Glob over the pending dir on every miss.
 		// Writer populates it after PersistPending; packer drops entries

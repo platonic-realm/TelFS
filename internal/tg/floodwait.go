@@ -31,8 +31,9 @@ const MaxFloodWait = 60 * time.Minute
 // a wedged client.
 const FloodWaitLogInterval = 30 * time.Second
 
-// FloodWaiter is a telegram.Middleware that handles FLOOD_WAIT_N by
-// sleeping N seconds and retrying, bounded by MaxFloodWait per attempt.
+// FloodWaiter is a telegram.Middleware that handles FLOOD_WAIT_N and
+// FLOOD_PREMIUM_WAIT_N by sleeping N seconds and retrying, bounded by
+// MaxFloodWait per attempt.
 // Replaces gotd/contrib's SimpleWaiter with WithMaxWait(2 * time.Minute):
 // the 2-minute cap was a stand-in default, not a deliberate floor.
 //
@@ -58,7 +59,7 @@ func (w *FloodWaiter) Handle(next tg.Invoker) telegram.InvokeFunc {
 			if err == nil {
 				return nil
 			}
-			d, ok := tgerr.AsFloodWait(err)
+			kind, d, ok := classifyFlood(err)
 			if !ok {
 				return err
 			}
@@ -72,13 +73,40 @@ func (w *FloodWaiter) Handle(next tg.Invoker) telegram.InvokeFunc {
 			// Every flood wait is named, however short: an operator
 			// watching a long run must be able to tell "Telegram asked us
 			// to slow down" from a slow network (short waits used to be
-			// slept through silently).
-			fmt.Fprintf(os.Stderr, "[flood-wait] %s: Telegram asked to wait %v\n", methodName(input), d.Round(time.Second))
+			// slept through silently). FLOOD_PREMIUM_WAIT gets its own
+			// line: it is not a per-method flood but Telegram's upload
+			// speed limit for accounts without Premium, and the remedy
+			// differs (a lower [upload] max_rate / connections, or Premium).
+			if kind == tgerr.ErrPremiumFloodWait {
+				metrics.FloodPremiumWaits.Inc()
+				fmt.Fprintf(os.Stderr, "[flood-wait] %s: FLOOD_PREMIUM_WAIT — Telegram's upload limit for accounts without Premium; waiting %v\n", methodName(input), d.Round(time.Second))
+			} else {
+				fmt.Fprintf(os.Stderr, "[flood-wait] %s: Telegram asked to wait %v\n", methodName(input), d.Round(time.Second))
+			}
 			if err := sleepWithProgress(ctx, d); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+// classifyFlood reports whether err is one of Telegram's flood throttles —
+// FLOOD_WAIT_X or FLOOD_PREMIUM_WAIT_X — which one (tgerr.ErrFloodWait or
+// tgerr.ErrPremiumFloodWait) and the wait it asks for. FLOOD_PREMIUM_WAIT
+// is checked by its own type, not only through tgerr.AsFloodWait (whose
+// list holds it in gotd v0.144): a gotd release that changed that list must
+// not turn Telegram's upload limit into failed uploads.
+func classifyFlood(err error) (kind string, d time.Duration, ok bool) {
+	if err == nil {
+		return "", 0, false
+	}
+	if e, ok := tgerr.AsType(err, tgerr.ErrPremiumFloodWait); ok {
+		return tgerr.ErrPremiumFloodWait, time.Duration(e.Argument) * time.Second, true
+	}
+	if d, ok := tgerr.AsFloodWait(err); ok {
+		return tgerr.ErrFloodWait, d, true
+	}
+	return "", 0, false
 }
 
 // sleepWithProgress sleeps for d, logging remaining time every

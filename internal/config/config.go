@@ -88,6 +88,11 @@ type Config struct {
 	// (spec v1, row 4).
 	Snapshot SnapshotConfig `toml:"snapshot,omitempty"`
 
+	// Upload is how chunks, packs, journal batches and snapshots are
+	// uploaded: connections, parts in flight, byte-rate cap (spec v1,
+	// row 2).
+	Upload UploadConfig `toml:"upload,omitempty"`
+
 	// DataDir is the resolved location of the .telfs/ directory. Not serialized.
 	DataDir string `toml:"-"`
 }
@@ -632,6 +637,103 @@ func (c *Config) SnapshotPolicy() (everyOps int64, every time.Duration, err erro
 		every = d
 	}
 	return everyOps, every, nil
+}
+
+// UploadConfig is `[upload]` in config.toml (spec v1, row 2).
+//
+//	[upload]
+//	connections = 8         # upload connections to the account's data centre (0 = the main connection only)
+//	parts_per_upload = 2    # 512 KiB parts in flight per upload
+//	max_rate = "5MB/s"      # byte-rate cap on upload parts ("0" = no cap)
+//
+// The account's data centre is far away (DC5, ~170 ms round trip from S9):
+// one TCP connection carries ~0.2 MB/s however many parts are in flight on
+// it, so throughput comes from more connections. The cap keeps TelFS from
+// taking the whole line. Pointers: an explicit 0 differs from "unset".
+type UploadConfig struct {
+	Connections    *int   `toml:"connections,omitempty"`
+	PartsPerUpload *int   `toml:"parts_per_upload,omitempty"`
+	MaxRate        string `toml:"max_rate,omitempty"`
+}
+
+// UploadSettings is [upload] resolved: defaults applied, values checked.
+type UploadSettings struct {
+	// Connections is the size of the upload connection pool; 0 = uploads
+	// share the main connection (the behaviour before v1).
+	Connections int
+	// PartsPerUpload is how many parts of one upload are in flight at once.
+	PartsPerUpload int
+	// MaxRate caps upload parts in bytes per second; 0 = no cap.
+	MaxRate int64
+}
+
+// [upload] defaults — from the 2026-10-28 measurements (notes/specs/P2-P4.md,
+// R5: 2 parts in flight × 8 connections reached 4.15 MB/s, 33–42 % of the
+// 10–12.5 MB/s line; the cap is 40–50 % of the line). TO BE FINALISED with
+// the numbers of the 2026-10-28 21:47 run.
+const (
+	DefaultUploadConnections    = 8
+	DefaultUploadPartsPerUpload = 2
+	DefaultUploadMaxRate        = 5_000_000 // bytes/s ("5MB/s")
+)
+
+// [upload] limits. A pool beyond 32 connections or 16 parts in flight per
+// upload is a typo, not a tuning; a cap below 64 KiB/s (one 512 KiB part
+// every 8 s) is almost certainly a missing unit ("5" = 5 bytes/s).
+const (
+	MaxUploadConnections    = 32
+	MaxUploadPartsPerUpload = 16
+	MinUploadMaxRate        = 64 << 10
+)
+
+// UploadSettings returns [upload] with the defaults for unset values, or an
+// error naming the bad value.
+func (c *Config) UploadSettings() (UploadSettings, error) {
+	s := UploadSettings{
+		Connections:    DefaultUploadConnections,
+		PartsPerUpload: DefaultUploadPartsPerUpload,
+		MaxRate:        DefaultUploadMaxRate,
+	}
+	if p := c.Upload.Connections; p != nil {
+		if *p < 0 || *p > MaxUploadConnections {
+			return UploadSettings{}, fmt.Errorf("[upload] connections = %d: must be 0 (the main connection only) to %d", *p, MaxUploadConnections)
+		}
+		s.Connections = *p
+	}
+	if p := c.Upload.PartsPerUpload; p != nil {
+		if *p < 1 || *p > MaxUploadPartsPerUpload {
+			return UploadSettings{}, fmt.Errorf("[upload] parts_per_upload = %d: must be 1 to %d", *p, MaxUploadPartsPerUpload)
+		}
+		s.PartsPerUpload = *p
+	}
+	if strings.TrimSpace(c.Upload.MaxRate) != "" {
+		r, err := ParseByteRate(c.Upload.MaxRate)
+		if err != nil {
+			return UploadSettings{}, fmt.Errorf("[upload] max_rate: %w", err)
+		}
+		if r != 0 && r < MinUploadMaxRate {
+			return UploadSettings{}, fmt.Errorf("[upload] max_rate = %q is %d bytes/s, below the minimum of 64KiB/s (a unit missing? e.g. \"5MB/s\"; \"0\" = no cap)", c.Upload.MaxRate, r)
+		}
+		s.MaxRate = r
+	}
+	return s, nil
+}
+
+// ParseByteRate reads a rate in bytes per second: "5MB/s", "800 KiB/s",
+// "5000000" or "0". The "/s" is optional; the units are ParseHumanBytes'.
+func ParseByteRate(s string) (int64, error) {
+	t := strings.TrimSpace(s)
+	if l := strings.ToLower(t); strings.HasSuffix(l, "/s") {
+		t = strings.TrimSpace(t[:len(t)-2])
+	}
+	if t == "" {
+		return 0, fmt.Errorf("%q: missing number (e.g. \"5MB/s\", \"0\" = no cap)", s)
+	}
+	n, err := ParseHumanBytes(t)
+	if err != nil {
+		return 0, fmt.Errorf("%q: not a rate (e.g. \"5MB/s\", \"800KiB/s\", \"0\" = no cap)", s)
+	}
+	return n, nil
 }
 
 // CredentialsDirVar is the variable systemd sets for a unit that loads

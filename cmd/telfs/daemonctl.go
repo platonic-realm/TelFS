@@ -320,15 +320,19 @@ func (d *daemonCtl) status(ctx context.Context) statusV1 {
 		link.State = "busy"
 	}
 	st.Link = &link
-	conns := 0
-	if d.pool != nil {
-		conns = d.pool.Cap()
-	}
-	st.Upload = &statusUpload{Connections: conns, RateBytesPerS: d.rate()}
+	st.Upload = uploadStatus(d.cfg, d.rate())
 	if !snap.LastError.IsZero() {
 		st.LastError = &statusError{Text: snap.LastErrorMsg, Unix: snap.LastError.Unix()}
 	}
 	return st
+}
+
+// uploadStatus is the status's upload block: the configured [upload] pool
+// size and byte-rate cap (checked when the mount started; a read-only
+// mount opens no upload connections) and the measured upload rate.
+func uploadStatus(cfg *config.Config, rate int64) *statusUpload {
+	us, _ := cfg.UploadSettings()
+	return &statusUpload{Connections: us.Connections, RateCapBytesPerS: us.MaxRate, RateBytesPerS: rate}
 }
 
 // ownLogPath is where this daemon's stdout goes, when that is a regular

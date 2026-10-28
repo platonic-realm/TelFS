@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync/atomic"
 	"time"
@@ -33,7 +34,7 @@ type SessionManager struct {
 func (c *Client) NewSessionManager() *SessionManager {
 	return &SessionManager{
 		client:    c,
-		session:   &Session{cfg: c.cfg, tracker: c.tracker},
+		session:   c.newSession(),
 		reconnect: make(chan struct{}, 1),
 		stop:      make(chan struct{}),
 	}
@@ -97,6 +98,25 @@ func (m *SessionManager) Run(ctx context.Context, onFirstConnect func() error) e
 				// Bind the new client to the stable Session so
 				// callers' next call picks it up.
 				m.session.swapAPI(tgc.API())
+				// The upload pool lives exactly as long as this
+				// connection cycle: opened on its client, unbound and
+				// closed when the cycle ends (a reconnect builds the
+				// next one). Until it is bound, and if it can't be
+				// opened, uploads use the main connection. A read-only
+				// session uploads nothing and gets none.
+				if !m.session.ReadOnly() {
+					pool, upAPI, err := m.client.openUploadPool(tgc)
+					switch {
+					case err != nil:
+						fmt.Fprintf(os.Stderr, "[upload] no upload connections this session (%v); uploads use the main connection\n", err)
+					case pool != nil:
+						m.session.swapUploadAPI(upAPI)
+						defer func() {
+							m.session.swapUploadAPI(nil)
+							closePoolBounded(pool, uploadPoolCloseWait)
+						}()
+					}
+				}
 				m.connected.Store(true)
 				if first {
 					first = false
@@ -151,6 +171,26 @@ func (m *SessionManager) Run(ctx context.Context, onFirstConnect func() error) e
 			case <-time.After(5 * time.Second):
 			}
 		}
+	}
+}
+
+// uploadPoolCloseWait bounds how long a cycle's end waits for its upload
+// connections to close. A reconnect is often the answer to a wedged
+// connection; it must not wedge on one in turn.
+const uploadPoolCloseWait = 10 * time.Second
+
+// closePoolBounded closes p, waiting at most d for its connections to end
+// (the rest finish in the background).
+func closePoolBounded(p io.Closer, d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		_ = p.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		fmt.Fprintf(os.Stderr, "[upload] upload connections still closing after %v; going on\n", d)
 	}
 }
 

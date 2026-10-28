@@ -3,6 +3,7 @@ package tg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -11,6 +12,8 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+
+	"telfs/internal/metrics"
 )
 
 // fakeInvoker counts how many times it was called and can be
@@ -135,5 +138,70 @@ func TestFloodWaiterNamesEveryWait(t *testing.T) {
 	}
 	if want := "[flood-wait] UploadGetFileRequest: Telegram asked to wait 1s\n"; string(out) != want {
 		t.Fatalf("stderr %q, want %q", out, want)
+	}
+}
+
+// FLOOD_PREMIUM_WAIT_X (Telegram's upload limit for accounts without
+// Premium) is a flood wait like FLOOD_WAIT_X — honoured for X seconds —
+// but classified, counted and logged on its own.
+func TestClassifyFloodPremium(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		kind string
+		d    time.Duration
+	}{
+		{tgerr.New(420, "FLOOD_WAIT_7"), tgerr.ErrFloodWait, 7 * time.Second},
+		{tgerr.New(420, "FLOOD_PREMIUM_WAIT_5"), tgerr.ErrPremiumFloodWait, 5 * time.Second},
+		{fmt.Errorf("upload part: %w", tgerr.New(420, "FLOOD_PREMIUM_WAIT_3")), tgerr.ErrPremiumFloodWait, 3 * time.Second},
+	} {
+		kind, d, ok := classifyFlood(c.err)
+		if !ok || kind != c.kind || d != c.d {
+			t.Errorf("%v: %q %v %v, want %q %v", c.err, kind, d, ok, c.kind, c.d)
+		}
+		if d2, ok := asFloodWait(c.err); !ok || d2 != c.d {
+			t.Errorf("tracker's asFloodWait(%v) = %v %v", c.err, d2, ok)
+		}
+	}
+	for _, err := range []error{nil, errors.New("FLOOD"), tgerr.New(400, "CHANNEL_INVALID")} {
+		if _, _, ok := classifyFlood(err); ok {
+			t.Errorf("%v classified as a flood wait", err)
+		}
+	}
+}
+
+func TestFloodWaiterPremiumWaitNamedDistinctly(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	before := metrics.FloodPremiumWaits.Load()
+	calls := 0
+	next := invokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+		calls++
+		if calls == 1 {
+			return tgerr.New(420, "FLOOD_PREMIUM_WAIT_1")
+		}
+		return nil
+	})
+	start := time.Now()
+	err = NewFloodWaiter().Handle(next)(context.Background(), &tg.UploadSaveFilePartRequest{}, nil)
+	elapsed := time.Since(start)
+	os.Stderr = old
+	w.Close()
+	out, _ := io.ReadAll(r)
+	if err != nil || calls != 2 {
+		t.Fatalf("err %v after %d calls, want a retry that succeeds", err, calls)
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("waited %v, want the 1 s Telegram asked for", elapsed)
+	}
+	want := "[flood-wait] UploadSaveFilePartRequest: FLOOD_PREMIUM_WAIT — Telegram's upload limit for accounts without Premium; waiting 1s\n"
+	if string(out) != want {
+		t.Fatalf("stderr %q, want %q", out, want)
+	}
+	if metrics.FloodPremiumWaits.Load() != before+1 {
+		t.Fatal("telfs_flood_premium_waits_total not counted")
 	}
 }

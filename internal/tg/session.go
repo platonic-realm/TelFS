@@ -1,7 +1,6 @@
 package tg
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -14,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gotd/td/telegram/downloader"
-	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 	"golang.org/x/sync/errgroup"
@@ -52,6 +50,13 @@ type Session struct {
 
 	apiMu sync.RWMutex
 	api   *tg.Client
+	// upAPI uploads parts through the current connection cycle's upload
+	// pool ([upload] connections; nil = no pool now, parts go over api).
+	// Guarded by apiMu like api.
+	upAPI *tg.Client
+	// uploadThreads is the parts in flight per upload on the pool
+	// ([upload] parts_per_upload).
+	uploadThreads int
 
 	// docCache memoizes channels.getMessages → *tg.Document lookups
 	// so a chunk download doesn't pay an extra round trip just to
@@ -131,6 +136,31 @@ func (s *Session) swapAPI(api *tg.Client) {
 	s.apiMu.Lock()
 	s.api = api
 	s.apiMu.Unlock()
+}
+
+// swapUploadAPI installs the API of a connection cycle's upload pool, or
+// nil when the cycle ends (uploads then use the main connection).
+func (s *Session) swapUploadAPI(api *tg.Client) {
+	s.apiMu.Lock()
+	s.upAPI = api
+	s.apiMu.Unlock()
+}
+
+// partsAPI is where an upload's parts go, and how many at once: the
+// upload pool with [upload] parts_per_upload in flight when a pool is
+// bound; otherwise main, one part at a time (as before v1 — the main
+// connection also carries downloads, journal posts and everything else).
+func (s *Session) partsAPI(main *tg.Client) (*tg.Client, int) {
+	s.apiMu.RLock()
+	up := s.upAPI
+	s.apiMu.RUnlock()
+	if up == nil {
+		return main, 1
+	}
+	if s.uploadThreads < 1 {
+		return up, 1
+	}
+	return up, s.uploadThreads
 }
 
 // Config returns the configuration the session was opened with.
@@ -425,7 +455,7 @@ func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, cap
 			case <-time.After(delay):
 			}
 		}
-		msgID, err := s.tryUploadOnce(ctx, peer, bytes.NewReader(body), filename, caption, rid)
+		msgID, err := s.tryUploadOnce(ctx, peer, body, filename, caption, rid)
 		if err == nil {
 			return msgID, nil
 		}
@@ -437,20 +467,18 @@ func (s *Session) UploadDocument(ctx context.Context, r io.Reader, filename, cap
 	return 0, fmt.Errorf("upload failed after %d attempts: %w", uploadMaxAttempts, lastErr)
 }
 
-func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, r io.Reader, filename, caption string, rid int64) (int, error) {
+func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, body []byte, filename, caption string, rid int64) (int, error) {
 	api, err := s.currentAPI()
 	if err != nil {
 		return 0, err
 	}
-	// 512 KiB part size satisfies gotd's constraints (partSize % 1024
-	// == 0 and 524288 % partSize == 0) and shrinks a 32 MiB packed
-	// blob from 256 SaveBigFilePart RPCs to 64. Under a tight upload
-	// rate limit that 4× reduction directly translates into 4× more
-	// rate-limit budget available for downloads sharing the same
-	// middleware chain — the bottleneck visible in /telegram during
-	// kernel-untar workloads.
-	u := uploader.NewUploader(api).WithPartSize(512 * 1024)
-	uf, err := u.FromReader(ctx, filename, r)
+	// The parts go through the upload pool when there is one (spec v1
+	// row 2: one TCP connection to the account's far-away data centre
+	// carries ~0.2 MB/s, so throughput comes from more connections),
+	// several in flight; the message itself is sent on the main
+	// connection — the parts belong to the account, not to a connection.
+	partsAPI, threads := s.partsAPI(api)
+	uf, err := uploadParts(ctx, partsAPI, filename, body, threads)
 	if err != nil {
 		return 0, fmt.Errorf("upload bytes: %w", err)
 	}
@@ -471,6 +499,72 @@ func (s *Session) tryUploadOnce(ctx context.Context, peer *tg.InputPeerChannel, 
 		return 0, fmt.Errorf("send media: %w", err)
 	}
 	return extractNewMessageID(upd, rid)
+}
+
+// uploadPartTries is how often a part is sent again when Telegram answers
+// it with false ("not saved"); gotd's uploader retried that forever.
+const uploadPartTries = 3
+
+// uploadParts uploads body as one file through api, threads parts in
+// flight, and returns the file for sendMedia.
+//
+// The wire format is Telegram's streamed upload, which TelFS has always used
+// (gotd's uploader.FromReader): upload.saveBigFilePart for every size,
+// 512 KiB parts (Telegram's largest — a 32 MiB pack is 64 RPCs, not 256),
+// file_total_parts = -1 on every part but the last, which carries the total
+// and goes out once all the others have been saved — as in a one-at-a-time
+// upload. TelFS sends the parts itself because gotd can't do this in
+// parallel: its streamed upload with more than one thread is a data race
+// (the reader goroutine sets the total while the senders read it — found by
+// the race detector), and its known-size path sends files up to 10 MiB one
+// part at a time.
+func uploadParts(ctx context.Context, api *tg.Client, name string, body []byte, threads int) (tg.InputFileClass, error) {
+	if len(body) == 0 {
+		return nil, errors.New("nothing to upload (empty body)")
+	}
+	fileID, err := randomID()
+	if err != nil {
+		return nil, err
+	}
+	n := (len(body) + uploadPartMax - 1) / uploadPartMax
+	send := func(ctx context.Context, i, total int) error {
+		req := &tg.UploadSaveBigFilePartRequest{
+			FileID:         fileID,
+			FilePart:       i,
+			FileTotalParts: total,
+			Bytes:          body[i*uploadPartMax : min((i+1)*uploadPartMax, len(body))],
+		}
+		for try := 1; ; try++ {
+			ok, err := api.UploadSaveBigFilePart(ctx, req)
+			if err != nil {
+				return fmt.Errorf("part %d of %d: %w", i+1, n, err)
+			}
+			if ok {
+				return nil
+			}
+			if try == uploadPartTries {
+				return fmt.Errorf("part %d of %d: Telegram did not save it (%d tries)", i+1, n, try)
+			}
+		}
+	}
+	if threads < 1 {
+		threads = 1
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(threads)
+	for i := 0; i < n-1 && gctx.Err() == nil; i++ {
+		g.Go(func() error { return send(gctx, i, -1) })
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := send(ctx, n-1, n); err != nil {
+		return nil, err
+	}
+	return &tg.InputFileBig{ID: fileID, Parts: n, Name: name}, nil
 }
 
 // isRetriableUploadErr decides whether an UploadDocument failure looks

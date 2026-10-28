@@ -172,3 +172,33 @@ func TestExitCodesV1(t *testing.T) {
 		}
 	}
 }
+
+// status --json's upload block (spec v1 §3): the configured [upload] pool
+// size and byte-rate cap, and the measured rate.
+func TestUploadStatus(t *testing.T) {
+	cfg := &config.Config{}
+	if got := uploadStatus(cfg, 1234); *got != (statusUpload{Connections: 8, RateCapBytesPerS: 5_000_000, RateBytesPerS: 1234}) {
+		t.Fatalf("defaults: %+v", *got)
+	}
+	conns := 0
+	cfg.Upload = config.UploadConfig{Connections: &conns, MaxRate: "0"}
+	if got := uploadStatus(cfg, 0); *got != (statusUpload{}) {
+		t.Fatalf("no pool, no cap: %+v", *got)
+	}
+	b, _ := json.Marshal(uploadStatus(&config.Config{}, 7))
+	if string(b) != `{"connections":8,"rate_cap_bytes_per_s":5000000,"rate_bytes_per_s":7}` {
+		t.Fatalf("JSON %s", b)
+	}
+}
+
+func TestDescribeUpload(t *testing.T) {
+	for u, want := range map[config.UploadSettings]string{
+		{Connections: 8, PartsPerUpload: 2, MaxRate: 5_000_000}:  "8 connections, 2 parts in flight per upload, capped at 5 MB/s",
+		{Connections: 16, PartsPerUpload: 1, MaxRate: 1_250_000}: "16 connections, 1 part in flight per upload, capped at 1.25 MB/s",
+		{Connections: 0, PartsPerUpload: 2, MaxRate: 0}:          "the main connection only, no rate cap",
+	} {
+		if got := describeUpload(u); got != want {
+			t.Errorf("%+v: %q, want %q", u, got, want)
+		}
+	}
+}

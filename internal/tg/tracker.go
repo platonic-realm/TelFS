@@ -11,7 +11,6 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
-	"github.com/gotd/td/tgerr"
 )
 
 // KVLifetimeStats is the meta_kv key holding the tracker's persisted
@@ -427,7 +426,8 @@ func encodedSize(v bin.Encoder) int {
 }
 
 // asFloodWait classifies err as a Telegram flood throttle and returns
-// the mandated sleep. The AUTHORITATIVE probe is tgerr.AsFloodWait —
+// the mandated sleep. The AUTHORITATIVE probe is classifyFlood (gotd's typed
+// error: tgerr FLOOD_WAIT / FLOOD_PREMIUM_WAIT) —
 // gotd's own error type prints as "rpc error code 420: FLOOD_WAIT
 // (23)" (type and argument SEPARATED), so no substring scan for
 // "FLOOD_WAIT_N" ever matches it; the previous implementation relied
@@ -440,7 +440,7 @@ func asFloodWait(err error) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
 	}
-	if d, ok := tgerr.AsFloodWait(err); ok {
+	if _, d, ok := classifyFlood(err); ok {
 		return d, true
 	}
 	// Fall back to a string match for older gotd versions or wrapped errors.

@@ -290,3 +290,83 @@ func TestSnapshotPolicyConfig(t *testing.T) {
 		}
 	}
 }
+
+// [upload] (spec v1, row 2): defaults when unset, read from config.toml,
+// bad values refused with the table named; an unset table saves without
+// [upload], an explicit 0 survives a save.
+func TestUploadSettingsConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{DataDir: dir, APIID: 1, APIHash: "h"}
+	s, err := cfg.UploadSettings()
+	if err != nil || s != (UploadSettings{Connections: 8, PartsPerUpload: 2, MaxRate: 5_000_000}) {
+		t.Fatalf("defaults: %+v %v", s, err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(cfg.ConfigPath()); strings.Contains(string(b), "[upload]") {
+		t.Fatalf("an unset [upload] must not be written:\n%s", b)
+	}
+	toml := "api_id = 7\napi_hash = \"h\"\n\n[upload]\nconnections = 16\nparts_per_upload = 4\nmax_rate = \"8 MiB/s\"\n"
+	if err := os.WriteFile(filepath.Join(dir, ConfigFile), []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, err = got.UploadSettings(); err != nil || s != (UploadSettings{Connections: 16, PartsPerUpload: 4, MaxRate: 8 << 20}) {
+		t.Fatalf("configured: %+v %v", s, err)
+	}
+
+	// connections = 0 (main connection only) and max_rate = "0" (no cap)
+	// are values, not "unset".
+	toml = "api_id = 7\napi_hash = \"h\"\n\n[upload]\nconnections = 0\nmax_rate = \"0\"\n"
+	if err := os.WriteFile(filepath.Join(dir, ConfigFile), []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = LoadFromDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = got.UploadSettings(); err != nil || s != (UploadSettings{Connections: 0, PartsPerUpload: 2, MaxRate: 0}) {
+		t.Fatalf("zeros: %+v %v", s, err)
+	}
+	if err := got.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = LoadFromDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = got.UploadSettings(); err != nil || s.Connections != 0 || s.MaxRate != 0 {
+		t.Fatalf("zeros after a save: %+v %v", s, err)
+	}
+
+	n := func(v int) *int { return &v }
+	for _, bad := range []UploadConfig{
+		{Connections: n(-1)}, {Connections: n(33)},
+		{PartsPerUpload: n(0)}, {PartsPerUpload: n(17)},
+		{MaxRate: "fast"}, {MaxRate: "5 MB/min"}, {MaxRate: "/s"}, {MaxRate: "-5MB/s"},
+		{MaxRate: "5"}, // 5 bytes/s: a unit missing
+	} {
+		c := &Config{Upload: bad}
+		if _, err := c.UploadSettings(); err == nil || !strings.Contains(err.Error(), "[upload]") {
+			t.Errorf("%+v: %v, want an error naming [upload]", bad, err)
+		}
+	}
+}
+
+func TestParseByteRate(t *testing.T) {
+	for in, want := range map[string]int64{
+		"5MB/s": 5_000_000, "5 mb/s": 5_000_000, "800KiB/s": 800 << 10, "1.5MB/S": 1_500_000,
+		"5000000": 5_000_000, "0": 0, "0MB/s": 0, "2GB": 2_000_000_000,
+	} {
+		if got, err := ParseByteRate(in); err != nil || got != want {
+			t.Errorf("ParseByteRate(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "/s", "MB/s", "5 parsecs", "five"} {
+		if _, err := ParseByteRate(in); err == nil {
+			t.Errorf("ParseByteRate(%q): no error", in)
+		}
+	}
+}

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/tg"
 
 	"telfs/internal/config"
 )
@@ -32,6 +35,12 @@ type Client struct {
 	cfg       *config.Config
 	tracker   *Tracker
 	rateLimit *RateLimiter
+	// byteLimit caps upload parts in bytes/s ([upload] max_rate), on
+	// every connection of this client.
+	byteLimit *ByteLimiter
+	// upload is [upload] resolved: the upload pool's size and the parts
+	// in flight per upload.
+	upload config.UploadSettings
 	// storage holds the MTProto session. Since P1 it is always the
 	// encrypted session.enc (internal/sessionstore); the caller opens
 	// it with the profile's secret and passes it in.
@@ -52,12 +61,27 @@ func New(cfg *config.Config, storage session.Storage) (*Client, error) {
 	if storage == nil {
 		return nil, errors.New("tg: no session storage (open session.enc with the profile's secret first)")
 	}
+	up, err := cfg.UploadSettings()
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
 		cfg:       cfg,
 		tracker:   NewTracker(128),
 		rateLimit: NewRateLimiter(0, 0),
+		byteLimit: NewByteLimiter(up.MaxRate),
+		upload:    up,
 		storage:   storage,
 	}, nil
+}
+
+// UploadSettings is the client's [upload]: pool size, parts in flight per
+// upload, byte-rate cap.
+func (c *Client) UploadSettings() config.UploadSettings { return c.upload }
+
+// newSession is a Session of this client, with no connection bound yet.
+func (c *Client) newSession() *Session {
+	return &Session{cfg: c.cfg, tracker: c.tracker, uploadThreads: c.upload.PartsPerUpload}
 }
 
 // Tracker returns the request log + connection-state tracker. The
@@ -90,19 +114,91 @@ func (c *Client) newTG() *telegram.Client {
 	// BEFORE flooding into FloodWaiter's retry loop or being counted
 	// by TrackingMiddleware as "in flight". That keeps the daemon's
 	// outbound rate bounded by the operator-controlled budget rather
-	// than by Telegram's punitive FLOOD_WAITs.
+	// than by Telegram's punitive FLOOD_WAITs. The ByteLimiter comes
+	// next: upload parts wait there for their bytes ([upload] max_rate),
+	// also before they count as in flight.
 	opts := telegram.Options{
 		SessionStorage: storage,
-		Middlewares: []telegram.Middleware{
-			c.rateLimit,
-			NewFloodWaiter(),
-			&TrackingMiddleware{Tracker: c.tracker},
-		},
+		Middlewares:    c.middlewares(),
 	}
 	if c.cfg.DC != 0 {
 		opts.DC = c.cfg.DC
 	}
 	return telegram.NewClient(c.cfg.APIID, c.cfg.APIHash, opts)
+}
+
+// middlewares is TelFS's invoker chain, outermost first (see newTG for the
+// order): the RPC-per-minute limiter, the upload byte-rate cap, the flood
+// waiter, the tracker. The main connection gets it through
+// telegram.Options; the upload pool through wrapUploadInvoker — gotd's
+// Client.Pool invokes its connections directly, WITHOUT the client's
+// middlewares, so without that wrapper uploads would skip flood waits,
+// the limiters and the tracker (status, adaptive limiter, stall watchdog).
+func (c *Client) middlewares() []telegram.Middleware {
+	return []telegram.Middleware{
+		c.rateLimit,
+		c.byteLimit,
+		NewFloodWaiter(),
+		&TrackingMiddleware{Tracker: c.tracker},
+	}
+}
+
+// chainInvoker wraps inv in mws, the first outermost (gotd's own order).
+func chainInvoker(inv tg.Invoker, mws ...telegram.Middleware) tg.Invoker {
+	for i := len(mws) - 1; i >= 0; i-- {
+		inv = mws[i].Handle(inv)
+	}
+	return inv
+}
+
+// wrapUploadInvoker is an API over raw (an upload pool's invoker) that
+// runs every call through the client's middleware chain.
+func (c *Client) wrapUploadInvoker(raw tg.Invoker) *tg.Client {
+	return tg.NewClient(chainInvoker(raw, c.middlewares()...))
+}
+
+// uploadPool is one connection cycle's pool of upload connections (gotd
+// Client.Pool: N connections to the account's data centre, sharing the
+// main connection's authorization). Once closed, its errors read as
+// ErrNotConnected, which UploadDocument retries — on the next cycle's
+// pool or on the main connection.
+type uploadPool struct {
+	inv    telegram.CloseInvoker
+	closed atomic.Bool
+}
+
+// Invoke implements tg.Invoker.
+func (p *uploadPool) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	if p.closed.Load() {
+		return ErrNotConnected
+	}
+	err := p.inv.Invoke(ctx, input, output)
+	if err != nil && p.closed.Load() {
+		return fmt.Errorf("%w (upload connections closed: %v)", ErrNotConnected, err)
+	}
+	return err
+}
+
+// Close closes the pool's connections (waits for them to end).
+func (p *uploadPool) Close() error {
+	p.closed.Store(true)
+	return p.inv.Close()
+}
+
+// openUploadPool opens the upload pool of a connection cycle on tgc (a
+// running client) and returns it with the API that uploads through it.
+// (nil, nil, nil) when [upload] connections = 0. gotd dials the pool's
+// connections lazily, on the first uploads.
+func (c *Client) openUploadPool(tgc *telegram.Client) (*uploadPool, *tg.Client, error) {
+	if c.upload.Connections <= 0 {
+		return nil, nil, nil
+	}
+	inv, err := tgc.Pool(int64(c.upload.Connections))
+	if err != nil {
+		return nil, nil, err
+	}
+	p := &uploadPool{inv: inv}
+	return p, c.wrapUploadInvoker(p), nil
 }
 
 // RunSession runs fn within an authenticated MTProto session. fn receives
@@ -126,7 +222,9 @@ func (c *Client) RunSession(ctx context.Context, fn func(ctx context.Context, se
 		if !status.Authorized {
 			return ErrNotAuthorized
 		}
-		return fn(ctx, &Session{api: tgc.API(), cfg: c.cfg, tracker: c.tracker})
+		sess := c.newSession()
+		sess.api = tgc.API()
+		return fn(ctx, sess)
 	})
 	if err == nil && ctx.Err() != nil {
 		return ctx.Err()

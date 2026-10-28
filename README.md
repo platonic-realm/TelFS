@@ -261,7 +261,8 @@ once it is closed.
 `mountpoint`, `pid`, `link` (state ok/busy/down/fault), `sync` (synced,
 pending uploads and bytes, unposted journal ops, oldest pending age),
 `snapshot`, `versions` (count, newest name and creation time),
-`upload`, `staging` (dir, pending bytes, cap, blocked), `key_header`,
+`upload` (configured connections and rate cap, measured upload rate in
+bytes/s), `staging` (dir, pending bytes, cap, blocked), `key_header`,
 `crypto_uses`, `last_error`. Without a running mount it reports from
 local state, with the live-only fields null. `telfs status --json
 --version NAME` asks that version's mount instead (`version_mount` =
@@ -703,7 +704,36 @@ min_free = "5GiB"             # never fill the staging filesystem below this (de
 [snapshot]                    # format 2: when to take a whole-DB snapshot
 every_ops = 500000            # after this many journal ops since the last one (default 500000)
 every = "24h"                 # or after this long, if anything changed (default 24h; Go duration)
+
+[upload]                      # how chunks, packs, journal batches and snapshots go up
+connections = 8               # upload connections to the account's data centre (default 8; 0 = the main connection only; max 32)
+parts_per_upload = 2          # 512 KiB parts of one upload in flight at once (default 2; 1..16)
+max_rate = "5MB/s"            # byte-rate cap on upload parts (default 5 MB/s; "0" = no cap; at least 64KiB/s)
 ```
+
+**Uploads.** Telegram keeps an account's files in one data centre, often
+far away (S9's account: DC5, ~170 ms round trip), and one TCP connection
+that far carries ~0.2 MB/s however many parts are in flight on it. So
+uploads go through a pool of `connections` extra connections to that
+data centre, each upload with `parts_per_upload` parts in flight; the
+up to four uploads running at once fill the pool. Measured 2026-10-28:
+1 connection 0.21 MB/s, 2 parts × 8 connections 4.15 MB/s. `max_rate`
+keeps TelFS from taking the whole line (a token bucket in bytes per
+second over every upload part, all connections together). The adaptive
+requests-per-minute limiter (`telfs ratelimit`) still applies on top: it
+starts each mount at 120 requests/min (~1 MB/s of 512 KiB parts) and,
+after 5 minutes without a flood wait, rises by 30 every 30 s while
+uploads run (up to 1200); `telfs ratelimit mode manual` turns it off.
+The defaults come from those measurements and may still change. The
+mount prints the settings in effect (`Upload: 8 connections, …`);
+`telfs status --json` reports them in `upload` (`connections`,
+`rate_cap_bytes_per_s`) next to the measured `rate_bytes_per_s`.
+Telegram answers too fast an account with `FLOOD_WAIT_X` or — its
+upload limit for accounts without Premium — `FLOOD_PREMIUM_WAIT_X`;
+TelFS waits the X seconds and goes on, and names each wait in the log
+(`[flood-wait] …: FLOOD_PREMIUM_WAIT — …`). Repeated premium waits mean
+the rate is above what the account is allowed: lower `max_rate` or
+`connections`.
 
 **Snapshots (format 2).** The journal holds every change, including
 where each chunk lives, so the newest snapshot plus the journal after it
