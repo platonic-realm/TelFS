@@ -226,6 +226,12 @@ func (s SecretConfig) Validate() error {
 		if s.File == "" {
 			return errors.New(`[secret] source = "file" needs file = "<path>"`)
 		}
+		if rest, ok := credentialRel(s.File); ok {
+			if !credentialNameOK(rest) {
+				return fmt.Errorf("[secret] file %q must name a file inside the credentials directory", s.File)
+			}
+			return nil
+		}
 		if !filepath.IsAbs(s.File) {
 			return fmt.Errorf("[secret] file %q must be an absolute path", s.File)
 		}
@@ -578,3 +584,43 @@ func (c *Config) StagingLimits() (maxBytes, minFree int64, err error) {
 	return maxBytes, minFree, nil
 }
 
+// CredentialsDirVar is the variable systemd sets for a unit that loads
+// credentials (LoadCredential=/LoadCredentialEncrypted=): the unit's own
+// credentials directory (%d in the unit). It holds a path, not a secret.
+const CredentialsDirVar = "CREDENTIALS_DIRECTORY"
+
+// credentialRel returns the part after "${CREDENTIALS_DIRECTORY}/" (or
+// "$CREDENTIALS_DIRECTORY/") when file starts with it.
+func credentialRel(file string) (string, bool) {
+	for _, pre := range []string{"${" + CredentialsDirVar + "}/", "$" + CredentialsDirVar + "/"} {
+		if strings.HasPrefix(file, pre) {
+			return file[len(pre):], true
+		}
+	}
+	return "", false
+}
+
+func credentialNameOK(rel string) bool {
+	c := filepath.Clean(rel)
+	return rel != "" && c != "." && !filepath.IsAbs(c) && c != ".." && !strings.HasPrefix(c, "../")
+}
+
+// ResolvedFile is the secret file's path. A file under
+// ${CREDENTIALS_DIRECTORY} (systemd encrypted credentials, spec v1) resolves
+// inside that directory only: if the variable is unset — the command is not
+// running in the unit that loaded the credential — it is an error, never a
+// fallback to some other place. Nothing else in the path is expanded.
+func (s SecretConfig) ResolvedFile() (string, error) {
+	rel, ok := credentialRel(s.File)
+	if !ok {
+		return s.File, nil
+	}
+	if !credentialNameOK(rel) {
+		return "", fmt.Errorf("[secret] file %q must name a file inside the credentials directory", s.File)
+	}
+	dir := os.Getenv(CredentialsDirVar)
+	if dir == "" {
+		return "", fmt.Errorf("[secret] file %q comes from systemd's credentials directory, but $%s is not set — run this from the unit that loads the credential (LoadCredentialEncrypted=)", s.File, CredentialsDirVar)
+	}
+	return filepath.Join(dir, filepath.Clean(rel)), nil
+}

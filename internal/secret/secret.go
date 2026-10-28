@@ -169,7 +169,11 @@ func Read(ctx context.Context, conf config.SecretConfig, req Request) (*Secret, 
 	}
 	switch src {
 	case config.SecretSourceFile:
-		b, err := ReadFile(conf.File)
+		path, err := conf.ResolvedFile()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrSource, err)
+		}
+		b, err := ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrSource, err)
 		}

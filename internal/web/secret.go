@@ -114,8 +114,12 @@ func (s *Server) profilesSetSecret(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
-	if sc.Source == config.SecretSourceFile {
-		if b, err := secret.ReadFile(sc.File); err != nil {
+	// A ${CREDENTIALS_DIRECTORY} path (systemd encrypted credentials) is
+	// readable only inside the unit that loads it — the console cannot
+	// test-read it; Validate above checked its form.
+	path, credErr := sc.ResolvedFile()
+	if sc.Source == config.SecretSourceFile && credErr == nil {
+		if b, err := secret.ReadFile(path); err != nil {
 			SetFlash(w, "error", err.Error())
 			http.Redirect(w, r, back, http.StatusSeeOther)
 			return

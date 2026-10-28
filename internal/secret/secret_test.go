@@ -187,3 +187,35 @@ func TestWarnIfWeak(t *testing.T) {
 		t.Fatalf("no warning expected at %d characters: %q", WeakLength, buf.String())
 	}
 }
+
+// systemd encrypted credentials (spec v1): a ${CREDENTIALS_DIRECTORY} path
+// resolves inside the unit's credentials directory only — unset variable →
+// source error (exit 2), no fallback; `..` cannot climb out.
+func TestReadFromCredentialsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "telfs-secret"), []byte("correct horse battery staple\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	conf := config.SecretConfig{Source: config.SecretSourceFile, File: "${CREDENTIALS_DIRECTORY}/telfs-secret"}
+	t.Setenv(config.CredentialsDirVar, dir)
+	s, err := Read(context.Background(), conf, Request{NoPrompt: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(s.Bytes()) != "correct horse battery staple" {
+		t.Fatalf("secret %q", s.Bytes())
+	}
+	t.Setenv(config.CredentialsDirVar, "")
+	_, err = Read(context.Background(), conf, Request{NoPrompt: true})
+	if !errors.Is(err, ErrSource) || !strings.Contains(err.Error(), "CREDENTIALS_DIRECTORY is not set") {
+		t.Fatalf("unset variable: %v", err)
+	}
+	for _, bad := range []string{"${CREDENTIALS_DIRECTORY}/../etc/passwd", "${CREDENTIALS_DIRECTORY}/", "$CREDENTIALS_DIRECTORY/a/../../b"} {
+		if err := (config.SecretConfig{Source: config.SecretSourceFile, File: bad}).Validate(); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	if err := (config.SecretConfig{Source: config.SecretSourceFile, File: "$CREDENTIALS_DIRECTORY/telfs-secret"}).Validate(); err != nil {
+		t.Errorf("plain $VAR form refused: %v", err)
+	}
+}

@@ -325,6 +325,13 @@ entry  = "Services/TelFS/main"   # path inside KeePassXC's exposed Secret Servic
   starts inherits it.
 - **file** — a regular file (no symlink), giving nothing to "others",
   at most 4 KiB; one trailing newline is ignored. What boot mounts use.
+  For systemd encrypted credentials (`LoadCredentialEncrypted=` in the
+  unit) write `file = "${CREDENTIALS_DIRECTORY}/telfs-secret"`: TelFS
+  expands only that variable, reads the secret from the unit's own
+  credentials directory and nowhere else (unset → error, exit 2), and
+  never copies it to disk. Run anywhere else, such a profile fails
+  with a clear message — commands that only talk to the running daemon
+  don't need the secret.
 - **keepassxc** — `secret-tool lookup Path /<entry>` against the
   running KeePassXC (unlock or confirm in its window; 2-minute limit).
 
