@@ -2,6 +2,7 @@ package fs
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -161,6 +162,9 @@ func (h *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32,
 		if interrupted(ctx, err) {
 			return uint32(n), syscall.EINTR
 		}
+		if errors.Is(err, chunk.ErrStagingFull) {
+			return uint32(n), syscall.ENOSPC
+		}
 		log.Printf("fs.handle.Write(ino=%d, off=%d, len=%d): wrote %d, err=%v", h.node.ino, off, len(data), n, err)
 		return uint32(n), syscall.EIO
 	}
@@ -199,6 +203,9 @@ func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
 			return syscall.EINTR // pool shutdown mid-teardown
 		}
 		log.Printf("fs.handle.Flush(ino=%d): %v", h.node.ino, err)
+		if errors.Is(err, chunk.ErrStagingFull) {
+			return syscall.ENOSPC
+		}
 		return syscall.EIO
 	}
 	return 0
@@ -219,6 +226,9 @@ func (h *fileHandle) Fsync(ctx context.Context, _ uint32) syscall.Errno {
 			return syscall.EINTR
 		}
 		log.Printf("fs.handle.Fsync(ino=%d): %v", h.node.ino, err)
+		if errors.Is(err, chunk.ErrStagingFull) {
+			return syscall.ENOSPC
+		}
 		return syscall.EIO
 	}
 	return 0

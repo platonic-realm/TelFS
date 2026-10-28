@@ -79,6 +79,10 @@ type Config struct {
 	// hold the cache pointer for the life of the daemon.
 	CacheCap string `toml:"cache_cap,omitempty"`
 
+	// Staging is where written-but-not-yet-uploaded data waits, and how
+	// much of it may (spec v1, row 9).
+	Staging StagingConfig `toml:"staging,omitempty"`
+
 	// DataDir is the resolved location of the .telfs/ directory. Not serialized.
 	DataDir string `toml:"-"`
 }
@@ -527,3 +531,50 @@ func (c *Config) RequireChannel() error {
 	}
 	return nil
 }
+
+// StagingConfig is `[staging]` in config.toml (spec v1, row 9).
+//
+//	[staging]
+//	dir = "/srv/…/telfs-staging"  # default <profile>/cache/pending
+//	max_bytes = "50GB"            # staged bytes above which writes wait
+//	min_free = "5GiB"             # never fill the staging filesystem below this
+//
+// The directory must be on persistent storage: until a chunk is uploaded,
+// its staged wire is the filesystem's only copy (re-submitted at the next
+// mount after a crash).
+type StagingConfig struct {
+	Dir      string `toml:"dir,omitempty"`
+	MaxBytes string `toml:"max_bytes,omitempty"`
+	MinFree  string `toml:"min_free,omitempty"`
+}
+
+// PendingDirName is the staging directory's name under the cache root
+// (chunk.PendingDirName is the same).
+const PendingDirName = "pending"
+
+// StagingDir is the staging directory: [staging] dir, else
+// <profile>/cache/pending.
+func (c *Config) StagingDir() string {
+	if c.Staging.Dir != "" {
+		return c.Staging.Dir
+	}
+	return filepath.Join(c.CachePath(), PendingDirName)
+}
+
+// StagingLimits returns [staging] max_bytes and min_free, with the v1
+// defaults (50 GB, 5 GiB) for unset values. max_bytes = 0 means no cap.
+func (c *Config) StagingLimits() (maxBytes, minFree int64, err error) {
+	maxBytes, minFree = 50_000_000_000, 5<<30
+	if c.Staging.MaxBytes != "" {
+		if maxBytes, err = ParseHumanBytes(c.Staging.MaxBytes); err != nil {
+			return 0, 0, fmt.Errorf("[staging] max_bytes: %w", err)
+		}
+	}
+	if c.Staging.MinFree != "" {
+		if minFree, err = ParseHumanBytes(c.Staging.MinFree); err != nil {
+			return 0, 0, fmt.Errorf("[staging] min_free: %w", err)
+		}
+	}
+	return maxBytes, minFree, nil
+}
+

@@ -9,13 +9,11 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"telfs/internal/chunk"
 	"telfs/internal/config"
 	"telfs/internal/meta"
 	"telfs/internal/snapshot"
@@ -232,7 +230,7 @@ func loadOfflineSync(ctx context.Context, data *tgPageData) {
 		}
 	}
 	pendingClean := true
-	pendingDir := filepath.Join(cfg.CachePath(), chunk.PendingDirName)
+	pendingDir := cfg.StagingDir()
 	if ents, err := os.ReadDir(pendingDir); err == nil {
 		for _, e := range ents {
 			if !e.IsDir() {

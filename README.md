@@ -498,7 +498,22 @@ username = "you"
 id = 1234567890
 access_hash = -9876543210123456789
 title = "My TelFS"
+
+[staging]                     # written through the mount, not yet uploaded
+dir = "/srv/telfs-staging"    # default <profile>/cache/pending — persistent storage, not tmpfs
+max_bytes = "50GB"            # above this, writes wait for uploads (default 50 GB; "0" = no cap)
+min_free = "5GiB"             # never fill the staging filesystem below this (default 5 GiB)
 ```
+
+**Staging.** A write goes to the staging directory first and to the
+channel later, so `close()` returns at disk speed. Until a chunk is
+uploaded its staged copy is the only one: put the directory on
+persistent storage. When `max_bytes` are waiting, writes block until
+uploads catch up (a 400 GB `rsync` slows to upload speed instead of
+filling the disk); if the filesystem would drop below `min_free` with
+nothing of TelFS's left to upload, writes fail with "No space left on
+device". A failed upload is retried from the staged copy until it
+lands; anything still staged at unmount is uploaded at the next mount.
 
 Environment overrides:
 

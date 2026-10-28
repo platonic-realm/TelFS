@@ -34,9 +34,12 @@ import (
 // time. Practical worst case for a real 1 MiB chunk is on the order
 // of a minute before final give-up; that's the point where surfacing
 // the error to userspace is the right call.
+// uploadRetryFirst is the first backoff (a variable so tests can shorten it).
+var uploadRetryFirst = 500 * time.Millisecond
+
 func uploadWithRetry(ctx context.Context, u Uploader, body []byte, name, caption string) (int, error) {
 	const maxAttempts = 5
-	backoff := 500 * time.Millisecond
+	backoff := uploadRetryFirst
 	const backoffCap = 8 * time.Second
 
 	var lastErr error

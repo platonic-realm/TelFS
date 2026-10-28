@@ -750,7 +750,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// through such a gap would truncate away fully-recoverable data —
 	// which is exactly what the crash left behind.
 	stagedSet := make(map[int64]map[int32]bool)
-	if entries, err := chunk.ScanPending(filepath.Join(cfg.CachePath(), chunk.PendingDirName)); err == nil {
+	if entries, err := chunk.ScanPending(cfg.StagingDir()); err == nil {
 		for _, e := range entries {
 			if stagedSet[e.Ino] == nil {
 				stagedSet[e.Ino] = make(map[int32]bool)
@@ -984,12 +984,23 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// after PutChunk lands. A SIGKILL between dispatch and
 		// PutChunk leaves the wire on disk; cmdMount's pre-mount
 		// recovery (below) re-submits it on next startup.
-		pendingDir, err := chunk.EnsurePendingDir(cache.Dir())
-		if err != nil {
-			return err
+		// The staging directory ([staging] dir, default
+		// <profile>/cache/pending) and its gate: written-but-not-yet-
+		// uploaded data waits there, up to [staging] max_bytes, never
+		// filling its filesystem below min_free (spec v1, row 9).
+		pendingDir := cfg.StagingDir()
+		if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+			return fmt.Errorf("staging dir: %w", err)
 		}
 		chunk.CleanupPendingTmp(pendingDir)
 		pool.PendingDir = pendingDir
+		stageMax, stageFree, err := cfg.StagingLimits()
+		if err != nil {
+			return err
+		}
+		stagingGate := chunk.NewDiskGate(pendingDir, stageMax, stageFree)
+		pool.Disk = stagingGate
+		fmt.Printf("Staging: %s (up to %s waiting for upload, keeps %s free)\n", pendingDir, humanBytes(stageMax), humanBytes(stageFree))
 		// In-process pending index: accelerates Reader.tryPendingFallback
 		// by skipping the O(N) Glob over the pending dir on every miss.
 		// Writer populates it after PersistPending; packer drops entries
@@ -1038,6 +1049,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		packer := chunk.NewPacker(metaStore, sess, 0, 0, 0)
 		packer.SetWire(pipe.wc)
 		packer.SetPendingIndex(pendingIndex)
+		packer.SetDiskGate(stagingGate)
 		// Cancel pending wires on unlink. When a file is deleted while
 		// some of its chunks are still buffered in the packer (tar
 		// overwriting an extracted tree, rm -rf during an upload, etc.),
@@ -1338,7 +1350,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		if *readonly {
 			fmt.Fprintln(os.Stderr, "read-only: no snapshots, no journal, no uploads — nothing is written to the channel")
 		} else {
-			go recoverPending(signalCtx, pendingDir, packer, metaStore, pendingIndex)
+			go recoverPending(signalCtx, pendingDir, packer, metaStore, pendingIndex, stagingGate)
 		}
 
 		// Stall watchdog: if there's chunk work pending but no
@@ -1658,7 +1670,20 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 		}
 		var pendingFiles int
 		var pendingBytes int64
-		if pendingDir != "" {
+		var stagingCap int64
+		var stagingBlocked bool
+		var stagedWaiting int64
+		var stagedRunning int32
+		if pool != nil && pool.Disk != nil {
+			// Queue mode: the gate and the in-memory index know the
+			// staged bytes and files; listing a directory of hundreds of
+			// thousands of wires on every request would not scale.
+			pendingBytes, stagingCap, stagingBlocked = pool.Disk.Stats()
+			if pool.PendingIndex != nil {
+				pendingFiles = pool.PendingIndex.Len()
+			}
+			stagedWaiting, stagedRunning = pool.StagedQueue()
+		} else if pendingDir != "" {
 			if ents, err := os.ReadDir(pendingDir); err == nil {
 				for _, e := range ents {
 					if e.IsDir() {
@@ -1700,6 +1725,12 @@ func telegramJSONHandler(tr *tg.Tracker, cfg *config.Config, packer *chunk.Packe
 		fmt.Fprintf(w, "    \"pool_in_flight\": %d,\n", poolInFlight)
 		fmt.Fprintf(w, "    \"pool_cap\": %d,\n", poolCap)
 		fmt.Fprintf(w, "    \"uploads_total\": %d,\n", uploadsTotal)
+		fmt.Fprintf(w, "    \"staging_dir\": %q,\n", pendingDir)
+		fmt.Fprintf(w, "    \"staging_bytes\": %d,\n", pendingBytes)
+		fmt.Fprintf(w, "    \"staging_cap_bytes\": %d,\n", stagingCap)
+		fmt.Fprintf(w, "    \"staging_blocked\": %t,\n", stagingBlocked)
+		fmt.Fprintf(w, "    \"staged_direct_waiting\": %d,\n", stagedWaiting)
+		fmt.Fprintf(w, "    \"staged_direct_running\": %d,\n", stagedRunning)
 		fmt.Fprintf(w, "    \"journal_unposted\": %d\n", journalUnposted)
 		fmt.Fprintln(w, "  },")
 		// Channel-sync verdict. channel_complete means the channel
@@ -1804,7 +1835,7 @@ func checkFusermount() {
 // Runs in a goroutine so it doesn't delay the "Mounted at" message.
 // Errors from individual entries are logged but don't abort the
 // recovery — leftover entries will be retried on the next startup.
-func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstore *meta.Store, pendingIndex *chunk.PendingIndex) {
+func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstore *meta.Store, pendingIndex *chunk.PendingIndex, gate *chunk.DiskGate) {
 	entries, err := chunk.ScanPending(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pending: scan:", err)
@@ -1890,22 +1921,20 @@ func recoverPending(ctx context.Context, dir string, packer *chunk.Packer, mstor
 		// window go through the O(1) lookup instead of a Glob scan.
 		// The packer will UnrecordPersist on each successful PutChunk.
 		pendingIndex.RecordPersist(e.Ino, e.Idx, e.Path)
-		wire, err := os.ReadFile(e.Path)
+		info, err := os.Stat(e.Path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "pending: read %s: %v\n", e.Path, err)
+			fmt.Fprintf(os.Stderr, "pending: stat %s: %v\n", e.Path, err)
 			continue
 		}
-		// Submit blocks only on enqueue. The packer's flusher
-		// processes the batch normally; on success it deletes the
-		// pending file. We discard the result chan — fire-and-
-		// forget is appropriate since this code path is background
-		// recovery and the packer already logs flush errors to
-		// stderr; a failed retry leaves the pending file in place
-		// for the NEXT startup scan to retry again.
-		// Format 2 keeps the content hash (the wire's AAD) in the
-		// staged file's name; it must reach chunk_map with the row.
-		ch := packer.SubmitHashed(e.Ino, e.Idx, e.PlaintextSize, wire, e.Path, e.Hash, "")
-		go func() { <-ch }()
+		// By REFERENCE (spec v1, row 9): the packer reads the wire at
+		// flush, so recovering 50 GB of staged data never loads it into
+		// memory. Its bytes count against the staging cap from now
+		// until its file is removed. A failure is retried from disk
+		// (and, after a restart, re-found here). Format 2 keeps the
+		// content hash (the wire's AAD) in the staged file's name; it
+		// must reach chunk_map with the row.
+		gate.Add(info.Size())
+		packer.SubmitStaged(e.Ino, e.Idx, e.PlaintextSize, info.Size(), e.Path, e.Hash, "", 0, nil)
 	}
 }
 

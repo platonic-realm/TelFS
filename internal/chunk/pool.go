@@ -3,6 +3,8 @@ package chunk
 import (
 	"context"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -65,6 +67,134 @@ type UploadPool struct {
 	// upload goroutine finishes — success or failure.
 	staged    *semaphore.Weighted
 	stagedCap int64
+
+	// Disk, when set (production: PendingDir is set), switches the writer
+	// to the disk-backed staging queue (spec v1, row 9): a chunk's wire is
+	// written to PendingDir and its memory released before it waits for
+	// anything; direct uploads then run from the queue below (the workers
+	// replace the sem), packed ones from the packer, both reading the wire
+	// back from disk. Nil keeps the in-memory pipeline (tests, mocks).
+	Disk *DiskGate
+
+	qmu       sync.Mutex
+	queue     []*stagedJob
+	qsignal   chan struct{}
+	qstart    sync.Once
+	busy      atomic.Int32
+	queued    atomic.Int64
+	retryBase time.Duration
+}
+
+// stagedJob is one staged direct upload. run returns true when the job is
+// finished (uploaded, or dropped because its inode is gone) and false to
+// be retried later from the staged wire.
+type stagedJob struct {
+	run     func(ctx context.Context) bool
+	attempt int
+}
+
+// DefaultStagedRetryBase is the first retry delay of a failed staged upload;
+// it doubles up to stagedRetryMax. The wire is on disk, so the job keeps
+// retrying for as long as the daemon runs (a network outage resumes by
+// itself); at shutdown it stays staged and the next mount re-submits it.
+const (
+	DefaultStagedRetryBase = 5 * time.Second
+	stagedRetryMax         = 5 * time.Minute
+)
+
+// EnqueueStaged queues a staged direct upload (queue mode only).
+func (p *UploadPool) EnqueueStaged(run func(ctx context.Context) bool) {
+	p.qstart.Do(p.startWorkers)
+	p.push(&stagedJob{run: run})
+}
+
+func (p *UploadPool) push(j *stagedJob) {
+	p.qmu.Lock()
+	p.queue = append(p.queue, j)
+	p.qmu.Unlock()
+	p.queued.Add(1)
+	select {
+	case p.qsignal <- struct{}{}:
+	default:
+	}
+}
+
+func (p *UploadPool) pop() *stagedJob {
+	p.qmu.Lock()
+	defer p.qmu.Unlock()
+	if len(p.queue) == 0 {
+		return nil
+	}
+	j := p.queue[0]
+	p.queue[0] = nil
+	p.queue = p.queue[1:]
+	p.queued.Add(-1)
+	return j
+}
+
+// startWorkers runs one worker per concurrency slot.
+func (p *UploadPool) startWorkers() {
+	for i := 0; i < cap(p.sem); i++ {
+		go p.worker()
+	}
+}
+
+func (p *UploadPool) worker() {
+	for {
+		j := p.pop()
+		if j == nil {
+			select {
+			case <-p.qsignal:
+				continue
+			case <-p.uploadCtx.Done():
+				return
+			}
+		}
+		if p.uploadCtx.Err() != nil {
+			return // shutting down: the wire stays staged for the next mount
+		}
+		p.busy.Add(1)
+		done := runStagedJob(p.uploadCtx, j)
+		p.busy.Add(-1)
+		if done {
+			// More work may be waiting behind this one.
+			select {
+			case p.qsignal <- struct{}{}:
+			default:
+			}
+			continue
+		}
+		j.attempt++
+		base := p.retryBase
+		if base <= 0 {
+			base = DefaultStagedRetryBase
+		}
+		d := base << min(j.attempt-1, 16)
+		if d > stagedRetryMax || d <= 0 {
+			d = stagedRetryMax
+		}
+		time.AfterFunc(d, func() {
+			if p.uploadCtx.Err() == nil {
+				p.push(j)
+			}
+		})
+	}
+}
+
+// runStagedJob runs a job, turning a panic into "finished" (logged by the
+// job's own guard) so one bad job can never kill a worker.
+func runStagedJob(ctx context.Context, j *stagedJob) (done bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			done = true
+		}
+	}()
+	return j.run(ctx)
+}
+
+// StagedQueue reports the staged direct uploads waiting and running.
+func (p *UploadPool) StagedQueue() (waiting int64, running int32) {
+	return p.queued.Load(), p.busy.Load()
 }
 
 // NewUploadPool constructs a pool with the given concurrency cap.
@@ -81,6 +211,7 @@ func NewUploadPool(concurrency int) *UploadPool {
 		Pending:      NewPendingInodes(),
 		staged:       semaphore.NewWeighted(DefaultStagedCapBytes),
 		stagedCap:    DefaultStagedCapBytes,
+		qsignal:      make(chan struct{}, 1),
 	}
 }
 
@@ -125,7 +256,12 @@ func (p *UploadPool) UploadCtx() context.Context {
 // by active uploads. The sem channel is "send-to-acquire"; len(sem)
 // reflects how many tokens have been pushed (= in-flight count).
 // Cheap to call from a status endpoint.
-func (p *UploadPool) InFlight() int { return len(p.sem) }
+func (p *UploadPool) InFlight() int {
+	if p.Disk != nil {
+		return int(p.busy.Load())
+	}
+	return len(p.sem)
+}
 
 // Cap returns the upload-concurrency cap this pool was constructed
 // with. Used by the web UI to render "N of M slots in use" without

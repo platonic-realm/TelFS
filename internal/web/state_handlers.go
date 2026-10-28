@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 
 	"telfs/internal/chunk"
 	"telfs/internal/config"
@@ -123,7 +122,7 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 	d.DataDir = cfg.DataDir
 	d.DBPath = cfg.DBPath()
 	d.CachePath = cfg.CachePath()
-	d.PendingDir = filepath.Join(cfg.CachePath(), chunk.PendingDirName)
+	d.PendingDir = cfg.StagingDir()
 
 	if info, err := os.Stat(cfg.DBPath()); err == nil {
 		d.DBSize = info.Size()
@@ -225,7 +224,7 @@ func (s *Server) stateRepair(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer mstore.Close()
-		pendingDir := filepath.Join(cfg.CachePath(), chunk.PendingDirName)
+		pendingDir := cfg.StagingDir()
 		_, err = mstore.RepairPartialFilesProgress(context.Background(), stagedCheckerFor(pendingDir), s.repair.OnProgress)
 		if err != nil {
 			s.opts.Logger.Printf("repair: %v", err)

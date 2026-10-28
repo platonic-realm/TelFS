@@ -228,6 +228,12 @@ func (w *Writer) WriteAt(ctx context.Context, src []byte, off int64) (int, error
 	if w.closed {
 		return 0, fmt.Errorf("writer: handle closed")
 	}
+	// Except the staging floor (queue mode): the staging filesystem is
+	// full and nothing staged can free it — writing on would only pile
+	// the data up in memory. The file layer maps it to ENOSPC.
+	if errors.Is(w.uploadErr, ErrStagingFull) {
+		return 0, w.uploadErr
+	}
 	// NOTE: we DO NOT surface w.uploadErr here. Background upload
 	// failures that have been restored-to-dirty will retry on the
 	// next dispatch (eager below, or explicit Flush). Returning the
@@ -855,6 +861,10 @@ func (w *Writer) removeFromOrderLocked(idx int32) {
 // writer has been Detached (no map left to restore into — the failed
 // chunk is lost, the error logs to stderr).
 func (w *Writer) uploadOne(ctx context.Context, idx int32, dc *dirtyChunk, doneCh chan struct{}, res *Reservation) {
+	if w.queueMode() {
+		w.uploadOneStaged(ctx, idx, dc, doneCh, res)
+		return
+	}
 	// Defers unwind LIFO: panic guard runs LAST (outermost — must catch
 	// even the inner defers' panics). Then restore-on-failure runs
 	// first on normal return (so waiters see the resurrected dirty

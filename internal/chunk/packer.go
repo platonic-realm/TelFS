@@ -3,6 +3,7 @@ package chunk
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -101,6 +102,14 @@ type Packer struct {
 	// for. PutChunk uses context.Background() for the same reason.
 	stop chan struct{}
 	done chan struct{}
+
+	// Queue mode (spec v1, row 9): staged requests hold only their path;
+	// disk releases their staged bytes when the file is removed. A failed
+	// flush puts staged requests back and backs the whole packer off.
+	disk       *DiskGate
+	retryUntil time.Time
+	retryN     int
+	retryBase  time.Duration
 }
 
 type packReq struct {
@@ -120,6 +129,20 @@ type packReq struct {
 	hash     []byte
 	codec    string
 	fileSize int64
+	// staged: queue mode — wire is nil until flush reads wireLen bytes
+	// from pendingPath; onDone (may be nil) receives the outcome instead
+	// of result, and never a transient error (staged work is retried).
+	staged  bool
+	wireLen int64
+	onDone  func(packResult)
+}
+
+// size is the request's wire length, loaded or not.
+func (r *packReq) size() int64 {
+	if r.wire != nil {
+		return int64(len(r.wire))
+	}
+	return r.wireLen
 }
 
 type packResult struct {
@@ -176,6 +199,10 @@ func (p *Packer) QueueDepth() (chunks int, bytes int64) {
 // user can compare packer_pending_bytes against the trigger.
 func (p *Packer) Target() int64 { return p.target }
 
+// SetDiskGate wires the staging gate (queue mode): removing a staged wire
+// after its row landed releases its bytes.
+func (p *Packer) SetDiskGate(g *DiskGate) { p.disk = g }
+
 // SetPendingIndex wires the in-process pending index so the packer
 // can keep it in sync with the on-disk source of truth as it
 // DeletePendings (on flush success and on FK-violation drop).
@@ -204,7 +231,7 @@ func (p *Packer) DropInode(ino int64) int {
 	for _, r := range p.pending {
 		if r.ino == ino {
 			dropped = append(dropped, r)
-			p.bufBytes -= int64(len(r.wire))
+			p.bufBytes -= r.size()
 			continue
 		}
 		kept = append(kept, r)
@@ -212,11 +239,9 @@ func (p *Packer) DropInode(ino int64) int {
 	p.pending = kept
 	p.mu.Unlock()
 	for _, r := range dropped {
-		if r.pendingPath != "" {
-			_ = DeletePending(r.pendingPath)
-		}
+		p.removeStaged(r)
 		p.pendingIndex.UnrecordPersist(r.ino, r.idx)
-		close(r.result)
+		p.complete(r, packResult{})
 	}
 	return len(dropped)
 }
@@ -262,12 +287,91 @@ func (p *Packer) SubmitFrom(ino int64, idx int32, plaintextSize int32, wire []by
 		pendingPath: pendingPath, hash: hash, codec: codec, fileSize: fileSize})
 }
 
+// SubmitStaged queues a staged chunk BY REFERENCE (queue mode, spec v1
+// row 9): its wire stays on disk at pendingPath (wireLen bytes) and is read
+// at flush, so the packer never holds more than one batch in memory however
+// long the queue. onDone (may be nil) runs once with the outcome — a
+// failure is retried from disk, never reported.
+func (p *Packer) SubmitStaged(ino int64, idx int32, plaintextSize int32, wireLen int64, pendingPath string, hash []byte, codec string, fileSize int64, onDone func(packResult)) {
+	p.submit(packReq{ino: ino, idx: idx, plaintextSize: plaintextSize, pendingPath: pendingPath,
+		hash: hash, codec: codec, fileSize: fileSize, staged: true, wireLen: wireLen, onDone: onDone})
+}
+
+// complete delivers a request's outcome: onDone for staged requests, the
+// result channel otherwise (a zero result = done, row not wanted).
+func (p *Packer) complete(r packReq, res packResult) {
+	if r.staged {
+		if r.onDone != nil {
+			r.onDone(res)
+		}
+		return
+	}
+	if r.result != nil {
+		r.result <- res
+		close(r.result)
+	}
+}
+
+// removeStaged deletes a request's staged wire after its row landed (or it
+// was dropped): through the gate in queue mode, so its bytes are released.
+func (p *Packer) removeStaged(r packReq) {
+	if r.pendingPath == "" {
+		return
+	}
+	if r.staged {
+		p.disk.Remove(r.pendingPath)
+		return
+	}
+	_ = DeletePending(r.pendingPath)
+}
+
+// failBatch reports a failed flush: in-memory requests get the error (the
+// writer restores them for retry), staged ones go back to the queue.
+func (p *Packer) failBatch(batch []packReq, err error) {
+	var staged []packReq
+	for _, r := range batch {
+		if r.staged {
+			staged = append(staged, r)
+			continue
+		}
+		p.complete(r, packResult{err: err})
+	}
+	if len(staged) > 0 {
+		p.requeue(staged, err)
+	}
+}
+
+// requeue puts staged requests back at the FRONT (order kept), drops their
+// loaded wires (read again next time), and backs the packer off.
+func (p *Packer) requeue(rs []packReq, err error) {
+	for i := range rs {
+		rs[i].wire = nil
+	}
+	p.mu.Lock()
+	p.pending = append(append([]packReq(nil), rs...), p.pending...)
+	for i := range rs {
+		p.bufBytes += rs[i].size()
+	}
+	p.retryN++
+	base := p.retryBase
+	if base <= 0 {
+		base = DefaultStagedRetryBase
+	}
+	d := base << min(p.retryN-1, 16)
+	if d > stagedRetryMax || d <= 0 {
+		d = stagedRetryMax
+	}
+	p.retryUntil = time.Now().Add(d)
+	p.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "[packer] %d staged chunk(s) kept for retry in %s: %v\n", len(rs), d, err)
+}
+
 func (p *Packer) submit(req packReq) <-chan packResult {
 	ch := make(chan packResult, 1)
 	req.result = ch
 	p.mu.Lock()
 	p.pending = append(p.pending, req)
-	p.bufBytes += int64(len(req.wire))
+	p.bufBytes += req.size()
 	overTarget := p.bufBytes >= p.target
 	p.mu.Unlock()
 	if overTarget {
@@ -339,7 +443,7 @@ func (p *Packer) loop() {
 // both the steady-state and the recovery path.
 func (p *Packer) flush() {
 	p.mu.Lock()
-	if len(p.pending) == 0 {
+	if len(p.pending) == 0 || time.Now().Before(p.retryUntil) {
 		p.mu.Unlock()
 		return
 	}
@@ -347,7 +451,7 @@ func (p *Packer) flush() {
 	var batchBytes int64
 	taken := 0
 	for i, r := range p.pending {
-		w := int64(len(r.wire))
+		w := r.size()
 		// Take at least one — even if it alone exceeds target —
 		// so we always make progress.
 		if i > 0 && batchBytes+w > p.target {
@@ -372,6 +476,37 @@ func (p *Packer) flush() {
 		}
 	}
 
+	// Staged requests carry only a path: read their wires now, so at most
+	// one batch is ever in memory.
+	loaded := make([]packReq, 0, len(batch))
+	var unreadable []packReq
+	var readErr error
+	for _, r := range batch {
+		if r.staged && r.wire == nil {
+			b, err := os.ReadFile(r.pendingPath)
+			if errors.Is(err, os.ErrNotExist) {
+				// Removed under us (its inode was unlinked): nothing to upload.
+				p.pendingIndex.UnrecordPersist(r.ino, r.idx)
+				p.complete(r, packResult{})
+				continue
+			}
+			if err != nil {
+				unreadable = append(unreadable, r)
+				readErr = err
+				continue
+			}
+			r.wire = b
+		}
+		loaded = append(loaded, r)
+	}
+	if len(unreadable) > 0 {
+		p.requeue(unreadable, fmt.Errorf("read staged wire: %w", readErr))
+	}
+	batch = loaded
+	if len(batch) == 0 {
+		return
+	}
+
 	// Assemble blob. Per-chunk pack_offset is the running prefix sum.
 	var buf bytes.Buffer
 	offsets := make([]int64, len(batch))
@@ -387,10 +522,7 @@ func (p *Packer) flush() {
 	tail, name, caption, derr := p.wire().PackDoc(context.Background(), items, int64(buf.Len()))
 	if derr != nil {
 		fmt.Fprintf(os.Stderr, "[packer] describe pack (%d chunks): %v\n", len(batch), derr)
-		for _, r := range batch {
-			r.result <- packResult{err: fmt.Errorf("packer describe: %w", derr)}
-			close(r.result)
-		}
+		p.failBatch(batch, fmt.Errorf("packer describe: %w", derr))
 		return
 	}
 	buf.Write(tail)
@@ -439,12 +571,12 @@ func (p *Packer) flush() {
 	if err != nil {
 		metrics.UploadErrors.Inc()
 		fmt.Fprintf(os.Stderr, "[packer] upload (%d chunks, %d bytes): %v\n", len(batch), blobSize, err)
-		for _, r := range batch {
-			r.result <- packResult{err: fmt.Errorf("packer upload: %w", err)}
-			close(r.result)
-		}
+		p.failBatch(batch, fmt.Errorf("packer upload: %w", err))
 		return
 	}
+	p.mu.Lock()
+	p.retryN = 0
+	p.mu.Unlock()
 	metrics.ChunksUploaded.Add(int64(len(batch)))
 	metrics.BytesUploaded.Add(int64(blobSize))
 	// Write chunk_map rows in a single transaction so a partial
@@ -477,26 +609,26 @@ func (p *Packer) flush() {
 			// because the caller (file handle for an inode that's
 			// now deleted) has nothing to do with the answer.
 			if meta.IsFKViolation(err) {
-				if r.pendingPath != "" {
-					_ = DeletePending(r.pendingPath)
-				}
+				p.removeStaged(r)
 				p.pendingIndex.UnrecordPersist(r.ino, r.idx)
 				fmt.Fprintf(os.Stderr, "[packer] dropped orphan chunk ino=%d/%d (inode gone, msg %d kept for GC)\n", r.ino, r.idx, msgID)
-				close(r.result)
+				p.complete(r, packResult{})
 				continue
 			}
-			r.result <- packResult{err: fmt.Errorf("packer put_chunk: %w", err)}
-			close(r.result)
+			if r.staged {
+				// The extent is on the channel but its row is not: upload
+				// it again later (this message becomes gc fodder).
+				p.requeue([]packReq{r}, fmt.Errorf("packer put_chunk: %w", err))
+				continue
+			}
+			p.complete(r, packResult{err: fmt.Errorf("packer put_chunk: %w", err)})
 			continue
 		}
 		// chunk_map row landed — safe to drop the on-disk staging
 		// copy. Leaving it would re-upload on next startup (which
 		// would orphan the just-landed message on the channel).
-		if r.pendingPath != "" {
-			_ = DeletePending(r.pendingPath)
-		}
+		p.removeStaged(r)
 		p.pendingIndex.UnrecordPersist(r.ino, r.idx)
-		r.result <- packResult{msgID: int64(msgID), packOff: offsets[i]}
-		close(r.result)
+		p.complete(r, packResult{msgID: int64(msgID), packOff: offsets[i]})
 	}
 }
