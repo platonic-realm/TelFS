@@ -366,6 +366,11 @@ func unixOrZero(t time.Time) int64 {
 	return t.Unix()
 }
 
+// openUploads is the body of GET /uploads/open.
+type openUploads struct {
+	Inos []int64 `json:"inos"`
+}
+
 // syncReply is the body of /sync and /sync/wait.
 type syncReply struct {
 	Token           uint64 `json:"token,omitempty"`
@@ -500,6 +505,16 @@ func (d *daemonCtl) handler() http.Handler {
 			time.Sleep(100 * time.Millisecond)
 			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 		}()
+	})
+	// GET /uploads/open: the inodes with uploads in flight (`telfs
+	// restore` of the live filesystem: their data in the DB may not be
+	// their current content).
+	mux.HandleFunc("GET /uploads/open", func(w http.ResponseWriter, _ *http.Request) {
+		rep := openUploads{Inos: []int64{}}
+		if d.pool != nil && d.pool.Pending != nil {
+			rep.Inos = append(rep.Inos, d.pool.Pending.Inos()...)
+		}
+		writeJSON(w, http.StatusOK, rep)
 	})
 	if d.version == "" {
 		d.versionsRoutes(mux)

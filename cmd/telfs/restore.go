@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -110,12 +110,16 @@ func cmdRestore(ctx context.Context, args []string) error {
 		return err
 	}
 	// The live tree is planned before the secret and the network: a
-	// wrong SRC fails at once.
+	// wrong SRC fails at once. Right after the read: the inodes whose
+	// uploads are still open (the daemon's, or staged for the next
+	// mount) — what the plan shows of them may not be their content.
 	var plan *restore.Plan
+	var openAtPlan map[int64]string
 	if *versionName == "" {
 		if plan, err = planRestore(ctx, live, src, "the live filesystem"); err != nil {
 			return err
 		}
+		openAtPlan = openUploadInos(ctx, cfg)
 	}
 	if err := cfg.RequireChannel(); err != nil {
 		return err
@@ -181,9 +185,9 @@ func cmdRestore(ctx context.Context, args []string) error {
 		return err
 	}
 
-	var inFlight func(context.Context, *restore.Entry) bool
+	var inFlight func(context.Context, []*restore.Entry) map[int64]string
 	if *versionName == "" {
-		inFlight = inFlightCheck(cfg, live)
+		inFlight = inFlightCheck(live, openAtPlan)
 	}
 	start := time.Now()
 	res, err := restore.Run(ctx, plan, restore.Options{
@@ -382,68 +386,101 @@ func telegramFailure(err error) bool {
 	return retriable(err) || errors.Is(err, tg.ErrNotConnected)
 }
 
-// inFlightCheck tells, for a restore of the live filesystem, whether a
-// file the DB showed with missing or short chunks is data the mount had
-// not uploaded yet rather than lost: the file changed since the read
-// (its rows landed, or it was written again), or uploads are pending —
-// in the running daemon, or staged for the next mount when none runs.
-func inFlightCheck(cfg *config.Config, live *meta.Store) func(context.Context, *restore.Entry) bool {
-	var once sync.Once
-	var uploading bool
-	return func(ctx context.Context, e *restore.Entry) bool {
-		once.Do(func() { uploading = uploadsPending(ctx, cfg) })
-		return uploading || changedSince(ctx, live, e)
+// inFlightCheck tells, for a restore of the live filesystem, which
+// restored files may not be as the plan read them — per inode: uploads
+// of it were open when the plan was read (open), or its inode or chunk
+// rows changed since (checked after the download, in one read). Only
+// those are pending (exit 4); a file with missing or short chunks and
+// neither is an integrity problem (exit 7), whatever else is uploading.
+func inFlightCheck(live *meta.Store, open map[int64]string) func(context.Context, []*restore.Entry) map[int64]string {
+	return func(ctx context.Context, files []*restore.Entry) map[int64]string {
+		out := map[int64]string{}
+		for _, e := range files {
+			if why, ok := open[e.Inode.Ino]; ok {
+				out[e.Inode.Ino] = why
+			}
+		}
+		for ino, why := range changedSince(ctx, live, files) {
+			if _, ok := out[ino]; !ok {
+				out[ino] = why
+			}
+		}
+		return out
 	}
 }
 
-// uploadsPending: the profile's daemon has uploads open, or — no daemon
-// answering — its staging directory holds wires.
-func uploadsPending(ctx context.Context, cfg *config.Config) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, control.BaseURL+"/sync", nil)
+// openUploadInos returns the inodes with uploads not landed yet: open in
+// the running daemon, and staged in the staging directory (wires a
+// mount uploads, or the next mount re-submits). Only exact staged-wire
+// names count (a leftover .tmp-N is nothing).
+func openUploadInos(ctx context.Context, cfg *config.Config) map[int64]string {
+	out := map[int64]string{}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, control.BaseURL+"/uploads/open", nil)
 	if err == nil {
 		if resp, err := ctlClient(cfg, 5*time.Second).Do(req); err == nil {
 			defer resp.Body.Close()
-			var rep syncReply
-			if json.NewDecoder(resp.Body).Decode(&rep) == nil {
-				return rep.PendingUploads > 0
+			var rep openUploads
+			if resp.StatusCode == http.StatusOK && json.NewDecoder(resp.Body).Decode(&rep) == nil {
+				for _, ino := range rep.Inos {
+					out[ino] = "its uploads were open in the mount"
+				}
 			}
 		}
 	}
-	ents, err := os.ReadDir(cfg.StagingDir())
-	return err == nil && len(ents) > 0
-}
-
-// changedSince re-reads e's inode and chunk rows: did the file change
-// after the restore's read?
-func changedSince(ctx context.Context, m *meta.Store, e *restore.Entry) bool {
-	changed := false
-	err := m.Read(ctx, func(v *meta.ReadView) error {
-		in, err := v.GetInode(ctx, e.Inode.Ino)
-		if err != nil || in.Size != e.Inode.Size || in.Mtime != e.Inode.Mtime {
-			changed = true // rewritten, or gone
-			return nil
-		}
-		rows, err := v.Chunks(ctx, e.Inode.Ino)
-		if err != nil {
-			return err
-		}
-		now := map[int32]meta.Chunk{}
-		for _, c := range rows {
-			now[c.Idx] = c
-		}
-		for _, idx := range e.Missing {
-			if _, ok := now[idx]; ok {
-				changed = true
+	if staged, err := chunk.ScanPending(cfg.StagingDir()); err == nil {
+		for _, pe := range staged {
+			if _, ok := out[pe.Ino]; !ok {
+				out[pe.Ino] = "a chunk of it was staged, not uploaded"
 			}
 		}
-		for _, c := range e.Chunks {
-			if n, ok := now[c.Idx]; !ok || n.TGMessageID != c.TGMessageID || n.Size != c.Size || n.PackOffset != c.PackOffset {
-				changed = true
+	}
+	return out
+}
+
+// changedSince re-reads the files' inodes and chunk rows in one read:
+// which changed after the restore's plan (rows landed or replaced, size
+// or time changed, or gone)?
+func changedSince(ctx context.Context, m *meta.Store, files []*restore.Entry) map[int64]string {
+	out := map[int64]string{}
+	err := m.Read(ctx, func(v *meta.ReadView) error {
+		for _, e := range files {
+			in, err := v.GetInode(ctx, e.Inode.Ino)
+			if err != nil || in.Size != e.Inode.Size || in.Mtime != e.Inode.Mtime {
+				out[e.Inode.Ino] = "it changed while restoring" // rewritten, or gone
+				continue
+			}
+			rows, err := v.Chunks(ctx, e.Inode.Ino)
+			if err != nil {
+				return err
+			}
+			now := map[int32]meta.Chunk{}
+			for _, c := range rows {
+				now[c.Idx] = c
+			}
+			changed := false
+			for _, idx := range e.Missing {
+				if _, ok := now[idx]; ok {
+					changed = true
+				}
+			}
+			for _, c := range e.Chunks {
+				if n, ok := now[c.Idx]; !ok || n.TGMessageID != c.TGMessageID || n.Size != c.Size || n.PackOffset != c.PackOffset || !bytes.Equal(n.Hash, c.Hash) {
+					changed = true
+				}
+			}
+			if changed {
+				out[e.Inode.Ino] = "its chunks changed while restoring"
 			}
 		}
 		return nil
 	})
-	return changed || err != nil
+	if err != nil {
+		// Unreadable: no file can be vouched for.
+		for _, e := range files {
+			out[e.Inode.Ino] = "the DB could not be read again: " + err.Error()
+		}
+	}
+	return out
 }
 
 // reportListMax is how many problem files stderr names.

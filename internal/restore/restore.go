@@ -92,11 +92,16 @@ type Options struct {
 	// first back-off (default 2 s, doubled per attempt).
 	Attempts int
 	Backoff  time.Duration
-	// InFlight says whether a file the DB shows with missing or short
-	// chunks is still being uploaded by the mount (a restore of the live
-	// filesystem while it writes) rather than damaged; nil = never (a
-	// version is complete by construction).
-	InFlight func(context.Context, *Entry) bool
+	// InFlight, for a restore of the live filesystem beside its mount,
+	// says which restored files may not be as the plan read them: their
+	// uploads were open (or staged) when the plan was read, or their
+	// inode or chunk rows changed since (it is asked after the download).
+	// It is asked once, with every data-holding file, and returns those
+	// files' inodes with why. Such a file is KindPending (exit 4) — and
+	// so are its missing or short chunks; a missing or short chunk of any
+	// other file is KindIntegrity. nil = never (a version is complete by
+	// construction).
+	InFlight func(ctx context.Context, files []*Entry) map[int64]string
 	// Chown restores owners (only root can; default: when running as
 	// root).
 	Chown bool
@@ -144,6 +149,7 @@ type runner struct {
 	plan    *Plan
 	files   map[int]*fileRun // entry index → state
 	created []bool           // per entry: exists in DEST as planned
+	linksOf map[int][]int    // first name → its other names (hard links)
 
 	mu       sync.Mutex
 	problems map[int][]Problem // entry index → problems (first decides the kind)
@@ -174,7 +180,12 @@ func Run(ctx context.Context, plan *Plan, opts Options) (*Result, error) {
 		return nil, errors.New("restore: no codec or downloader")
 	}
 	r := &runner{opts: opts, plan: plan, files: map[int]*fileRun{}, created: make([]bool, len(plan.Entries)),
-		problems: map[int][]Problem{}, extra: append([]Problem(nil), plan.Problems...)}
+		linksOf: map[int][]int{}, problems: map[int][]Problem{}, extra: append([]Problem(nil), plan.Problems...)}
+	for i, e := range plan.Entries {
+		if e.LinkOf >= 0 {
+			r.linksOf[e.LinkOf] = append(r.linksOf[e.LinkOf], i)
+		}
+	}
 	res := &Result{Stray: plan.Stray}
 	res.Dirs, res.Files, res.Symlinks, res.Links, _ = plan.Totals()
 
@@ -229,12 +240,7 @@ func (r *runner) collect() []Problem {
 		idx = append(idx, i)
 	}
 	sort.Ints(idx)
-	links := map[int][]int{} // first name → its other names
-	for i, e := range r.plan.Entries {
-		if e.LinkOf >= 0 {
-			links[e.LinkOf] = append(links[e.LinkOf], i)
-		}
-	}
+	links := r.linksOf
 	for _, i := range idx {
 		ps := r.problems[i]
 		p := ps[0]
@@ -376,8 +382,11 @@ func (r *runner) makeLink(e *Entry, p string) error {
 
 // makeFile creates a regular file at its full size (the chunks are
 // written into it later), or keeps an existing one of the right size:
-// identical → skipped; else, if no other name shares it, only its wrong
-// chunks are downloaded again.
+// identical → skipped; else only its wrong chunks are downloaded again.
+// An existing file is kept only when no name in DEST shares its inode
+// except this file's own planned hard links (writing into it would change
+// another file; keeping it would join two files), and when every byte
+// outside its chunks — a sparse file's holes — is zero.
 func (r *runner) makeFile(i int, e *Entry, p string, res *Result) error {
 	fr := &fileRun{present: make([]bool, len(e.Chunks)), want: make([][]byte, len(e.Chunks))}
 	r.files[i] = fr
@@ -389,30 +398,152 @@ func (r *runner) makeFile(i int, e *Entry, p string, res *Result) error {
 		return err
 	case fi.IsDir():
 		return fmt.Errorf("%s exists and is a directory", p)
-	case fi.Mode().IsRegular() && fi.Size() == e.Inode.Size:
+	case fi.Mode().IsRegular() && fi.Size() == e.Inode.Size && !r.sharedOutside(i, fi):
 		n, err := r.checkExisting(e, p, fr)
 		if err != nil {
 			break // unreadable: write it anew
+		}
+		if ok, err := zerosIn(p, uncovered(e)); err != nil || !ok {
+			break // bytes in its holes (another version's data): write it anew
 		}
 		if n == len(e.Chunks) && len(e.Missing) == 0 && len(e.Short) == 0 {
 			fr.skip = true
 			res.Identical++
 			return nil
 		}
-		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink == 1 {
-			res.ChunksPresent += n
-			return os.Chmod(p, fi.Mode().Perm()|0o600)
-		}
-		// Shared with another name in DEST: writing into it would change
-		// that one too. Write it anew.
-		for j := range fr.present {
-			fr.present[j] = false
-		}
+		res.ChunksPresent += n
+		return os.Chmod(p, fi.Mode().Perm()|0o600)
+	}
+	for j := range fr.present {
+		fr.present[j] = false
 	}
 	if err := os.Remove(p); err != nil {
 		return err
 	}
 	return createFile(p, e.Inode.Size)
+}
+
+// sharedOutside reports whether the existing DEST file fi of entry i has
+// names in DEST other than i's own planned hard links.
+func (r *runner) sharedOutside(i int, fi os.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return true
+	}
+	if st.Nlink <= 1 {
+		return false
+	}
+	own := uint64(1)
+	for _, l := range r.linksOf[i] {
+		if lfi, err := os.Lstat(r.dest(&r.plan.Entries[l])); err == nil && os.SameFile(lfi, fi) {
+			own++
+		}
+	}
+	return uint64(st.Nlink) != own
+}
+
+// uncovered returns the byte ranges of e that no chunk row covers: a
+// sparse file's holes (slots without a row, and the tail of a short
+// row), and a non-sparse file's missing or short chunks. They must read
+// as zeros.
+func uncovered(e *Entry) [][2]int64 {
+	in := e.Inode
+	if in.Size <= 0 || in.ChunkSize <= 0 {
+		return nil
+	}
+	rows := make(map[int32]int64, len(e.Chunks))
+	for _, c := range e.Chunks {
+		rows[c.Idx] = int64(c.Size)
+	}
+	var out [][2]int64
+	add := func(a, b int64) {
+		if a >= b {
+			return
+		}
+		if n := len(out); n > 0 && out[n-1][1] == a {
+			out[n-1][1] = b
+			return
+		}
+		out = append(out, [2]int64{a, b})
+	}
+	n := (in.Size + in.ChunkSize - 1) / in.ChunkSize
+	for idx := int64(0); idx < n; idx++ {
+		start := idx * in.ChunkSize
+		end := start + slotLen(in, int32(idx))
+		if size, ok := rows[int32(idx)]; ok {
+			add(start+size, end)
+		} else {
+			add(start, end)
+		}
+	}
+	return out
+}
+
+// zerosIn reports whether every byte of p in ranges is zero.
+func zerosIn(p string, ranges [][2]int64) (bool, error) {
+	if len(ranges) == 0 {
+		return true, nil
+	}
+	f, err := openRead(p)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	return zeros(f, ranges)
+}
+
+// zeros reports whether every byte of f in ranges is zero, reading only
+// the data regions (SEEK_DATA / SEEK_HOLE): a hole is zeros by
+// definition, so a large sparse file costs what it stores.
+func zeros(f *os.File, ranges [][2]int64) (bool, error) {
+	if len(ranges) == 0 {
+		return true, nil
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	buf := make([]byte, 1<<20)
+	for _, rg := range ranges {
+		off, end := rg[0], rg[1]
+		if end > fi.Size() {
+			return false, nil // shorter than its size
+		}
+		for off < end {
+			d, err := f.Seek(off, unix.SEEK_DATA)
+			switch {
+			case errors.Is(err, unix.ENXIO):
+				d = end // no data after off
+			case err != nil:
+				d = off // no SEEK_DATA here: read it all
+			}
+			if d >= end {
+				break
+			}
+			h, err := f.Seek(d, unix.SEEK_HOLE)
+			if err != nil || h > end {
+				h = end
+			}
+			for d < h {
+				n := min(int64(len(buf)), h-d)
+				k, err := f.ReadAt(buf[:n], d)
+				if k == 0 && err != nil {
+					if errors.Is(err, io.EOF) {
+						return false, nil // shorter than its size
+					}
+					return false, err
+				}
+				for _, b := range buf[:k] {
+					if b != 0 {
+						return false, nil
+					}
+				}
+				d += int64(k)
+			}
+			off = h
+		}
+	}
+	return true, nil
 }
 
 func createFile(p string, size int64) error {
@@ -721,9 +852,23 @@ func writeAt(p string, data []byte, off int64) error {
 // ---- 3. verification ----
 
 // verify re-reads every file this run wrote and checks each chunk's
-// keyed hash (addition 4). Files already identical were read and
-// checked by structure(); lost or short chunks are integrity problems.
+// keyed hash and that every byte outside the chunks is zero (addition
+// 4). Files already identical were read and checked by structure(); lost
+// or short chunks are integrity problems — unless the live mount was
+// still uploading the file (InFlight), which makes it pending.
 func (r *runner) verify(ctx context.Context, res *Result) error {
+	var inflight map[int64]string
+	if r.opts.InFlight != nil {
+		var files []*Entry
+		for i := range r.plan.Entries {
+			if r.files[i] != nil {
+				files = append(files, &r.plan.Entries[i])
+			}
+		}
+		if len(files) > 0 {
+			inflight = r.opts.InFlight(ctx, files)
+		}
+	}
 	var todo []int
 	for i := range r.plan.Entries {
 		e := &r.plan.Entries[i]
@@ -734,10 +879,15 @@ func (r *runner) verify(ctx context.Context, res *Result) error {
 		// problem is already recorded. Lost chunks don't stop the check
 		// of the chunks that are there.
 		writeFailed := r.failed(i)
+		why, pending := inflight[e.Inode.Ino]
+		hint := ""
+		if pending {
+			hint = fmt.Sprintf(" — the mount had not uploaded it yet (%s): `telfs sync --wait`, then restore again", why)
+		}
 		if len(e.Missing) > 0 || len(e.Short) > 0 {
-			kind, hint := KindIntegrity, ""
-			if r.opts.InFlight != nil && r.opts.InFlight(ctx, e) {
-				kind, hint = KindPending, " — not uploaded yet when the DB was read (the mount is still writing it): `telfs sync --wait`, then restore again"
+			kind := KindIntegrity
+			if pending {
+				kind = KindPending
 			}
 			for _, idx := range e.Missing {
 				r.problem(i, kind, "chunk %d: missing from the DB%s", idx, hint)
@@ -745,6 +895,10 @@ func (r *runner) verify(ctx context.Context, res *Result) error {
 			for _, idx := range e.Short {
 				r.problem(i, kind, "chunk %d: shorter than its place in the file%s", idx, hint)
 			}
+		} else if pending {
+			// Its chunks may be older than its size and time (rewritten in
+			// place, uploads open): what was restored may be a mix.
+			r.problem(i, KindPending, "restored as the DB showed it, which may not be its current content%s", hint)
 		}
 		if r.files[i].skip || !r.created[i] || writeFailed {
 			continue
@@ -815,6 +969,15 @@ func (r *runner) verifyFile(i int, buf *[]byte) bool {
 			r.problem(i, KindIntegrity, "verification: chunk %d differs from its keyed hash", c.Idx)
 			ok = false
 		}
+	}
+	// Holes (a sparse file's, or the gaps of a damaged one) must read
+	// as zeros: no hash covers them.
+	if z, err := zeros(f, uncovered(e)); err != nil {
+		r.problem(i, KindIntegrity, "verification: the bytes outside its chunks: %v", err)
+		return false
+	} else if !z {
+		r.problem(i, KindIntegrity, "verification: bytes outside its chunks (a hole) are not zero")
+		ok = false
 	}
 	return ok
 }

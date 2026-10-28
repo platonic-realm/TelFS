@@ -284,24 +284,28 @@ func TestRestoreInFlightCheck(t *testing.T) {
 	if len(e.Missing) != 1 || e.Missing[0] != 1 {
 		t.Fatalf("missing %v", e.Missing)
 	}
-	check := inFlightCheck(cfg, m)
-	if check(ctx, e) {
-		t.Fatal("unchanged file, nothing staged: reported in flight")
+	files := []*restore.Entry{e}
+	check := inFlightCheck(m, openUploadInos(ctx, cfg))
+	if got := check(ctx, files); len(got) != 0 {
+		t.Fatalf("unchanged file, nothing staged: reported in flight %v", got)
 	}
 	// The row lands after the read.
 	m.PutChunk(ctx, meta.Chunk{Ino: ino, Idx: 1, TGMessageID: 6, Size: 4, Hash: []byte{2}})
-	if !changedSince(ctx, m, e) {
+	if got := changedSince(ctx, m, files); got[ino] == "" {
 		t.Error("a row that landed after the read: not seen")
 	}
-	// No daemon, but wires staged for the next mount.
+	// No daemon, but wires staged for the next mount — of THIS file only
+	// counts; a leftover .tmp-N or another file's wire does not.
 	if err := os.MkdirAll(cfg.StagingDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if uploadsPending(ctx, cfg) {
-		t.Error("empty staging dir: uploads pending")
+	os.WriteFile(filepath.Join(cfg.StagingDir(), fmt.Sprintf("%d-1-4-00ff.bin.tmp-77", ino)), []byte("w"), 0o600)
+	os.WriteFile(filepath.Join(cfg.StagingDir(), "999-1-4-00ff.bin"), []byte("wire"), 0o600)
+	if open := openUploadInos(ctx, cfg); len(open) != 1 || open[999] == "" {
+		t.Errorf("staged: %v, want inode 999 only", open)
 	}
-	os.WriteFile(filepath.Join(cfg.StagingDir(), "9-1-4-00.bin"), []byte("wire"), 0o600)
-	if !uploadsPending(ctx, cfg) {
-		t.Error("a staged wire: no uploads pending")
+	os.WriteFile(filepath.Join(cfg.StagingDir(), fmt.Sprintf("%d-1-4-00ff.bin", ino)), []byte("wire"), 0o600)
+	if open := openUploadInos(ctx, cfg); open[ino] == "" {
+		t.Errorf("a staged wire of the file: %v", open)
 	}
 }

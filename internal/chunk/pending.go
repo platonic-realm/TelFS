@@ -19,7 +19,7 @@ import (
 // explicit synchronization, and TelFS won't try to fix that here.
 type PendingInodes struct {
 	mu     sync.Mutex
-	counts map[int64]int          // ino -> in-flight upload count
+	counts map[int64]int           // ino -> in-flight upload count
 	drains map[int64]chan struct{} // ino -> closed when count returns to 0
 }
 
@@ -69,6 +69,19 @@ func (p *PendingInodes) Total() int64 {
 		total += int64(c)
 	}
 	return total
+}
+
+// Inos returns the inodes with uploads in flight (any order).
+func (p *PendingInodes) Inos() []int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]int64, 0, len(p.counts))
+	for ino, c := range p.counts {
+		if c > 0 {
+			out = append(out, ino)
+		}
+	}
+	return out
 }
 
 // Wait blocks until the current batch of in-flight uploads for ino

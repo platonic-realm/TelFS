@@ -525,12 +525,19 @@ func TestRestoreIntegrityProblems(t *testing.T) {
 	}
 	// A live restore whose mount is still uploading holey.bin: its
 	// missing chunk is pending, not lost; the damage stays integrity.
-	var asked []string
+	holey := lookupIno(t, f, "/holey.bin")
+	asked := 0
 	res = f.run("/", dest, func(o *Options) {
-		o.InFlight = func(_ context.Context, e *Entry) bool { asked = append(asked, e.Path); return true }
+		o.InFlight = func(_ context.Context, files []*Entry) map[int64]string {
+			asked++
+			if len(files) != 45+3 {
+				t.Errorf("InFlight asked about %d files, want every restored one (48)", len(files))
+			}
+			return map[int64]string{holey: "its uploads were open in the mount"}
+		}
 	})
-	if strings.Join(asked, ",") != "/holey.bin" {
-		t.Errorf("InFlight asked about %v, want /holey.bin only", asked)
+	if asked != 1 {
+		t.Errorf("InFlight asked %d times, want once", asked)
 	}
 	if got := problemPaths(res, KindPending); strings.Join(got, ",") != "/holey.bin" {
 		t.Errorf("pending %v (all %+v)", got, res.Problems)

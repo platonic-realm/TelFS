@@ -426,11 +426,16 @@ telfs restore [--workers 4] SRC DEST
   as root. Nothing is written to the channel.
 - **Verification:** after writing, every restored file is read back
   from DEST and each chunk's keyed content hash compared with the
-  database's. (Downloads are authenticated on the way in as well.)
+  database's; every byte outside the chunks (a sparse file's holes)
+  must read as zero. (Downloads are authenticated on the way in as
+  well.)
 - **Resumable:** run it again after an interruption or a failure — a
-  file already in DEST with the right size and matching keyed hashes is
-  skipped, and in a file that is partly right only the wrong chunks are
-  downloaded again.
+  file already in DEST with the right size, matching keyed hashes and
+  zeros in its holes is skipped, and in a file that is partly right
+  only the wrong chunks are downloaded again. A file in DEST that shares
+  its inode with a name that is not one of its own hard links (an
+  earlier restore of a state where the two were linked) is written anew,
+  so separate files stay separate.
 - It needs the secret (it decrypts on its own): a systemd unit for it
   loads the credential like the mount's.
 - Exit 0 when everything was restored and verified. Otherwise every
@@ -442,8 +447,12 @@ telfs restore [--workers 4] SRC DEST
   database, a message gone or damaged, or a restored file whose bytes
   differ from its keyed hashes; **6** Telegram failed after the retries
   (the restore stops; run it again to resume); **4** a restore of the
-  live filesystem met files the mount had not uploaded yet (`telfs sync
-  --wait`, then restore again); **1** DEST could not be written.
+  live filesystem met files the mount had not uploaded yet — decided
+  per file: its uploads were open in the mount (or staged) when the
+  database was read, or its size, time or chunks changed while
+  restoring (`telfs sync --wait`, then restore again); a missing chunk
+  of a file with neither is lost data (7), whatever else is uploading;
+  **1** DEST could not be written.
 
 ## Recovery
 
