@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 
 	"telfs/internal/chunk"
 	"telfs/internal/config"
 	"telfs/internal/meta"
+	"telfs/internal/mountctl"
 	"telfs/internal/snapshot"
 )
 
@@ -19,6 +21,7 @@ type stateShowData struct {
 	pageBase
 	HasMeta      bool
 	Profile      string
+	Profiles     []string // tabs: the page shows one profile (?profile=)
 	DataDir      string
 	DBPath       string
 	DBSize       int64
@@ -114,14 +117,14 @@ type stateMountRow struct {
 }
 
 func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
-	d := stateShowData{pageBase: s.basePage(w, r)}
-	cfg, err := loadCfg(r)
+	d := stateShowData{pageBase: s.basePage(w, r), Profiles: listProfileNames()}
+	cfg, name, err := requestProfile(r)
+	d.Profile = name
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
 		s.renderTemplateWith(w, "state/show.html", d, "templates/partials/cache.html")
 		return
 	}
-	d.Profile = profileOf(r)
 	d.DataDir = cfg.DataDir
 	d.DBPath = cfg.DBPath()
 	d.CachePath = cfg.CachePath()
@@ -199,20 +202,21 @@ func (s *Server) stateRepair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.FormValue("force") == "1"
-	if !force && len(activeMounts()) > 0 {
-		SetFlash(w, "error", "refuses to repair while a fuse.telfs mount is active. Stop the mount first, or re-submit with the 'force anyway' checkbox.")
-		http.Redirect(w, r, "/state", http.StatusSeeOther)
-		return
-	}
-	cfg, err := loadCfg(r)
+	cfg, name, err := requestProfile(r)
+	back := "/state?profile=" + url.QueryEscape(name)
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
-		http.Redirect(w, r, "/state", http.StatusSeeOther)
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	if _, mp, mounted, _ := mountctl.FindLiveByProfile(name); !force && mounted {
+		SetFlash(w, "error", "refuses to repair "+name+" while it is mounted at "+mp+". Stop the mount first, or re-submit with the 'force anyway' checkbox.")
+		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
 	if !s.repair.Begin() {
 		SetFlash(w, "error", "a repair run is already in flight — wait for it to finish")
-		http.Redirect(w, r, "/state", http.StatusSeeOther)
+		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
 	// Fire-and-forget goroutine. Uses a background ctx so the handler
@@ -234,7 +238,7 @@ func (s *Server) stateRepair(w http.ResponseWriter, r *http.Request) {
 		}
 		s.repair.Finish(err)
 	}()
-	http.Redirect(w, r, "/state", http.StatusSeeOther)
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
 // stagedCheckerFor snapshots the pending dir into a meta.StagedChecker

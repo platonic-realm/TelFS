@@ -183,8 +183,11 @@ type tgPageData struct {
 	pageBase
 	// Profile is the profile this page shows (?profile=, default the
 	// selected one); Profiles lists every profile for the tabs.
-	Profile      string
-	Profiles     []string
+	Profile  string
+	Profiles []string
+	// Upload is the daemon's upload block (status --json): rate, cap in
+	// effect and configured cap (full page, daemon online).
+	Upload       *uploadView
 	Source       string // URL we fetched from (for the help text)
 	Online       bool   // did the fetch succeed
 	FetchError   string // explanation if Online is false
@@ -470,7 +473,63 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 		data.DownloadRateLimitPerMin = readDownloadRateLimitFromMeta(r.Context(), cfg)
 	}
 	fillTGState(r.Context(), &data, cfg, err, sourceFor(r))
+	if data.Online && cfg != nil {
+		if live := fetchLiveStatus(cfg); live != nil {
+			data.Upload = live.Upload
+		}
+	}
 	return data
+}
+
+// uploadView is status --json's upload block.
+type uploadView struct {
+	Connections            int   `json:"connections"`
+	RateCapBytesPerS       int64 `json:"rate_cap_bytes_per_s"`
+	RateBytesPerS          int64 `json:"rate_bytes_per_s"`
+	RateCapConfigBytesPerS int64 `json:"rate_cap_config_bytes_per_s"`
+}
+
+// telegramSetUploadLimit changes the shown profile's upload cap while its
+// daemon runs (control socket POST /upload/limit, v1.1 I3).
+func (s *Server) telegramSetUploadLimit(w http.ResponseWriter, r *http.Request) {
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	cfg, name, err := requestProfile(r)
+	back := "/telegram"
+	if name != "" {
+		back += "?profile=" + neturl.QueryEscape(name)
+	}
+	if err != nil {
+		SetFlash(w, "error", "profile: "+err.Error())
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	resp, err := control.Client(control.Path(cfg.DataDir), 5*time.Second).Post(
+		control.BaseURL+"/upload/limit?rate="+neturl.QueryEscape(strings.TrimSpace(r.FormValue("rate"))), "", nil)
+	if err != nil {
+		SetFlash(w, "error", "the mount of "+name+" does not answer: "+err.Error())
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	defer resp.Body.Close()
+	var rep struct {
+		Cap   int64  `json:"rate_cap_bytes_per_s"`
+		Error string `json:"error"`
+	}
+	json.NewDecoder(resp.Body).Decode(&rep)
+	switch {
+	case rep.Error != "":
+		SetFlash(w, "error", rep.Error)
+	case resp.StatusCode != http.StatusOK:
+		SetFlash(w, "error", fmt.Sprintf("the mount answered %d (an older telfs without the route? restart it)", resp.StatusCode))
+	case rep.Cap == 0:
+		SetFlash(w, "ok", "upload cap removed until the mount stops")
+	default:
+		SetFlash(w, "ok", "upload cap set to "+rateText(rep.Cap)+" until the mount stops")
+	}
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
 // populateTGState does the actual HTTP fetch + JSON parse + reverse-

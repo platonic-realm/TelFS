@@ -398,12 +398,10 @@ func buildSetupChecklist(d dashboardData, cfg *config.Config) setupChecklist {
 	// `init` (a new filesystem) or by a mount's recovery (an existing
 	// one). Skipping it means "this channel already holds a filesystem".
 	fsOK := cfg != nil && fileExists(cfg.DBPath())
-	// "Mount it" is done when THIS profile has written chunks — a
-	// reliable signal that the FS has been mounted at some point.
-	// (Checking active /proc/mounts entries is unreliable because
-	// fuse.telfs entries don't reveal which profile they belong to,
-	// and another profile's mount would falsely mark this one done.)
-	mountedOK := hasChunksFor(cfg)
+	// "Mount it" is done when THIS profile's daemon answers on its
+	// control socket (mounted now), or the profile has written chunks
+	// (it was mounted at some point).
+	mountedOK := hasChunksFor(cfg) || (cfg != nil && fetchLiveStatus(cfg) != nil)
 
 	apiHref := "/profiles"
 	if d.Active != "" {
@@ -480,7 +478,7 @@ func buildSetupChecklist(d dashboardData, cfg *config.Config) setupChecklist {
 			Href:    "/mount/new",
 			Why:     "Start the FUSE daemon. Files written to the mountpoint flow through the chunk pipeline to the channel.",
 			Detail:  "Pick a mountpoint (any empty directory). The web server launches a `telfs mount` child process and tracks it for you — start, stop, and tail the log from the Mounts page. The mount survives `telfs web` restarts via /proc/mounts reconciliation.",
-			Outcome: "An `fuse.telfs` entry shows up in `mount`; the Files page browses live FS contents.",
+			Outcome: "A `fuse.telfs` entry shows up in `mount`; the Browse page shows the files.",
 			CTA:     "Open mount form",
 		},
 	}

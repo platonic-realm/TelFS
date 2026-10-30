@@ -222,6 +222,31 @@ nav > a.active { color: var(--ink); border-bottom-color: var(--copper); }
 }
 .nav-menu a:hover { color: var(--ink); background: var(--well); }
 .nav-menu a.active { color: var(--copper); }
+/* The masthead's profile switcher: a nav-group whose summary is the
+   selected profile's lamp-less pill; its menu opens to the left (it sits
+   at the right edge) and holds one POST form per other profile. */
+.profile-switch > summary.pill { cursor: pointer; list-style: none; }
+.profile-switch > summary.pill::-webkit-details-marker { display: none; }
+.profile-switch .nav-menu { left: auto; right: 0; }
+.nav-menu form { margin: 0; }
+.nav-menu .nav-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+  padding: 7px 14px;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  cursor: pointer;
+}
+.nav-menu .nav-menu-item:hover { color: var(--ink); background: var(--well); }
+.nav-menu .nav-menu-item.current { color: var(--copper); cursor: default; }
+.nav-menu .nav-menu-item.current:hover { background: none; }
 
 .header-extras { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .theme-toggle {
@@ -465,6 +490,20 @@ table.ledger th:first-child, table.ledger td:first-child { padding-left: 10px; }
 table.ledger tr.selected > td:first-child { box-shadow: inset 2px 0 0 var(--copper); }
 table.ledger tr.sub > td { border-bottom-style: dotted; padding-top: 0; }
 .err-text { color: var(--lamp-err); }
+/* A secondary line inside a ledger cell (a mountpoint under a profile
+   name, a detail under a number). */
+.line-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--ink-subtle);
+  overflow-wrap: anywhere;
+}
+.line-sub.err-text { color: var(--lamp-err); }
+/* Wide ledgers scroll sideways on a phone instead of running off it. */
+.table-scroll { overflow-x: auto; }
+.table-scroll > table { min-width: 640px; }
+.qbar.mini { max-width: 160px; margin: 5px 0 3px auto; }
 
 /* Tabs: one per profile on pages that show one profile at a time. */
 .tabs {
@@ -625,11 +664,15 @@ pre code { border: 0; padding: 0; background: none; }
 /* ─── setup checklist / wizard ──────────────────────────────────── */
 .setup-step {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 12px;
+  gap: 4px 12px;
   padding: 9px 0;
   border-bottom: 1px solid var(--rule);
 }
+/* The open step's help and buttons go on their own full-width rows: as
+   flex siblings of the label they squeezed into narrow columns. */
+.setup-step > .setup-why, .setup-step > .setup-detail, .setup-step > .setup-cta { flex-basis: 100%; }
 .setup-step:last-child { border-bottom: 0; }
 .setup-label { font-weight: 500; }
 .setup-next .setup-label { color: var(--copper); }

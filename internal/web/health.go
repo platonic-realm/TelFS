@@ -20,11 +20,13 @@ import (
 //
 //	green  "link ok"     daemon online and none of the below.
 //	yellow "link busy"   no upload progress for > 60 s with work queued,
-//	                     OR a FLOOD_WAIT in the last 5 min, OR the staging
-//	                     directory holds more than 80 % of its cap.
+//	                     OR a FLOOD_WAIT in the last 5 min.
+//	yellow "backlog"     the link is fine but the staging directory holds
+//	                     more than 80 % of its cap: uploads are behind the
+//	                     writes (the lamp names the backlog, not the link).
 //	red    "link down"   no daemon answers.
 //	red    "link fault"  last error < 30 s ago.
-//	red    "backlog"     writes are blocked: the staging cap ([staging]
+//	red    "writes wait" writes are blocked: the staging cap ([staging]
 //	                     max_bytes) or the staging filesystem's free-space
 //	                     floor ([staging] min_free) is reached, so writes
 //	                     wait for uploads.
@@ -79,7 +81,7 @@ func classifyHealth(state tgPageData) (kind, label, tip string) {
 		return "err", "link fault", fmt.Sprintf("Last error %ds ago: %s", state.State.LastErrorAgeSeconds, state.State.LastErrorMessage)
 	}
 	if q.StagingBlocked {
-		return "err", "backlog", "Writes are waiting for uploads: " + q.stagingSummary() +
+		return "err", "writes wait", "Writes are waiting for uploads: " + q.stagingSummary() +
 			" — the staging cap ([staging] max_bytes) or the staging filesystem's free-space floor ([staging] min_free) is reached; writes resume as uploads land."
 	}
 	// Yellow conditions.
@@ -90,10 +92,14 @@ func classifyHealth(state tgPageData) (kind, label, tip string) {
 	if hasFloodWaitInLast5Min(state) {
 		yellowReasons = append(yellowReasons, "FLOOD_WAIT observed in the last 5 min")
 	}
-	if q.StagingLevel() == "warn" {
+	stagingFull := q.StagingLevel() == "warn"
+	if stagingFull {
 		yellowReasons = append(yellowReasons, "staging nearly full: "+q.stagingSummary()+" — uploads are behind the writes")
 	}
 	if len(yellowReasons) > 0 {
+		if stagingFull && len(yellowReasons) == 1 {
+			return "warn", "backlog", yellowReasons[0]
+		}
 		return "warn", "link busy", strings.Join(yellowReasons, " · ")
 	}
 	// Green — fall through.

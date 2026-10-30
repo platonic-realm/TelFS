@@ -1,7 +1,11 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"html/template"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +15,7 @@ import (
 	"testing"
 
 	"telfs/internal/config"
+	"telfs/internal/control"
 	"telfs/internal/meta"
 )
 
@@ -269,5 +274,86 @@ func TestProfileSelection(t *testing.T) {
 	post("/profiles/backup/default")
 	if config.ActiveProfile() != "backup" {
 		t.Fatal("Make CLI default did not")
+	}
+}
+
+// UX pass helpers: help text renders `code`, rates read like config.toml,
+// the staging meter turns yellow above 80 % and red while writes wait.
+func TestUXHelpers(t *testing.T) {
+	if got := string(mdCode("run `telfs mount` <now> `x")); got != "run <code>telfs mount</code> &lt;now&gt; `x" {
+		t.Fatalf("md: %s", got)
+	}
+	for bps, want := range map[int64]string{3_870_000: "3.9 MB/s", 820_000: "820 kB/s", 12: "12 B/s"} {
+		if got := rateText(bps); got != want {
+			t.Errorf("rate %d: %q, want %q", bps, got, want)
+		}
+	}
+	l := &liveStatus{}
+	l.Staging.CapBytes, l.Staging.PendingBytes = 100, 50
+	if l.StagingKind() != "" {
+		t.Error("50 % is no warning")
+	}
+	l.Staging.PendingBytes = 90
+	if l.StagingKind() != "warn" {
+		t.Error("90 % warns")
+	}
+	l.Staging.Blocked = true
+	if l.StagingKind() != "err" {
+		t.Error("writes waiting is red")
+	}
+}
+
+// The masthead's profile switcher: every other profile is one POST form
+// with the browser's CSRF token and the page to return to.
+func TestMastheadProfileSwitcher(t *testing.T) {
+	isolate(t)
+	mkProfile(t, "backup", "b", true)
+	mkProfile(t, "cloud", "c", true)
+	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder(), profile: "cloud", csrf: "0123456789abcdef0123456789abcdef", path: "/state?profile=cloud"}
+	files := []string{"templates/layout.html", "templates/telegram.html", "templates/partials/telegram.html"}
+	tm := template.Must(template.New("").Funcs(funcsFor(rec)).ParseFS(templatesFS, files...))
+	var b bytes.Buffer
+	if err := tm.ExecuteTemplate(&b, "layout", tgPageData{Profile: "cloud"}); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{`class="nav-group profile-switch"`, `cloud ▾`, `action="/profiles/backup/use"`,
+		`value="0123456789abcdef0123456789abcdef"`, `name="back" value="/state?profile=cloud"`, `cloud · selected`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("masthead lacks %q", want)
+		}
+	}
+	if strings.Contains(out, `action="/profiles/cloud/use"`) {
+		t.Error("the selected profile is no switch target")
+	}
+}
+
+// The Telegram page's upload cap form talks to the profile's daemon.
+func TestTelegramSetUploadLimit(t *testing.T) {
+	isolate(t)
+	mkProfile(t, "cloud", "c", true)
+	cfg, _ := loadProfileCfg("cloud")
+	var got string
+	ln, err := net.Listen("unix", control.Path(cfg.DataDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Method + " " + r.URL.RequestURI()
+		fmt.Fprint(w, `{"rate_cap_bytes_per_s":3000000,"rate_cap_config_bytes_per_s":5000000}`)
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+	s := &Server{state: NewState()}
+	r := httptest.NewRequest("POST", "/telegram/upload-limit", strings.NewReader("csrf=0123456789abcdef0123456789abcdef&profile=cloud&rate=3MB/s"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: csrfCookie, Value: "0123456789abcdef0123456789abcdef"})
+	rec := httptest.NewRecorder()
+	s.telegramSetUploadLimit(rec, r)
+	if got != "POST /upload/limit?rate=3MB%2Fs" || rec.Header().Get("Location") != "/telegram?profile=cloud" {
+		t.Fatalf("daemon got %q, redirect %q", got, rec.Header().Get("Location"))
+	}
+	if !strings.Contains(rec.Header().Get("Set-Cookie"), "3.0+MB") {
+		t.Errorf("flash %q", rec.Header().Get("Set-Cookie"))
 	}
 }

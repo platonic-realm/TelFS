@@ -44,12 +44,12 @@
     <tr><td>Wire bytes</td><td>tx <strong>{{humanBytes .State.TotalBytesTx}}</strong> · rx <strong>{{humanBytes .State.TotalBytesRx}}</strong> <small>(total payload = {{humanBytes .State.TotalBytes}})</small></td></tr>
     <tr><td>In-flight</td><td><strong>{{.State.InFlight}}</strong></td></tr>
     {{if .State.LastSuccessUnix}}
-    <tr><td>Last successful RPC</td><td>{{.State.LastSuccessAgeSeconds}}s ago</td></tr>
+    <tr><td>Last successful RPC</td><td>{{ago .State.LastSuccessUnix}}</td></tr>
     {{else}}
     <tr><td>Last successful RPC</td><td>(none yet)</td></tr>
     {{end}}
     {{if .State.LastErrorUnix}}
-    <tr><td>Last error</td><td>{{.State.LastErrorAgeSeconds}}s ago — <code>{{.State.LastErrorMessage}}</code></td></tr>
+    <tr><td>Last error</td><td>{{ago .State.LastErrorUnix}}{{if gt .State.LastSuccessUnix .State.LastErrorUnix}} <span class="pill ok" title="An RPC has succeeded since">recovered</span>{{else}} <span class="pill err">not recovered</span>{{end}} — <code>{{.State.LastErrorMessage}}</code></td></tr>
     {{end}}
     {{if gt .StallSeconds 90}}
     <tr><td>Stall warning</td><td class="warn"><strong>No upload progress for {{.StallSeconds}}s with work pending.</strong> Watchdog will trigger reconnect automatically.</td></tr>

@@ -1,10 +1,15 @@
 {{define "content"}}
-<h2>FS state</h2>
+<h2>FS state{{with .Profile}} <small>— profile {{.}}</small>{{end}}</h2>
+{{if gt (len .Profiles) 1}}
+<nav class="tabs" aria-label="Profile">
+  {{range .Profiles}}<a href="/state?profile={{.}}"{{if eq . $.Profile}} class="active"{{end}}>{{.}}</a>{{end}}
+</nav>
+{{end}}
 
 <section class="card">
   <h3>Profile</h3>
   <dl>
-    <dt>Active</dt><dd><strong>{{.Profile}}</strong></dd>
+    <dt>Profile</dt><dd><strong>{{.Profile}}</strong> <small><a href="/telegram?profile={{.Profile}}">Telegram →</a></small></dd>
     <dt>Data dir</dt><dd><code>{{.DataDir}}</code></dd>
     <dt>DB</dt><dd><code>{{.DBPath}}</code> — {{humanBytes .DBSize}}</dd>
     <dt>Cache</dt><dd><code>{{.CachePath}}</code> — {{humanBytes .CacheSize}} across {{.CacheN}} file(s)</dd>
@@ -138,6 +143,7 @@
   {{end}}
   <form method="post" action="/state/repair">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="profile" value="{{.Profile}}">
     {{if .MountActive}}
       <label>
         <input type="checkbox" name="force" value="1">

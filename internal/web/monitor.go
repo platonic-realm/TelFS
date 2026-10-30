@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"net/http"
 	"os"
 	"strconv"
@@ -37,11 +38,7 @@ type liveStatus struct {
 		JournalUnposted int64  `json:"journal_unposted"`
 		SnapshotDue     string `json:"snapshot_due"`
 	} `json:"sync"`
-	Upload *struct {
-		Connections      int   `json:"connections"`
-		RateCapBytesPerS int64 `json:"rate_cap_bytes_per_s"`
-		RateBytesPerS    int64 `json:"rate_bytes_per_s"`
-	} `json:"upload"`
+	Upload  *uploadView `json:"upload"`
 	Staging struct {
 		PendingBytes int64 `json:"pending_bytes"`
 		CapBytes     int64 `json:"cap_bytes"`
@@ -66,6 +63,20 @@ func (l *liveStatus) CurrentError() *struct {
 		return nil
 	}
 	return l.LastError
+}
+
+// StagingKind colours the staging meter: err while writes wait, warn
+// above 80 % of the cap.
+func (l *liveStatus) StagingKind() string {
+	switch {
+	case l == nil:
+		return ""
+	case l.Staging.Blocked:
+		return "err"
+	case l.StagingPct() > 80:
+		return "warn"
+	}
+	return ""
 }
 
 // StagingPct is the staged share of the staging cap, 0 without a cap.
@@ -238,6 +249,9 @@ func readFSView(ctx context.Context, cfg *config.Config) (fsView, bool) {
 	v.Format, _ = m.Format(ctx)
 	v.ChunkSize, _ = m.ChunkSize(ctx)
 	v.Codec, _ = m.CompressionCodec(ctx)
+	if v.Codec == "" || v.Codec == "none" {
+		v.Codec = "no compression"
+	}
 	switch {
 	case v.Format >= 2:
 		v.Encryption = "AES-256-GCM"
@@ -298,4 +312,34 @@ func lampProfiles(all []profileMonitor) []profileMonitor {
 		}
 	}
 	return out
+}
+
+// rateText renders bytes per second in decimal units, as config.toml
+// writes rates ("5MB/s"): "3.9 MB/s", "820 kB/s", "0 B/s".
+func rateText(bps int64) string {
+	switch {
+	case bps >= 1_000_000:
+		return fmt.Sprintf("%.1f MB/s", float64(bps)/1e6)
+	case bps >= 1_000:
+		return fmt.Sprintf("%.0f kB/s", float64(bps)/1e3)
+	default:
+		return fmt.Sprintf("%d B/s", bps)
+	}
+}
+
+// mdCode escapes s and renders its `code` spans as <code>.
+func mdCode(s string) template.HTML {
+	parts := strings.Split(template.HTMLEscapeString(s), "`")
+	var b strings.Builder
+	for i, p := range parts {
+		if i%2 == 1 && i < len(parts)-1 {
+			b.WriteString("<code>" + p + "</code>")
+			continue
+		}
+		if i%2 == 1 { // an unpaired backtick: keep it
+			b.WriteString("`")
+		}
+		b.WriteString(p)
+	}
+	return template.HTML(b.String())
 }

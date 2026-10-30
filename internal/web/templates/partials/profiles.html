@@ -1,58 +1,61 @@
 {{define "profiles_panel"}}
 <section class="card" id="profiles-panel" hx-get="/partials/profiles" hx-trigger="every 5s" hx-swap="outerHTML">
-  <h3>Profiles <small>— every profile, live (5 s). The selected one is what the Setup, Browse and State pages act on.</small></h3>
+  <h3>Profiles <small>— live, every 5 s · the selected one is what Setup, Browse and State act on</small></h3>
   {{if .Monitors}}
+  <div class="table-scroll">
   <table class="ledger">
     <thead><tr>
-      <th>Profile</th><th>Mount</th><th>Link</th><th>Channel copy</th>
-      <th class="num">Backlog</th><th class="num">Upload</th><th></th>
+      <th>Profile</th><th>Link</th><th>Channel copy</th>
+      <th class="num">Waiting to upload</th><th class="num">Upload</th><th></th>
     </tr></thead>
     <tbody>
     {{range .Monitors}}
     <tr{{if .Selected}} class="selected"{{end}}>
       <td>
         <a href="/profiles/{{.Name}}"><strong>{{.Name}}</strong></a>
-        {{if .Selected}}<span class="pill acc" title="The Setup, Browse and State pages act on this profile">selected</span>{{end}}
-        {{with .Err}}<br><small class="err-text">{{.}}</small>{{end}}
-      </td>
-      <td>
-        {{with .Mountpoint}}<code>{{.}}</code>{{else}}{{if .Online}}<small>mounted</small>{{else}}<small>not mounted</small>{{end}}{{end}}
-        {{if .ReadOnly}}<small>· read-only</small>{{end}}
+        {{if .Selected}}<span class="pill acc" title="The Setup, Browse and State pages of this browser act on this profile">selected</span>{{end}}
+        <span class="line-sub" title="{{.Mountpoint}}">{{with .Mountpoint}}{{.}}{{else}}{{if .Online}}mounted{{else}}not mounted{{end}}{{end}}{{if .ReadOnly}} · read-only{{end}}</span>
+        {{with .Err}}<span class="line-sub err-text">{{.}}</span>{{end}}
       </td>
       <td><span class="pill {{.LinkKind}}" title="{{.LinkTip}}">{{.LinkLabel}}</span></td>
       <td><span class="pill {{.SyncKind}}" title="{{.SyncTip}}">{{.SyncLabel}}</span></td>
       <td class="num">
         {{with .Live}}
-          {{.Sync.PendingUploads}} upload(s) · {{humanBytes .Sync.PendingBytes}}
-          {{if .Staging.CapBytes}}<br><small{{if .Staging.Blocked}} class="err-text"{{end}}>staged {{printf "%.0f" .StagingPct}} % of {{humanBytes .Staging.CapBytes}}{{if .Staging.Blocked}} — writes wait{{end}}</small>{{end}}
-          {{if .Sync.JournalUnposted}}<br><small>{{.Sync.JournalUnposted}} journal op(s) to post</small>{{end}}
-          {{with .Sync.SnapshotDue}}<br><small title="{{.}}">snapshot owed</small>{{end}}
+          {{if .Sync.PendingUploads}}{{.Sync.PendingUploads}} chunk(s) · {{humanBytes .Sync.PendingBytes}}{{else}}<small>nothing</small>{{end}}
+          {{if .Staging.CapBytes}}
+          <div class="qbar mini" title="staging: {{humanBytes .Staging.PendingBytes}} of the {{humanBytes .Staging.CapBytes}} cap"><div class="qbar-fill {{.StagingKind}}" style="width: {{pctOf64 .Staging.PendingBytes .Staging.CapBytes}}%"></div></div>
+          <small{{if .Staging.Blocked}} class="err-text"{{end}}>{{printf "%.0f" .StagingPct}} % of {{humanBytes .Staging.CapBytes}} staging{{if .Staging.Blocked}} — writes wait{{end}}</small>
+          {{end}}
+          {{if .Sync.JournalUnposted}}<span class="line-sub">{{.Sync.JournalUnposted}} journal op(s) to post</span>{{end}}
+          {{with .Sync.SnapshotDue}}<span class="line-sub" title="{{.}}">a snapshot is owed</span>{{end}}
         {{else}}<small>—</small>{{end}}
       </td>
       <td class="num">
         {{with .Live}}{{with .Upload}}
-          {{humanBytes .RateBytesPerS}}/s
-          <br><small>{{.Connections}} conn{{if .RateCapBytesPerS}} · cap {{humanBytes .RateCapBytesPerS}}/s{{end}}</small>
+          {{if .RateBytesPerS}}{{rate .RateBytesPerS}}{{else}}<small>idle</small>{{end}}
+          <span class="line-sub">cap {{if .RateCapBytesPerS}}{{rate .RateCapBytesPerS}}{{else}}none{{end}} · {{.Connections}} conn.</span>
         {{else}}<small>—</small>{{end}}{{else}}<small>—</small>{{end}}
       </td>
       <td class="actions">
-        <a class="btn small muted" href="/telegram?profile={{.Name}}" title="RPCs, queues and rate limits of {{.Name}}">Telegram</a>
+        <a href="/telegram?profile={{.Name}}" title="Requests, queue and upload cap of {{.Name}}">Telegram</a>
+        <a href="/state?profile={{.Name}}" title="Local state of {{.Name}}: inodes, chunks, journal, cache">State</a>
         {{if not .Selected}}
         <form class="inline-form" method="post" action="/profiles/{{.Name}}/use">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <button class="small" type="submit" title="Make the Setup, Browse and State pages act on {{.Name}}">Select</button>
+          <button class="small" type="submit" title="Make the Setup, Browse and State pages of this browser act on {{.Name}}">Select</button>
         </form>
         {{end}}
       </td>
     </tr>
     {{with .Live}}{{with .CurrentError}}
-    <tr class="sub"><td></td><td colspan="6"><small class="err-text">last error {{ago .Unix}}: {{.Text}}</small></td></tr>
+    <tr class="sub"><td></td><td colspan="5"><small class="err-text">last error {{ago .Unix}}, not recovered yet: {{.Text}}</small></td></tr>
     {{end}}{{end}}
     {{end}}
     </tbody>
   </table>
+  </div>
   {{else}}
-    <p><em>No profiles.</em> <a href="/profiles/new">Create one</a>.</p>
+    <p><em>No profiles yet.</em> <a href="/profiles/new">Create one</a> — or follow the <a href="/setup">guided setup</a>.</p>
   {{end}}
 </section>
 {{end}}
@@ -61,6 +64,7 @@
 <section class="card" id="mounts-panel" hx-get="/partials/status" hx-trigger="every 10s" hx-swap="outerHTML">
   <h3>Mounts <small>— every TelFS mount on this machine (10 s)</small></h3>
   {{if .MountList}}
+  <div class="table-scroll">
   <table class="ledger">
     <thead><tr><th>Mountpoint</th><th>Profile</th><th>Kind</th></tr></thead>
     <tbody>
@@ -73,6 +77,7 @@
     {{end}}
     </tbody>
   </table>
+  </div>
   {{else}}
     <p><em>No TelFS mounts.</em></p>
   {{end}}

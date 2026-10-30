@@ -82,6 +82,7 @@ func (s *Server) registerRoutes() {
 	// Telegram connection state + recent requests.
 	s.mux.HandleFunc("GET /telegram", s.telegramPage)
 	s.mux.HandleFunc("POST /telegram/ratelimit", s.telegramSetRateLimit)
+	s.mux.HandleFunc("POST /telegram/upload-limit", s.telegramSetUploadLimit)
 	s.mux.HandleFunc("GET /partials/telegram", s.telegramPartial)
 
 	// FS state + repair.
@@ -182,8 +183,10 @@ func (s *Server) renderPartialBlock(w http.ResponseWriter, name, block string, d
 func funcsFor(w http.ResponseWriter) template.FuncMap {
 	f := tmplFuncs()
 	if sr, ok := w.(*statusRecorder); ok {
-		sel := sr.profile
+		sel, csrf, path := sr.profile, sr.csrf, sr.path
 		f["activeProfile"] = func() string { return sel }
+		f["csrfToken"] = func() string { return csrf }
+		f["requestPath"] = func() string { return path }
 	}
 	return f
 }
@@ -203,6 +206,17 @@ func tmplFuncs() template.FuncMap {
 		"activeProfile": func() string { return selectedProfile(&http.Request{Header: http.Header{}}) },
 		// ago renders a unix time as a terse age ("3 h ago").
 		"ago": ago,
+		// rate renders bytes per second the way config.toml writes it
+		// (decimal MB/s: max_rate = "5MB/s").
+		"rate": rateText,
+		// md renders `code` spans in help text as <code> (the text is
+		// escaped first).
+		"md": mdCode,
+		// profiles lists every profile (the masthead's switcher);
+		// csrfToken / requestPath are bound per request by funcsFor.
+		"profiles":    listProfileNames,
+		"csrfToken":   func() string { return "" },
+		"requestPath": func() string { return "/" },
 		// pctOf / pctOf64: render a "filled %" for the queue visual
 		// bars. Clamped to [0, 100] so an over-target buffer (rare —
 		// the packer flushes on threshold) still produces a sane bar.

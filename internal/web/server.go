@@ -165,7 +165,13 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		r, sel := withSelection(r)
 		// request log (cheap)
 		start := time.Now()
-		ww := &statusRecorder{ResponseWriter: w, status: 200, profile: sel}
+		ww := &statusRecorder{ResponseWriter: w, status: 200, profile: sel, path: r.URL.RequestURI()}
+		if r.Method == http.MethodGet {
+			// Every page's masthead carries the profile switcher (a POST
+			// form): make sure the browser has a CSRF token. Reuses an
+			// existing one — never rotates it under open forms.
+			ww.csrf = s.state.EnsureCSRF(ww, r)
+		}
 		next.ServeHTTP(ww, r)
 		s.opts.Logger.Printf("%s %s %d %s", r.Method, r.URL.Path, ww.status, time.Since(start))
 	})
@@ -204,6 +210,8 @@ type statusRecorder struct {
 	http.ResponseWriter
 	status  int
 	profile string // the request's selected profile (selection.go)
+	csrf    string // the browser's CSRF token (GET requests)
+	path    string // the request URI (the profile switcher returns there)
 }
 
 func (sr *statusRecorder) WriteHeader(c int) {

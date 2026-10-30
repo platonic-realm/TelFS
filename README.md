@@ -968,16 +968,20 @@ browser through a chosen mountpoint.
 **Every profile at once.** Several profiles can run side by side (two
 mounts, two daemons); the console watches all of them without any
 global setting. The dashboard opens with a live table of every profile
-— mount, **link** lamp (ok / busy / down / fault; yellow above 80 % of
-the staging cap, red "backlog" when writes wait for uploads — a large
-backlog below the cap is normal during a first backup), **channel copy**
-lamp (green when the channel alone could recover the filesystem),
-backlog, upload rate and any error the link has not recovered from —
+— mount, **link** lamp (ok / busy / down / fault; yellow "backlog"
+above 80 % of the staging cap, red "writes wait" when writes wait for
+uploads — a large backlog below the cap is normal during a first
+backup), **channel copy** lamp (green when the channel alone could
+recover the filesystem), what waits to upload (with a staging meter),
+upload rate and cap, and any error the link has not recovered from —
 then every profile's channel and filesystem, then every TelFS mount on
 the machine (bind mounts of a mount show as "view of …" / "also visible
 at …", never as leftovers to unmount). The masthead carries the two
 lamps for each profile; each set opens that profile's Telegram tab
-(upload queue, staging, requests, rate limits — `?profile=NAME`).
+(upload queue, staging, requests, rate limits, and the upload cap — it
+can be changed there while the mount runs, like `telfs upload limit`;
+`?profile=NAME`). The State tab has the same per-profile tabs. The
+masthead's profile button switches the selection from any page.
 
 **Selection.** The Setup, Browse and State pages act on one profile:
 the one this browser selected (Select on the dashboard or the profile

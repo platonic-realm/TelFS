@@ -22,8 +22,8 @@
         <span class="pill acc">next</span>
         <a href="{{.Href}}" class="setup-label setup-next"><strong>{{.Label}}</strong></a>
         {{if .Optional}}<span class="pill muted">optional</span>{{end}}
-        {{if .Why}}<div class="setup-why"><small>{{.Why}}</small></div>{{end}}
-        {{if .Detail}}<div class="setup-detail"><small>{{.Detail}}</small></div>{{end}}
+        {{if .Why}}<div class="setup-why"><small>{{md .Why}}</small></div>{{end}}
+        {{if .Detail}}<div class="setup-detail"><small>{{md .Detail}}</small></div>{{end}}
         <div class="setup-cta">
           <a href="{{.Href}}" class="btn primary">{{if .CTA}}{{.CTA}}{{else}}Open this step{{end}} →</a>
           <a href="/setup" class="btn muted">Use the full wizard</a>
@@ -38,6 +38,7 @@
 
 <section class="card">
   <h3>Channels</h3>
+  <div class="table-scroll">
   <table class="ledger">
     <thead><tr><th>Profile</th><th>Channel</th><th class="num">Channel ID</th><th>Account</th></tr></thead>
     <tbody>
@@ -51,10 +52,12 @@
     {{end}}
     </tbody>
   </table>
+  </div>
 </section>
 
 <section class="card">
   <h3>Filesystems</h3>
+  <div class="table-scroll">
   <table class="ledger">
     <thead><tr><th>Profile</th><th>Filesystem</th><th>Last snapshot</th><th>Versions</th><th class="num">Local DB</th><th class="num">Cache</th></tr></thead>
     <tbody>
@@ -77,6 +80,7 @@
     {{end}}
     </tbody>
   </table>
+  </div>
 </section>
 
 {{template "mounts_panel" .}}

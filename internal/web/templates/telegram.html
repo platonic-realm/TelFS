@@ -8,6 +8,23 @@
 
 {{template "telegram_panel" .}}
 
+{{with .Upload}}
+<section class="card">
+  <h3>Upload rate <small>— bytes per second, every upload connection together</small></h3>
+  <dl>
+    <dt>Now</dt><dd>{{if .RateBytesPerS}}<strong>{{rate .RateBytesPerS}}</strong>{{else}}idle{{end}} over {{.Connections}} connection(s)</dd>
+    <dt>Cap</dt><dd>{{if .RateCapBytesPerS}}<strong>{{rate .RateCapBytesPerS}}</strong>{{else}}<strong>none</strong>{{end}}{{if ne .RateCapBytesPerS .RateCapConfigBytesPerS}} <span class="pill warn" title="Changed while running; config.toml's value applies again at the next start">changed</span> <small>config.toml: {{if .RateCapConfigBytesPerS}}{{rate .RateCapConfigBytesPerS}}{{else}}none{{end}}</small>{{end}}</dd>
+  </dl>
+  <form method="post" action="/telegram/upload-limit" class="row">
+    <input type="hidden" name="csrf" value="{{$.CSRF}}">
+    <input type="hidden" name="profile" value="{{$.Profile}}">
+    <label>New cap <input type="text" name="rate" placeholder="3MB/s · 800KiB/s · 0 = none" required></label>
+    <button type="submit">Set until the mount stops</button>
+  </form>
+  <p><small>Lets two mounts share one uplink by need (same as <code>telfs upload limit RATE</code>). <code>[upload] max_rate</code> in config.toml applies again when the mount restarts.</small></p>
+</section>
+{{end}}
+
 <section class="card">
   <h3>Request rate limits</h3>
   <p><small>
