@@ -1,7 +1,7 @@
 {{define "content"}}
 <h2>Encryption</h2>
 {{if not .HasMeta}}
-<p><em>No metadata DB yet for this profile.</em> A new filesystem — created in the <a href="/setup">setup wizard</a> or with <code>telfs init</code> — is always encrypted.</p>
+<p><em>No metadata DB yet for this profile.</em> A new filesystem — created in the <a href="{{pp "/setup"}}">setup wizard</a> or with <code>telfs init</code> — is always encrypted.</p>
 {{else if eq .Format 2}}
 <section class="card">
   <h3><span class="pill ok">always on</span> Format 2</h3>

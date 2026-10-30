@@ -17,7 +17,7 @@
   {{if .HasChunks}}
   <p><small>The codec is locked once chunks exist — switching mid-FS would shred every chunk written under the old one. To change, start a fresh profile and <code>cp -r</code> your data.</small></p>
   {{else}}
-  <p><a href="/compression/init" class="btn">Change codec</a></p>
+  <p><a href="{{pp "/compression/init"}}" class="btn">Change codec</a></p>
   {{end}}
 </section>
 {{end}}

@@ -37,7 +37,7 @@ import (
 // BYTES are to the cap, and whether writes actually wait.
 func (s *Server) healthPartial(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, renderLamps(lampProfiles(monitorProfiles(r.Context(), monLamps, profileOf(r)))))
+	_, _ = io.WriteString(w, renderLamps(lampProfiles(monitorProfiles(r.Context(), monLamps))))
 }
 
 // renderLamps is the masthead fragment: per profile its name and two
@@ -51,16 +51,12 @@ func renderLamps(profiles []profileMonitor) string {
 		b.WriteString(`<span class="pill muted" title="No profile yet — Setup → Guided wizard.">no profile</span>`)
 	}
 	for _, p := range profiles {
-		cls := "lamp-set"
-		if p.Selected {
-			cls += " selected"
-		}
-		fmt.Fprintf(&b, `<a class="%s" href="/telegram?profile=%s" title="%s">`+
+		fmt.Fprintf(&b, `<a class="lamp-set" href="/telegram?profile=%s" title="%s">`+
 			`<span class="lamp-name">%s</span>`+
 			`<span class="pill %s" title="%s">%s</span>`+
 			`<span class="pill %s" title="%s">%s</span>`+
 			`</a>`,
-			cls, url.QueryEscape(p.Name), htmlAttr("Profile "+p.Name+" — open its Telegram page"),
+			url.QueryEscape(p.Name), htmlAttr("Profile "+p.Name+" — open its Telegram page"),
 			template.HTMLEscapeString(p.Name),
 			p.LinkKind, htmlAttr(p.LinkTip), p.LinkLabel,
 			p.SyncKind, htmlAttr(p.SyncTip), p.SyncLabel)

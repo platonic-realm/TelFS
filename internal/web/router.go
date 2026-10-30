@@ -1,11 +1,14 @@
 package web
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io/fs"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -15,7 +18,19 @@ func (s *Server) registerRoutes() {
 	// Static assets are served straight out of the embedded FS — no
 	// per-file route registration. /static/style.css, /static/htmx.min.js.
 	sub, _ := fs.Sub(staticFS, "static")
-	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
+	files := http.StripPrefix("/static/", http.FileServer(http.FS(sub)))
+	s.mux.Handle("GET /static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Pages link assets with ?v=<content hash> (assetURL): such a URL
+		// never changes content, so caches may keep it for good. Without
+		// one, revalidate — a proxy (S9: Cloudflare) kept serving an old
+		// style.css with the new pages.
+		if r.URL.Query().Get("v") != "" {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		files.ServeHTTP(w, r)
+	}))
 
 	// Dashboard + status partial (auto-refresh).
 	s.mux.HandleFunc("GET /{$}", s.dashboardIndex)
@@ -39,7 +54,6 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /profiles/{name}", s.profilesShow)
 	s.mux.HandleFunc("POST /profiles/{name}/api", s.profilesSetAPI)
 	s.mux.HandleFunc("POST /profiles/{name}/secret", s.profilesSetSecret)
-	s.mux.HandleFunc("POST /profiles/{name}/use", s.profilesUse)
 	s.mux.HandleFunc("POST /profiles/{name}/default", s.profilesDefault)
 	s.mux.HandleFunc("POST /profiles/{name}/delete", s.profilesDelete)
 	// POST + CSRF, not GET: the bundle contains session.json — a live
@@ -178,17 +192,47 @@ func (s *Server) renderPartialBlock(w http.ResponseWriter, name, block string, d
 // here so a page and its partials see the same functions; otherwise
 // {{template ...}} embeds fail when the helper exists on the page's
 // FuncMap but not the partial's.
-// funcsFor is tmplFuncs bound to the request w answers: activeProfile is
-// that request's selected profile.
+// funcsFor is tmplFuncs bound to the request w answers: the profile the
+// page is about (?profile=, else the default), its profile bar, links and
+// form fields that keep that profile, and the browser's CSRF token.
 func funcsFor(w http.ResponseWriter) template.FuncMap {
 	f := tmplFuncs()
-	if sr, ok := w.(*statusRecorder); ok {
-		sel, csrf, path := sr.profile, sr.csrf, sr.path
-		f["activeProfile"] = func() string { return sel }
+	if sr, ok := w.(*statusRecorder); ok && sr.req != nil {
+		current, path, csrf := queryProfile(sr.req), sr.req.URL.Path, sr.csrf
+		f["pageProfile"] = func() string { return current }
+		f["profileBar"] = func() []profileTab { return profileBar(path, current) }
+		f["pp"] = func(u string) string { return withProfile(u, current) }
+		f["profileField"] = func() template.HTML { return hiddenProfile(current) }
 		f["csrfToken"] = func() string { return csrf }
-		f["requestPath"] = func() string { return path }
 	}
 	return f
+}
+
+// hiddenProfile is the form field that keeps a page's profile on submit.
+func hiddenProfile(name string) template.HTML {
+	return template.HTML(`<input type="hidden" name="profile" value="` + template.HTMLEscapeString(name) + `">`)
+}
+
+// assetVersions maps each static file to a short hash of its content: a
+// changed file gets a new URL, so no cache serves an old copy.
+var assetVersions = func() map[string]string {
+	out := map[string]string{}
+	_ = fs.WalkDir(staticFS, "static", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if b, err := fs.ReadFile(staticFS, p); err == nil {
+			sum := sha256.Sum256(b)
+			out[strings.TrimPrefix(p, "static/")] = hex.EncodeToString(sum[:6])
+		}
+		return nil
+	})
+	return out
+}()
+
+// assetURL is a static file's URL with its content version.
+func assetURL(name string) string {
+	return "/static/" + name + "?v=" + assetVersions[name]
 }
 
 func tmplFuncs() template.FuncMap {
@@ -200,10 +244,15 @@ func tmplFuncs() template.FuncMap {
 		// "adopted:/path/to/mnt" — a raw slash would split the
 		// segment and 404 the route.
 		"pathEscape": url.PathEscape,
-		// activeProfile names the profile the pages act on; funcsFor
-		// binds it to the request (the browser's selection). Without a
-		// request (tests) it is the selection's fallback.
-		"activeProfile": func() string { return selectedProfile(&http.Request{Header: http.Header{}}) },
+		// asset is a static file's versioned URL.
+		"asset": assetURL,
+		// pageProfile / profileBar / pp / profileField / csrfToken are
+		// bound per request by funcsFor; these are the request-less
+		// defaults (tests).
+		"pageProfile":  defaultProfile,
+		"profileBar":   func() []profileTab { return nil },
+		"pp":           func(u string) string { return withProfile(u, defaultProfile()) },
+		"profileField": func() template.HTML { return hiddenProfile(defaultProfile()) },
 		// ago renders a unix time as a terse age ("3 h ago").
 		"ago": ago,
 		// rate renders bytes per second the way config.toml writes it
@@ -211,12 +260,9 @@ func tmplFuncs() template.FuncMap {
 		"rate": rateText,
 		// md renders `code` spans in help text as <code> (the text is
 		// escaped first).
-		"md": mdCode,
-		// profiles lists every profile (the masthead's switcher);
-		// csrfToken / requestPath are bound per request by funcsFor.
-		"profiles":    listProfileNames,
-		"csrfToken":   func() string { return "" },
-		"requestPath": func() string { return "/" },
+		"md":        mdCode,
+		"profiles":  listProfileNames,
+		"csrfToken": func() string { return "" },
 		// pctOf / pctOf64: render a "filled %" for the queue visual
 		// bars. Clamped to [0, 100] so an over-target buffer (rare —
 		// the packer flushes on threshold) still produces a sane bar.

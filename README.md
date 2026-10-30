@@ -980,14 +980,15 @@ at …", never as leftovers to unmount). The masthead carries the two
 lamps for each profile; each set opens that profile's Telegram tab
 (upload queue, staging, requests, rate limits, and the upload cap — it
 can be changed there while the mount runs, like `telfs upload limit`;
-`?profile=NAME`). The State tab has the same per-profile tabs. The
-masthead's profile button switches the selection from any page.
+`?profile=NAME`).
 
-**Selection.** The Setup, Browse and State pages act on one profile:
-the one this browser selected (Select on the dashboard or the profile
-page; a cookie), else the CLI's default (`~/.config/telfs/active`), else
-the first profile. Selecting never changes the CLI's default; "Make CLI
-default" on a profile's page does, explicitly.
+**Pages about one profile** (Setup, Login, Channel, Encryption,
+Compression, Telegram, State) say which in their address —
+`?profile=NAME` — and show a profile bar at the top to switch to the
+same page about another profile; their forms and redirects keep it.
+There is no "selected" profile: without `?profile=` a page shows the
+CLI's default (`~/.config/telfs/active`), else the first profile. "Make
+CLI default" on a profile's page changes what `telfs` commands use.
 
 First-time users land on a guided `/setup` wizard where every step is
 an inline form on one page: create profile → API creds → phone login

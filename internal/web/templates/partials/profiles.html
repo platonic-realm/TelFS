@@ -1,6 +1,6 @@
 {{define "profiles_panel"}}
 <section class="card" id="profiles-panel" hx-get="/partials/profiles" hx-trigger="every 5s" hx-swap="outerHTML">
-  <h3>Profiles <small>— live, every 5 s · the selected one is what Setup, Browse and State act on</small></h3>
+  <h3>Profiles <small>— live, every 5 s</small></h3>
   {{if .Monitors}}
   <div class="table-scroll">
   <table class="ledger">
@@ -10,10 +10,9 @@
     </tr></thead>
     <tbody>
     {{range .Monitors}}
-    <tr{{if .Selected}} class="selected"{{end}}>
+    <tr>
       <td>
         <a href="/profiles/{{.Name}}"><strong>{{.Name}}</strong></a>
-        {{if .Selected}}<span class="pill acc" title="The Setup, Browse and State pages of this browser act on this profile">selected</span>{{end}}
         <span class="line-sub" title="{{.Mountpoint}}">{{with .Mountpoint}}{{.}}{{else}}{{if .Online}}mounted{{else}}not mounted{{end}}{{end}}{{if .ReadOnly}} · read-only{{end}}</span>
         {{with .Err}}<span class="line-sub err-text">{{.}}</span>{{end}}
       </td>
@@ -39,12 +38,6 @@
       <td class="actions">
         <a href="/telegram?profile={{.Name}}" title="Requests, queue and upload cap of {{.Name}}">Telegram</a>
         <a href="/state?profile={{.Name}}" title="Local state of {{.Name}}: inodes, chunks, journal, cache">State</a>
-        {{if not .Selected}}
-        <form class="inline-form" method="post" action="/profiles/{{.Name}}/use">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <button class="small" type="submit" title="Make the Setup, Browse and State pages of this browser act on {{.Name}}">Select</button>
-        </form>
-        {{end}}
       </td>
     </tr>
     {{with .Live}}{{with .CurrentError}}
@@ -55,7 +48,7 @@
   </table>
   </div>
   {{else}}
-    <p><em>No profiles yet.</em> <a href="/profiles/new">Create one</a> — or follow the <a href="/setup">guided setup</a>.</p>
+    <p><em>No profiles yet.</em> <a href="/profiles/new">Create one</a> — or follow the <a href="{{pp "/setup"}}">guided setup</a>.</p>
   {{end}}
 </section>
 {{end}}

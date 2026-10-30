@@ -1,13 +1,13 @@
 {{define "content"}}
 <h2>Set channel</h2>
 <form method="post" action="/channel/set" autocomplete="off">
-  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">{{profileField}}
   <label>Channel ID
     <input type="text" name="id" required pattern="-?[0-9]+" inputmode="numeric" placeholder="3930934278 or -1003930934278">
   </label>
   {{template "secretfield" .}}
   <button type="submit">Set</button>
-  <a href="/channel" class="btn">Cancel</a>
+  <a href="{{pp "/channel"}}" class="btn">Cancel</a>
 </form>
-<p><small>The id accepts either the raw positive form or the <code>-100…</code> form (both decode to the same channel). Your account must be a member of the channel — TelFS resolves everything else from your dialog list. Prefer <a href="/channel/list">picking from the list</a>.</small></p>
+<p><small>The id accepts either the raw positive form or the <code>-100…</code> form (both decode to the same channel). Your account must be a member of the channel — TelFS resolves everything else from your dialog list. Prefer <a href="{{pp "/channel/list"}}">picking from the list</a>.</small></p>
 {{end}}

@@ -43,7 +43,7 @@ func TestBehindReverseProxy(t *testing.T) {
 		t.Fatalf("csrf cookie %+v: want HttpOnly, SameSite=Lax", csrf)
 	}
 
-	post := httptest.NewRequest("POST", "/profiles/cloud/use", strings.NewReader("csrf="+csrf.Value))
+	post := httptest.NewRequest("POST", "/profiles/cloud/default", strings.NewReader("csrf="+csrf.Value))
 	post.Host = "127.0.0.1:8400"
 	post.Header.Set("Origin", "https://tfs.fatehi.dev")
 	post.Header.Set("Content-Type", "application/x-www-form-urlencoded")

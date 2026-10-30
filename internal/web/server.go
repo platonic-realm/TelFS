@@ -161,11 +161,14 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 			}
 		}()
-		// The profile this request acts on (per browser, v1.1 W1).
-		r, sel := withSelection(r)
 		// request log (cheap)
 		start := time.Now()
-		ww := &statusRecorder{ResponseWriter: w, status: 200, profile: sel, path: r.URL.RequestURI()}
+		ww := &statusRecorder{ResponseWriter: w, status: 200, req: r}
+		if !strings.HasPrefix(r.URL.Path, "/static/") {
+			// Pages are live state: never from a cache (a proxy's or the
+			// browser's back-forward one). Static assets carry their own.
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		if r.Method == http.MethodGet {
 			// Every page's masthead carries the profile switcher (a POST
 			// form): make sure the browser has a CSRF token. Reuses an
@@ -208,14 +211,24 @@ func (s *Server) hostAllowed(hostport string) bool {
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status  int
-	profile string // the request's selected profile (selection.go)
-	csrf    string // the browser's CSRF token (GET requests)
-	path    string // the request URI (the profile switcher returns there)
+	status int
+	req    *http.Request
+	csrf   string // the browser's CSRF token (GET requests)
 }
 
+// WriteHeader also keeps the profile on redirects: a handler that
+// redirects to a profile page (/setup, /channel, …) without ?profile=
+// gets the profile of the request appended — the page stays about the
+// same profile (selection.go).
 func (sr *statusRecorder) WriteHeader(c int) {
 	sr.status = c
+	if c >= 300 && c < 400 && sr.req != nil {
+		if loc := sr.Header().Get("Location"); strings.HasPrefix(loc, "/") && !strings.HasPrefix(loc, "//") {
+			if path, _, _ := strings.Cut(loc, "?"); isProfilePage(path) {
+				sr.Header().Set("Location", withProfile(loc, queryProfile(sr.req)))
+			}
+		}
+	}
 	sr.ResponseWriter.WriteHeader(c)
 }
 

@@ -11,15 +11,8 @@
 {{range .Profiles}}
 <tr>
   <td><a href="/profiles/{{.}}"><strong>{{.}}</strong></a></td>
-  <td>{{if eq . $.Active}}<span class="pill acc">selected</span>{{end}}{{if eq . $.Default}} <span class="pill muted" title="telfs commands without TELFS_PROFILE use it">CLI default</span>{{end}}</td>
+  <td>{{if eq . $.Default}}<span class="pill muted" title="telfs commands without TELFS_PROFILE use it">CLI default</span>{{end}}</td>
   <td class="actions">
-    {{if ne . $.Active}}
-    <form method="post" action="/profiles/{{.}}/use" style="display:inline">
-      <input type="hidden" name="csrf" value="{{$.CSRF}}">
-      <input type="hidden" name="back" value="/profiles">
-      <button type="submit" class="secondary">Select</button>
-    </form>
-    {{end}}
     <form method="post" action="/profiles/{{.}}/export" style="display:inline">
       <input type="hidden" name="csrf" value="{{$.CSRF}}">
       <button type="submit" class="secondary">Export</button>

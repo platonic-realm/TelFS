@@ -29,7 +29,7 @@
         {{/* ── the step's INLINE form ─────────────────────────── */}}
         {{if eq .Key "profile"}}
         <form method="post" action="/profiles" autocomplete="off">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
           <input type="hidden" name="from" value="setup">
           <label>Profile name
             <input type="text" name="name" required pattern="[a-zA-Z0-9_-]+" placeholder="main" autofocus>
@@ -39,7 +39,7 @@
 
         {{else if eq .Key "api"}}
         <form method="post" action="/profiles/{{$.Active}}/api" autocomplete="off">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
           <input type="hidden" name="from" value="setup">
           <label>API ID
             <input type="text" name="api_id" required pattern="[0-9]+" inputmode="numeric" placeholder="numeric id from my.telegram.org" {{if $.APIID}}value="{{$.APIID}}"{{end}} autofocus>
@@ -52,7 +52,7 @@
 
         {{else if eq .Key "secret"}}
         <form method="post" action="/profiles/{{$.Active}}/secret" autocomplete="off">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
           <input type="hidden" name="from" value="setup">
           <fieldset>
             <legend>Where the secret comes from</legend>
@@ -73,7 +73,7 @@
           {{if eq $.AuthStage "code"}}
           <p><span class="pill acc">code sent</span> Telegram just sent a 5-digit code to your account (SMS or the app's notifications). Enter it below.</p>
           <form method="post" action="/login/phone/code" autocomplete="off">
-            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
             <input type="hidden" name="from" value="setup">
             <label>Login code
               <input type="text" name="code" required inputmode="numeric" autofocus>
@@ -83,7 +83,7 @@
           {{else if eq $.AuthStage "password"}}
           <p><span class="pill acc">2FA</span> This account has two-step verification — enter its password to finish.</p>
           <form method="post" action="/login/phone/password" autocomplete="off">
-            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
             <input type="hidden" name="from" value="setup">
             <label>Two-step verification password
               <input type="password" name="password" required autofocus>
@@ -92,7 +92,7 @@
           </form>
           {{else}}
           <form method="post" action="/login/phone/start" autocomplete="off">
-            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
             <input type="hidden" name="from" value="setup">
             <label>Phone number (international, e.g. +14155552671)
               <input type="text" name="phone" required pattern="\+[0-9]+" placeholder="+..." autofocus>
@@ -103,13 +103,13 @@
           {{end}}
 
         {{else if eq .Key "channel"}}
-        <div hx-get="/setup/channels" hx-trigger="load" hx-swap="innerHTML">
+        <div hx-get="{{pp "/setup/channels"}}" hx-trigger="load" hx-swap="innerHTML">
           <p><em>Scanning your channels…</em></p>
         </div>
         <details>
           <summary>Or enter the channel id manually</summary>
           <form method="post" action="/channel/set" autocomplete="off">
-            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
             <input type="hidden" name="from" value="setup">
             <label>Channel id <input type="text" name="id" required pattern="-?[0-9]+" inputmode="numeric" placeholder="3930934278 or -1003930934278"></label>
             {{template "secretfield" $}}
@@ -119,7 +119,7 @@
 
         {{else if eq .Key "init"}}
         <form method="post" action="/setup/init" autocomplete="off" data-busy="Creating…">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
           <label>Chunk size
             <select name="chunk_size">
               <option value="4MiB" selected>4 MiB (default)</option>
@@ -160,7 +160,7 @@
         <div class="wizard-actions">
           {{if .Optional}}
             <form method="post" action="/setup/skip" style="display:inline">
-              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
               <input type="hidden" name="idx" value="{{$.CurrentIdx}}">
               <button type="submit" class="btn muted">Skip for now</button>
             </form>

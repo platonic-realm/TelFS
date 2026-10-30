@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -67,12 +66,12 @@ func dashboardFixture(t *testing.T) dashboardData {
 	}
 	ctx := context.Background()
 	return dashboardData{CSRF: "tok", Profile: "cloud", Active: "cloud",
-		Monitors: monitorProfiles(ctx, monFull, "cloud"), MountList: []mountView{
+		Monitors: monitorProfiles(ctx, monFull), MountList: []mountView{
 			{Point: "/srv/mnt/backup", Profile: "backup"}, {Point: "/mnt/offsite", Profile: "backup", ReadOnly: true}}}
 }
 
-// Every profile is monitored on its own, whichever is selected; without a
-// daemon a profile with a filesystem is "link down", one without is "no fs".
+// Every profile is monitored on its own; without a daemon a profile with a
+// filesystem is "link down", one without is "no fs".
 func TestMonitorProfilesEveryProfile(t *testing.T) {
 	d := dashboardFixture(t)
 	if len(d.Monitors) != 3 {
@@ -81,9 +80,6 @@ func TestMonitorProfilesEveryProfile(t *testing.T) {
 	by := map[string]profileMonitor{}
 	for _, p := range d.Monitors {
 		by[p.Name] = p
-	}
-	if !by["cloud"].Selected || by["backup"].Selected || by["spare"].Selected {
-		t.Error("only the selected profile is marked")
 	}
 	for _, n := range []string{"backup", "cloud"} {
 		p := by[n]
@@ -101,14 +97,14 @@ func TestMonitorProfilesEveryProfile(t *testing.T) {
 	}
 }
 
-// The monitoring works without any active profile (the service mounts set
-// none): every profile still shows, none marked.
+// The monitoring works without any CLI default (the service mounts set
+// none): every profile shows.
 func TestMonitorWithoutActiveProfile(t *testing.T) {
 	isolate(t)
 	mkProfile(t, "backup", "b", true)
 	mkProfile(t, "cloud", "c", true)
-	ms := monitorProfiles(context.Background(), monLive, "")
-	if len(ms) != 2 || ms[0].Selected || ms[1].Selected {
+	ms := monitorProfiles(context.Background(), monLive)
+	if len(ms) != 2 {
 		t.Fatalf("%+v", ms)
 	}
 	if out := renderLamps(lampProfiles(ms)); !strings.Contains(out, "backup") || !strings.Contains(out, "cloud") {
@@ -127,16 +123,15 @@ func TestDashboardRendersEveryProfile(t *testing.T) {
 		t.Fatal("order must be profiles, then channels, then filesystems")
 	}
 	for _, want := range []string{"TelFS-backup", "TelFS-cloud", `href="/telegram?profile=backup"`,
-		`action="/profiles/backup/use"`, "/mnt/offsite", `class="selected"`} {
+		`href="/state?profile=cloud"`, "/mnt/offsite"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("dashboard lacks %q", want)
 		}
 	}
-	if strings.Contains(out, `action="/profiles/cloud/use"`) {
-		t.Error("the selected profile gets no Select button")
-	}
-	if strings.Count(out, `class="selected"`) != 3 {
-		t.Error("the selected profile's row is marked in each of the three tables")
+	for _, gone := range []string{`/use"`, `class="selected"`, ">selected<", ">Select<"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("the dashboard selects nothing any more, yet has %q", gone)
+		}
 	}
 }
 
@@ -147,16 +142,16 @@ func TestDashboardSetupChecklistOnlyUntilConfigured(t *testing.T) {
 	isolate(t)
 	steps := []setupStep{{Key: "profile", Label: "Create a profile", Done: true, Href: "/profiles"},
 		{Key: "mount", Label: "Mount it", Href: "/mount/new"}}
-	open := render(t, "dashboard.html", dashboardData{Setup: setupChecklist{Steps: steps}}, "templates/partials/profiles.html")
-	if !strings.Contains(open, "Setup &amp; configuration") || !strings.Contains(open, `id="setup-checklist"`) {
-		t.Error("an open step must show the setup checklist")
+	open := render(t, "dashboard.html", dashboardData{Setups: []profileSetup{{Profile: "cloud", Setup: setupChecklist{Steps: steps}}}}, "templates/partials/profiles.html")
+	if !strings.Contains(open, "Setup &amp; configuration") || !strings.Contains(open, `id="setup-checklist-cloud"`) || !strings.Contains(open, `href="/setup?profile=cloud"`) {
+		t.Error("an open step must show that profile's setup checklist")
 	}
 	steps[1].Done = true
-	done := render(t, "dashboard.html", dashboardData{Setup: setupChecklist{Complete: true, Steps: steps}}, "templates/partials/profiles.html")
+	done := render(t, "dashboard.html", dashboardData{}, "templates/partials/profiles.html")
 	if strings.Contains(done, "Setup &amp; configuration") || strings.Contains(done, `id="setup-checklist"`) {
 		t.Error("a configured TelFS must not show the setup checklist")
 	}
-	if !strings.Contains(done, `href="/setup"`) {
+	if !strings.Contains(done, `/setup`) {
 		t.Error("the Setup menu must still link the guided wizard")
 	}
 }
@@ -165,10 +160,10 @@ func TestDashboardSetupChecklistOnlyUntilConfigured(t *testing.T) {
 func TestRenderLamps(t *testing.T) {
 	out := renderLamps([]profileMonitor{
 		{Name: "backup", LinkKind: "ok", LinkLabel: "link ok", SyncKind: "ok", SyncLabel: "synced"},
-		{Name: "cloud", Selected: true, LinkKind: "err", LinkLabel: "link down", SyncKind: "warn", SyncLabel: "not synced"},
+		{Name: "cloud", LinkKind: "err", LinkLabel: "link down", SyncKind: "warn", SyncLabel: "not synced"},
 	})
 	for _, want := range []string{`id="health-pill"`, `href="/telegram?profile=backup"`, `href="/telegram?profile=cloud"`,
-		`class="lamp-set selected"`, "link down", "synced"} {
+		`class="lamp-set"`, "link down", "synced"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("lamps lack %q: %s", want, out)
 		}
@@ -190,7 +185,7 @@ func TestRequestProfile(t *testing.T) {
 		t.Fatalf("explicit: %v %q", err, name)
 	}
 	if _, name, err := requestProfile(httptest.NewRequest("GET", "/telegram", nil)); err != nil || name != "cloud" {
-		t.Fatalf("default = the selected profile: %v %q", err, name)
+		t.Fatalf("default = the CLI default: %v %q", err, name)
 	}
 	for _, bad := range []string{"ghost", "../x"} {
 		if _, _, err := requestProfile(httptest.NewRequest("GET", "/telegram?profile="+bad, nil)); err == nil {
@@ -202,76 +197,83 @@ func TestRequestProfile(t *testing.T) {
 	}
 }
 
-// The Telegram page shows one profile with tabs for the others; its poll and
-// its rate-limit form carry that profile.
-func TestTelegramPageProfileTabs(t *testing.T) {
-	isolate(t)
-	d := tgPageData{pageBase: pageBase{CSRF: "c"}, Profile: "backup", Profiles: []string{"backup", "cloud"}}
-	out := render(t, "telegram.html", d, "templates/partials/telegram.html")
-	for _, want := range []string{`class="tabs"`, `href="/telegram?profile=cloud"`, `hx-get="/partials/telegram?profile=backup"`,
-		`name="profile" value="backup"`, "profile backup"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("telegram page lacks %q", want)
-		}
-	}
-}
-
-// The console's selection is per browser (v1.1 W1): cookie, else the CLI's
-// default, else the first profile; Select sets only the cookie, the CLI
-// default is a separate action; a bad cookie falls through.
-func TestProfileSelection(t *testing.T) {
+// A page about one profile says which in its address and keeps it: the
+// default without ?profile= is the CLI default, else the first profile; the
+// profile bar links the same page for every profile; redirects to profile
+// pages get the profile appended; the Telegram poll and forms carry it.
+func TestPageProfile(t *testing.T) {
 	isolate(t)
 	mkProfile(t, "backup", "b", true)
 	mkProfile(t, "cloud", "c", true)
-	req := func(cookie string) *http.Request {
-		r := httptest.NewRequest("GET", "/", nil)
-		if cookie != "" {
-			r.AddCookie(&http.Cookie{Name: profileCookie, Value: cookie})
-		}
-		return r
-	}
-	if got := selectedProfile(req("")); got != "backup" {
-		t.Fatalf("no cookie, no CLI default: %q, want the first profile", got)
+	get := func(target string) *http.Request { return httptest.NewRequest("GET", target, nil) }
+	if got := profileOf(get("/channel")); got != "backup" {
+		t.Fatalf("no ?profile=, no CLI default: %q, want the first profile", got)
 	}
 	config.SetActiveProfile("cloud")
-	if got := selectedProfile(req("")); got != "cloud" {
+	if got := profileOf(get("/channel")); got != "cloud" {
 		t.Fatalf("the CLI default: %q", got)
 	}
-	if got := selectedProfile(req("backup")); got != "backup" {
-		t.Fatalf("the browser's choice wins: %q", got)
+	if got := profileOf(get("/channel?profile=backup")); got != "backup" {
+		t.Fatalf("explicit: %q", got)
 	}
-	if got := selectedProfile(req("../etc")); got != "cloud" {
-		t.Fatalf("a bad cookie falls through: %q", got)
+	if got := profileOf(get("/channel?profile=../etc")); got != "cloud" {
+		t.Fatalf("a bad name falls back: %q", got)
 	}
 	if cfg, err := loadProfileCfg("ghost"); err == nil || cfg != nil {
 		t.Fatal("a missing profile loads")
 	}
 
-	s := &Server{state: NewState()}
-	post := func(target string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest("POST", target, strings.NewReader("csrf=0123456789abcdef0123456789abcdef&back=//evil.example"))
-		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		r.AddCookie(&http.Cookie{Name: "telfs_csrf", Value: "0123456789abcdef0123456789abcdef"})
-		r.SetPathValue("name", "backup")
+	// Redirects to a profile page keep the request's profile.
+	for _, c := range []struct{ target, loc, want string }{
+		{"/channel/set?profile=backup", "/channel", "/channel?profile=backup"},
+		{"/setup?profile=backup", "/setup?step=2", "/setup?step=2&profile=backup"},
+		{"/channel?profile=backup", "/setup?profile=cloud", "/setup?profile=cloud"},
+		{"/channel?profile=backup", "/profiles/backup", "/profiles/backup"},
+		{"/channel?profile=backup", "//evil.example/x", "//evil.example/x"},
+	} {
 		rec := httptest.NewRecorder()
-		if strings.HasSuffix(target, "/use") {
-			s.profilesUse(rec, r)
-		} else {
-			s.profilesDefault(rec, r)
+		sr := &statusRecorder{ResponseWriter: rec, req: get(c.target)}
+		http.Redirect(sr, sr.req, c.loc, http.StatusSeeOther)
+		if got := rec.Header().Get("Location"); got != c.want {
+			t.Errorf("%s → %s: Location %q, want %q", c.target, c.loc, got, c.want)
 		}
-		return rec
 	}
-	rec := post("/profiles/backup/use")
-	if c := rec.Result().Cookies(); len(c) == 0 || !slices.ContainsFunc(c, func(c *http.Cookie) bool { return c.Name == profileCookie && c.Value == "backup" }) {
-		t.Fatalf("Select sets no cookie: %v (status %d)", c, rec.Code)
+
+	// The profile bar on a profile page; none elsewhere.
+	tabs := profileBar("/channel", "backup")
+	if len(tabs) != 2 || tabs[0].URL != "/channel?profile=backup" || !tabs[0].Current || tabs[1].URL != "/channel?profile=cloud" || tabs[1].Current {
+		t.Fatalf("bar %+v", tabs)
 	}
-	if loc := rec.Header().Get("Location"); loc != "/" {
-		t.Fatalf("redirect %q: an outside back= must not be followed", loc)
+	if profileBar("/", "backup") != nil || profileBar("/mount", "backup") != nil {
+		t.Fatal("the dashboard and the mounts page are about every profile")
 	}
-	if config.ActiveProfile() != "cloud" {
-		t.Fatal("Select changed the CLI default")
+
+	// Rendered: the layout's bar, the page's profile in the poll and forms.
+	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder(), req: get("/telegram?profile=backup"), csrf: "0123456789abcdef0123456789abcdef"}
+	files := []string{"templates/layout.html", "templates/telegram.html", "templates/partials/telegram.html"}
+	tm := template.Must(template.New("").Funcs(funcsFor(rec)).ParseFS(templatesFS, files...))
+	var b bytes.Buffer
+	if err := tm.ExecuteTemplate(&b, "layout", tgPageData{pageBase: pageBase{CSRF: "c"}, Profile: "backup"}); err != nil {
+		t.Fatal(err)
 	}
-	post("/profiles/backup/default")
+	out := b.String()
+	for _, want := range []string{`class="profile-bar"`, `href="/telegram?profile=cloud"`, `class="active" aria-current="page">backup`,
+		`hx-get="/partials/telegram?profile=backup"`, `name="profile" value="backup"`, `href="/state?profile=backup"`, `/static/style.css?v=`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("telegram page lacks %q", want)
+		}
+	}
+	if strings.Contains(out, "profile-switch") || strings.Contains(out, "/use\"") {
+		t.Error("no switcher, no Select")
+	}
+
+	// Make CLI default is the one profile action left.
+	s := &Server{state: NewState()}
+	r := httptest.NewRequest("POST", "/profiles/backup/default", strings.NewReader("csrf=0123456789abcdef0123456789abcdef"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: csrfCookie, Value: "0123456789abcdef0123456789abcdef"})
+	r.SetPathValue("name", "backup")
+	s.profilesDefault(httptest.NewRecorder(), r)
 	if config.ActiveProfile() != "backup" {
 		t.Fatal("Make CLI default did not")
 	}
@@ -300,31 +302,6 @@ func TestUXHelpers(t *testing.T) {
 	l.Staging.Blocked = true
 	if l.StagingKind() != "err" {
 		t.Error("writes waiting is red")
-	}
-}
-
-// The masthead's profile switcher: every other profile is one POST form
-// with the browser's CSRF token and the page to return to.
-func TestMastheadProfileSwitcher(t *testing.T) {
-	isolate(t)
-	mkProfile(t, "backup", "b", true)
-	mkProfile(t, "cloud", "c", true)
-	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder(), profile: "cloud", csrf: "0123456789abcdef0123456789abcdef", path: "/state?profile=cloud"}
-	files := []string{"templates/layout.html", "templates/telegram.html", "templates/partials/telegram.html"}
-	tm := template.Must(template.New("").Funcs(funcsFor(rec)).ParseFS(templatesFS, files...))
-	var b bytes.Buffer
-	if err := tm.ExecuteTemplate(&b, "layout", tgPageData{Profile: "cloud"}); err != nil {
-		t.Fatal(err)
-	}
-	out := b.String()
-	for _, want := range []string{`class="nav-group profile-switch"`, `cloud ▾`, `action="/profiles/backup/use"`,
-		`value="0123456789abcdef0123456789abcdef"`, `name="back" value="/state?profile=cloud"`, `cloud · selected`} {
-		if !strings.Contains(out, want) {
-			t.Errorf("masthead lacks %q", want)
-		}
-	}
-	if strings.Contains(out, `action="/profiles/cloud/use"`) {
-		t.Error("the selected profile is no switch target")
 	}
 }
 

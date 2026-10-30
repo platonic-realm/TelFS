@@ -1,7 +1,7 @@
 {{define "content"}}
 {{if .NeedSecret}}
-<form hx-post="/setup/channels" hx-target="this" hx-swap="outerHTML" autocomplete="off">
-  <input type="hidden" name="csrf" value="{{.CSRF}}">
+<form hx-post="{{pp "/setup/channels"}}" hx-target="this" hx-swap="outerHTML" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">{{profileField}}
   <label>Secret for this profile (to open the Telegram session)
     <input type="password" name="secret" required autocomplete="current-password" autofocus>
   </label>
@@ -10,7 +10,7 @@
 {{else if .Error}}
 <p class="flash error">channel scan: {{.Error}}</p>
 {{else if not .Channels}}
-<p><em>No channels found. Create a private channel in the Telegram app, then <a href="/setup">reload</a>.</em></p>
+<p><em>No channels found. Create a private channel in the Telegram app, then <a href="{{pp "/setup"}}">reload</a>.</em></p>
 {{else}}
 <table>
   <thead><tr><th>Title</th><th>ID</th><th>Post</th><th class="actions"></th></tr></thead>
@@ -23,7 +23,7 @@
     <td class="actions">
       {{if .CanPost}}
       <form method="post" action="/channel/set">
-        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">{{profileField}}
         <input type="hidden" name="from" value="setup">
         <input type="hidden" name="id" value="{{.ID}}">
         <input type="hidden" name="access_hash" value="{{.AccessHash}}">

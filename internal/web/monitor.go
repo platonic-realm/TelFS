@@ -23,8 +23,7 @@ import (
 // tables and the masthead lamps. Several profiles can run at once (on S9
 // the backup and cloud daemons), so each profile is read on its own — from
 // its daemon's control socket when one runs, from its local state
-// otherwise. Nothing here depends on the selected (active) profile: the
-// selection only decides what the Setup, Browse and State pages act on.
+// otherwise.
 
 // liveStatus is the part of a daemon's GET /status (schema 1, spec v1 §3)
 // the dashboard shows.
@@ -116,7 +115,6 @@ func (f fsView) ShortUUID() string {
 // profileMonitor is one profile's row.
 type profileMonitor struct {
 	Name     string
-	Selected bool
 	Identity string
 	Channel  channelView
 	Err      string // the profile's config could not be read
@@ -153,7 +151,7 @@ const (
 
 // monitorProfiles reads every profile, concurrently (one wedged daemon
 // costs its 2 s timeout once, not once per profile).
-func monitorProfiles(ctx context.Context, level monLevel, selected string) []profileMonitor {
+func monitorProfiles(ctx context.Context, level monLevel) []profileMonitor {
 	names := listProfileNames()
 	out := make([]profileMonitor, len(names))
 	var wg sync.WaitGroup
@@ -161,15 +159,15 @@ func monitorProfiles(ctx context.Context, level monLevel, selected string) []pro
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			out[i] = monitorProfile(ctx, name, name == selected, level)
+			out[i] = monitorProfile(ctx, name, level)
 		}()
 	}
 	wg.Wait()
 	return out
 }
 
-func monitorProfile(ctx context.Context, name string, selected bool, level monLevel) profileMonitor {
-	pm := profileMonitor{Name: name, Selected: selected}
+func monitorProfile(ctx context.Context, name string, level monLevel) profileMonitor {
+	pm := profileMonitor{Name: name}
 	dir, err := config.ProfileDir(name)
 	if err != nil {
 		pm.Err = err.Error()
@@ -295,8 +293,8 @@ func ago(unix int64) string {
 }
 
 // lampProfiles are the profiles the masthead shows: those with a
-// filesystem or a running daemon. With none, the selected profile alone
-// (its lamps then say what is missing).
+// filesystem or a running daemon — or, before any has one, all of them
+// (their lamps then say what is missing).
 func lampProfiles(all []profileMonitor) []profileMonitor {
 	var out []profileMonitor
 	for _, p := range all {
@@ -305,11 +303,7 @@ func lampProfiles(all []profileMonitor) []profileMonitor {
 		}
 	}
 	if len(out) == 0 {
-		for _, p := range all {
-			if p.Selected {
-				out = append(out, p)
-			}
-		}
+		return all
 	}
 	return out
 }

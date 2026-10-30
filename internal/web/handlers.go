@@ -42,6 +42,9 @@ type dashboardData struct {
 	Profiles  []string
 	Active    string
 	Setup     setupChecklist
+	// Setups are the checklists the dashboard shows: one per profile
+	// with a step still open (or the first step when there is none).
+	Setups []profileSetup
 	// Monitors is every profile's row (dashboard tables); MountList every
 	// TelFS mount on the machine with the profile it serves.
 	Monitors  []profileMonitor
@@ -106,8 +109,9 @@ type flashData struct{ Kind, Msg string }
 // profile's channel and filesystem, then every TelFS mount.
 func (s *Server) dashboardIndex(w http.ResponseWriter, r *http.Request) {
 	d := s.loadDashboard(r.Context(), w, r)
-	d.Monitors = monitorProfiles(r.Context(), monFull, profileOf(r))
+	d.Monitors = monitorProfiles(r.Context(), monFull)
 	d.MountList = mountList()
+	d.Setups = setupsToFinish(d.Setup)
 	s.renderTemplateWith(w, "dashboard.html", d, "templates/partials/profiles.html")
 }
 
@@ -123,7 +127,7 @@ type profilesPanelData struct {
 // sees it. EnsureCSRF reuses the browser's token (no rotation), so the
 // table's Select buttons keep working across polls.
 func (s *Server) profilesPartial(w http.ResponseWriter, r *http.Request) {
-	d := profilesPanelData{CSRF: s.state.EnsureCSRF(w, r), Monitors: monitorProfiles(r.Context(), monLive, profileOf(r))}
+	d := profilesPanelData{CSRF: s.state.EnsureCSRF(w, r), Monitors: monitorProfiles(r.Context(), monLive)}
 	s.renderPartialBlock(w, "partials/profiles.html", "profiles_panel", d)
 }
 
@@ -381,6 +385,37 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 // the conceptual prerequisites: API creds → login → channel → optional
 // encryption → mount. The first not-done step gets a Why message; the
 // dashboard template renders that prominently.
+// profileSetup is one profile's checklist on the dashboard.
+type profileSetup struct {
+	Profile string
+	Setup   setupChecklist
+}
+
+// setupsToFinish is every profile whose setup has a step open — each
+// profile's own checklist, its links carrying the profile. With no profile
+// at all, the first step alone.
+func setupsToFinish(none setupChecklist) []profileSetup {
+	names := listProfileNames()
+	if len(names) == 0 {
+		return []profileSetup{{Setup: none}}
+	}
+	var out []profileSetup
+	for _, n := range names {
+		cfg, err := loadProfileCfg(n)
+		if err != nil {
+			continue
+		}
+		d := dashboardData{Active: n}
+		if cfg.Channel.ID != 0 {
+			d.Channel = channelView{Set: true, ID: cfg.Channel.ID, Title: cfg.Channel.Title}
+		}
+		if c := buildSetupChecklist(d, cfg); !c.Complete {
+			out = append(out, profileSetup{Profile: n, Setup: c})
+		}
+	}
+	return out
+}
+
 func buildSetupChecklist(d dashboardData, cfg *config.Config) setupChecklist {
 	apiOK := cfg != nil && cfg.APIID != 0 && cfg.APIHash != ""
 	// Authenticated means the LOGIN COMPLETED — [identity] is written
@@ -444,7 +479,7 @@ func buildSetupChecklist(d dashboardData, cfg *config.Config) setupChecklist {
 			Key:     "auth",
 			Label:   "Authenticate (phone)",
 			Done:    sessionOK,
-			Href:    "/login/phone",
+			Href:    withProfile("/login/phone", d.Active),
 			Why:     "Phone → code → 2FA password (if set). The first login locks the profile to your account.",
 			Detail:  "Telegram sends a 5-digit code via SMS or the app's notifications; accounts with two-step verification also enter their password. The resulting session locks the profile to your account.",
 			Outcome: "session.enc (encrypted with the profile's secret) appears in the profile directory; subsequent mounts won't prompt for a code.",
@@ -454,7 +489,7 @@ func buildSetupChecklist(d dashboardData, cfg *config.Config) setupChecklist {
 			Key:     "channel",
 			Label:   "Bind a private channel",
 			Done:    channelOK,
-			Href:    "/channel",
+			Href:    withProfile("/channel", d.Active),
 			Why:     "Pick the channel TelFS will store chunks in. Creating a private channel first in the Telegram app is the smoothest path.",
 			Detail:  "The list below enumerates your channels from your dialogs; picking one resolves its access_hash automatically. Chunks and snapshots for this filesystem will live as messages in that channel.",
 			Outcome: "config.toml's [channel] block has id + access_hash set; the dashboard's Channel card lights up.",
@@ -464,7 +499,7 @@ func buildSetupChecklist(d dashboardData, cfg *config.Config) setupChecklist {
 			Key:      "init",
 			Label:    "Create the filesystem",
 			Done:     fsOK,
-			Href:     "/setup",
+			Href:     withProfile("/setup", d.Active),
 			Why:      "A new filesystem on this channel — always encrypted. Skip this if the channel already holds one: the mount recovers it.",
 			Detail:   "Creates the filesystem's random data key, wraps it under the profile's secret, posts the key header as a pinned message in the channel, and takes the first snapshot. Everything TelFS posts from now on is encrypted: chunks, captions, snapshots and the journal; only message sizes and times stay visible. The chunk size and compression are fixed from here on. Zstd shrinks text, code and documents before encryption; media and archives gain nothing.",
 			Outcome:  "The key message is pinned in the channel; `telfs key export` prints the export to keep with the secret.",
@@ -475,7 +510,7 @@ func buildSetupChecklist(d dashboardData, cfg *config.Config) setupChecklist {
 			Key:     "mount",
 			Label:   "Mount it",
 			Done:    mountedOK,
-			Href:    "/mount/new",
+			Href:    withProfile("/mount/new", d.Active),
 			Why:     "Start the FUSE daemon. Files written to the mountpoint flow through the chunk pipeline to the channel.",
 			Detail:  "Pick a mountpoint (any empty directory). The web server launches a `telfs mount` child process and tracks it for you — start, stop, and tail the log from the Mounts page. The mount survives `telfs web` restarts via /proc/mounts reconciliation.",
 			Outcome: "A `fuse.telfs` entry shows up in `mount`; the Browse page shows the files.",
@@ -637,7 +672,6 @@ type profilesListData struct {
 	CSRF     string
 	Flash    flashData
 	Path     string
-	Active   string // the profile this browser has selected
 	Default  string // the CLI's default (~/.config/telfs/active)
 	Profiles []string
 }
@@ -648,7 +682,6 @@ func (s *Server) profilesList(w http.ResponseWriter, r *http.Request) {
 		CSRF:     s.state.EnsureCSRF(w, r),
 		Flash:    flashData{kind, msg},
 		Path:     r.URL.Path,
-		Active:   profileOf(r),
 		Default:  config.ActiveProfile(),
 		Profiles: listProfileNames(),
 	}
@@ -723,19 +756,17 @@ func (s *Server) profilesCreate(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
-	// A new profile is the one to configure next: this browser selects it
-	// (the wizard's remaining steps act on the selection). It becomes the
-	// CLI's default too when there is none yet, so `telfs` commands work.
-	setSelected(w, name)
+	// The new profile is the one to configure next: the wizard goes on
+	// with it (its pages carry ?profile=). It becomes the CLI's default
+	// too when there is none yet, so `telfs` commands work.
 	if config.ActiveProfile() == "" {
 		_ = config.SetActiveProfile(name)
 	}
+	SetFlash(w, "ok", fmt.Sprintf("created profile %q", name))
 	if r.FormValue("from") == "setup" {
-		SetFlash(w, "ok", fmt.Sprintf("created profile %q — selected", name))
-		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		http.Redirect(w, r, withProfile("/setup", name), http.StatusSeeOther)
 		return
 	}
-	SetFlash(w, "ok", fmt.Sprintf("created profile %q — selected", name))
 	http.Redirect(w, r, "/profiles/"+name, http.StatusSeeOther)
 }
 
@@ -744,7 +775,6 @@ type profileShowData struct {
 	Flash      flashData
 	Path       string
 	Name       string
-	Active     string // the profile this browser has selected
 	Default    string // the CLI's default (~/.config/telfs/active)
 	Dir        string
 	APIID      int
@@ -771,7 +801,6 @@ func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
 		CSRF:    s.state.EnsureCSRF(w, r),
 		Path:    r.URL.Path,
 		Name:    name,
-		Active:  profileOf(r),
 		Default: config.ActiveProfile(),
 	}
 	kind, msg := ConsumeFlash(w, r)
@@ -879,24 +908,6 @@ func (s *Server) profilesSetAPI(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
-func (s *Server) profilesUse(w http.ResponseWriter, r *http.Request) {
-	if err := s.state.CheckCSRF(r); err != nil {
-		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
-		return
-	}
-	name := r.PathValue("name")
-	if !profileExists(name) {
-		SetFlash(w, "error", fmt.Sprintf("no profile %q", name))
-		http.Redirect(w, r, "/profiles", http.StatusSeeOther)
-		return
-	}
-	// The browser's choice only (v1.1 W1): the CLI's default and other
-	// browsers are untouched.
-	setSelected(w, name)
-	SetFlash(w, "ok", fmt.Sprintf("selected profile %s — the Setup, Browse and State pages act on it", name))
-	http.Redirect(w, r, localBack(r, "/"), http.StatusSeeOther)
-}
-
 // profilesDefault makes a profile the CLI's default (~/.config/telfs/active,
 // what `telfs profile use` writes) — separate from the console's selection.
 func (s *Server) profilesDefault(w http.ResponseWriter, r *http.Request) {
@@ -911,16 +922,6 @@ func (s *Server) profilesDefault(w http.ResponseWriter, r *http.Request) {
 		SetFlash(w, "ok", fmt.Sprintf("%s is now the CLI's default profile (telfs commands without TELFS_PROFILE use it)", name))
 	}
 	http.Redirect(w, r, "/profiles/"+name, http.StatusSeeOther)
-}
-
-// localBack is the form's "back" field when it is a local path, else def
-// (never an open redirect).
-func localBack(r *http.Request, def string) string {
-	b := r.FormValue("back")
-	if strings.HasPrefix(b, "/") && !strings.HasPrefix(b, "//") && !strings.Contains(b, "\\") {
-		return b
-	}
-	return def
 }
 
 func (s *Server) profilesDelete(w http.ResponseWriter, r *http.Request) {
@@ -959,7 +960,7 @@ func (s *Server) profilesDelete(w http.ResponseWriter, r *http.Request) {
 		if err := config.ClearActiveProfile(); err != nil {
 			SetFlash(w, "error", fmt.Sprintf("deleted profile %q but could not clear the active selection: %v", name, err))
 		} else {
-			SetFlash(w, "ok", fmt.Sprintf("deleted profile %q — it was the active profile, so none is selected now", name))
+			SetFlash(w, "ok", fmt.Sprintf("deleted profile %q — it was the CLI default, so none is set now", name))
 		}
 	} else {
 		SetFlash(w, "ok", fmt.Sprintf("deleted profile %q", name))

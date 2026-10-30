@@ -11,7 +11,7 @@
   <p><span class="pill warn">mounted</span> The session is in use by the mount at <code>{{.Mountpoint}}</code>. Stop the mount on the <a href="/mount">Mounts page</a> before logging out.</p>
   {{else}}
   <form method="post" action="/login/logout" onsubmit="return confirm('Log out {{.Identity}}? The channel binding is kept — logging back into the SAME account resumes where you left off. A different account must re-bind the channel.');">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">{{profileField}}
     <button type="submit" class="danger">Log out</button>
   </form>
   {{end}}
@@ -20,7 +20,7 @@
 {{else}}
 <h2>Phone login · step 1 of 3</h2>
 <form method="post" action="/login/phone/start" autocomplete="off">
-  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">{{profileField}}
   {{if .NeedAPI}}
   <fieldset>
     <legend>API credentials</legend>

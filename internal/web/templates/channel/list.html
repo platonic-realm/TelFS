@@ -2,7 +2,7 @@
 <h2>Your channels</h2>
 {{if .NeedSecret}}
 <form method="post" action="/channel/list" autocomplete="off">
-  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">{{profileField}}
   {{template "secretfield" .}}
   <button type="submit">List my channels</button>
 </form>
@@ -24,5 +24,5 @@
 {{end}}
 </table>
 {{end}}
-<p><a href="/channel" class="btn">Back</a></p>
+<p><a href="{{pp "/channel"}}" class="btn">Back</a></p>
 {{end}}

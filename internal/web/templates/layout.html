@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TelFS</title>
-<link rel="stylesheet" href="/static/style.css">
-<script src="/static/htmx.min.js" defer></script>
-<script src="/static/ui.js" defer></script>
+<link rel="stylesheet" href="{{asset "style.css"}}">
+<script src="{{asset "htmx.min.js"}}" defer></script>
+<script src="{{asset "ui.js"}}" defer></script>
 </head>
 <body>
 <header>
@@ -16,36 +16,21 @@
     <a href="/" class="{{activeNav .Path "/"}}">Dashboard</a>
     <a href="/browse" class="{{activeNav .Path "/browse"}}">Browse</a>
     <a href="/mount" class="{{activeNav .Path "/mount"}}">Mounts</a>
-    <a href="/telegram" class="{{activeNav .Path "/telegram"}}">Telegram</a>
-    <a href="/state" class="{{activeNav .Path "/state"}}">State</a>
+    <a href="{{pp "/telegram"}}" class="{{activeNav .Path "/telegram"}}">Telegram</a>
+    <a href="{{pp "/state"}}" class="{{activeNav .Path "/state"}}">State</a>
     <details class="nav-group">
       <summary>Setup ▾</summary>
       <div class="nav-menu">
-        <a href="/setup" class="{{activeNav .Path "/setup"}}">Guided wizard</a>
+        <a href="{{pp "/setup"}}" class="{{activeNav .Path "/setup"}}">Guided wizard</a>
         <a href="/profiles" class="{{activeNav .Path "/profiles"}}">Profiles</a>
-        <a href="/login" class="{{activeNav .Path "/login"}}">Login</a>
-        <a href="/channel" class="{{activeNav .Path "/channel"}}">Channel</a>
-        <a href="/encrypt" class="{{activeNav .Path "/encrypt"}}">Encryption</a>
-        <a href="/compression" class="{{activeNav .Path "/compression"}}">Compression</a>
+        <a href="{{pp "/login"}}" class="{{activeNav .Path "/login"}}">Login</a>
+        <a href="{{pp "/channel"}}" class="{{activeNav .Path "/channel"}}">Channel</a>
+        <a href="{{pp "/encrypt"}}" class="{{activeNav .Path "/encrypt"}}">Encryption</a>
+        <a href="{{pp "/compression"}}" class="{{activeNav .Path "/compression"}}">Compression</a>
       </div>
     </details>
   </nav>
   <div class="header-extras">
-    {{$sel := activeProfile}}
-    <details class="nav-group profile-switch">
-      <summary class="pill acc" title="The profile the Setup, Browse and State pages act on (this browser) — click to switch; the lamps show every profile">{{with $sel}}{{.}}{{else}}no profile{{end}} ▾</summary>
-      <div class="nav-menu">
-        {{range profiles}}
-          {{if eq . $sel}}<span class="nav-menu-item current">{{.}} · selected</span>
-          {{else}}<form method="post" action="/profiles/{{.}}/use">
-            <input type="hidden" name="csrf" value="{{csrfToken}}">
-            <input type="hidden" name="back" value="{{requestPath}}">
-            <button type="submit" class="nav-menu-item">{{.}}</button>
-          </form>{{end}}
-        {{end}}
-        <a href="/profiles">Manage profiles →</a>
-      </div>
-    </details>
     <span id="health-pill" class="lamp-sets"
           hx-get="/partials/health" hx-trigger="load, every 5s" hx-swap="outerHTML"><span class="pill muted" title="Loading…">link…</span></span>
     <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode">◐</button>
@@ -53,6 +38,12 @@
   </div>
 </header>
 <main>
+{{with profileBar}}
+<nav class="profile-bar" aria-label="Profile">
+  <span class="profile-bar-label">Profile</span>
+  {{range .}}<a href="{{.URL}}"{{if .Current}} class="active" aria-current="page"{{end}}>{{.Name}}</a>{{end}}
+</nav>
+{{end}}
 {{if .Flash.Msg}}<div class="flash {{.Flash.Kind}}">{{.Flash.Msg}}</div>{{end}}
 {{template "content" .}}
 </main>

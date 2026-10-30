@@ -1,13 +1,14 @@
 {{define "content"}}
 {{template "profiles_panel" .}}
 
-{{/* Shown only while a step is open; once configured, every step stays reachable from the Setup menu. */}}
-{{if not .Setup.Complete}}
-<section class="card" id="setup-checklist">
-  <h3>Setup &amp; configuration <small>— profile {{.Profile}}: complete these to start using it</small></h3>
-  <p><a href="/setup" class="btn primary">Open the guided setup →</a></p>
+{{/* One card per profile with a step still open; once configured, every step stays reachable from the Setup menu. */}}
+{{range .Setups}}
+<section class="card" id="setup-checklist{{with .Profile}}-{{.}}{{end}}">
+  <h3>Setup &amp; configuration <small>— {{if .Profile}}profile {{.Profile}}: complete these to start using it{{else}}complete these to start using TelFS{{end}}</small></h3>
+  <p><a href="{{if .Profile}}/setup?profile={{.Profile}}{{else}}/setup{{end}}" class="btn primary">Open the guided setup →</a></p>
   <ol class="plain">
     {{$nextSurfaced := false}}
+    {{$setupURL := "/setup"}}{{with .Profile}}{{$setupURL = printf "/setup?profile=%s" .}}{{end}}
     {{range .Setup.Steps}}
     <li class="setup-step">
       {{if .Done}}
@@ -26,7 +27,7 @@
         {{if .Detail}}<div class="setup-detail"><small>{{md .Detail}}</small></div>{{end}}
         <div class="setup-cta">
           <a href="{{.Href}}" class="btn primary">{{if .CTA}}{{.CTA}}{{else}}Open this step{{end}} →</a>
-          <a href="/setup" class="btn muted">Use the full wizard</a>
+          <a href="{{$setupURL}}" class="btn muted">Use the full wizard</a>
         </div>
         {{$nextSurfaced = true}}
       {{end}}
@@ -43,7 +44,7 @@
     <thead><tr><th>Profile</th><th>Channel</th><th class="num">Channel ID</th><th>Account</th></tr></thead>
     <tbody>
     {{range .Monitors}}
-    <tr{{if .Selected}} class="selected"{{end}}>
+    <tr>
       <td><a href="/profiles/{{.Name}}">{{.Name}}</a></td>
       <td>{{if .Channel.Set}}{{.Channel.Title}}{{else}}<small>none bound</small>{{end}}</td>
       <td class="num">{{if .Channel.Set}}<code>{{.Channel.ID}}</code>{{end}}</td>
@@ -62,7 +63,7 @@
     <thead><tr><th>Profile</th><th>Filesystem</th><th>Last snapshot</th><th>Versions</th><th class="num">Local DB</th><th class="num">Cache</th></tr></thead>
     <tbody>
     {{range .Monitors}}
-    <tr{{if .Selected}} class="selected"{{end}}>
+    <tr>
       <td><a href="/profiles/{{.Name}}">{{.Name}}</a></td>
       {{if .HasDB}}
       <td>

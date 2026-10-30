@@ -14,8 +14,8 @@
 
 <p>
   {{if and .HasAPI .HasAuth}}
-  <a href="/channel/list" class="btn">List my channels</a>
+  <a href="{{pp "/channel/list"}}" class="btn">List my channels</a>
   {{end}}
-  <a href="/channel/set" class="btn">Set channel manually</a>
+  <a href="{{pp "/channel/set"}}" class="btn">Set channel manually</a>
 </p>
 {{end}}

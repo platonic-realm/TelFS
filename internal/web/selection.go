@@ -1,41 +1,46 @@
 package web
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 
 	"telfs/internal/config"
 )
 
-// The profile the console's pages act on is chosen per browser (v1.1 W1),
-// not by the global active file: S9's services run two profiles at once
-// and set no active profile, and every page used to say "no active
-// profile". The selection is, in order:
-//
-//  1. the browser's choice (cookie telfs_profile, set by Select);
-//  2. the CLI's default (~/.config/telfs/active), if it names a profile;
-//  3. the first profile.
-//
-// Monitoring (dashboard, masthead lamps, the Telegram page) shows every
-// profile whatever is selected. A page may still show another profile for
-// one request with ?profile=NAME (requestProfile). Making a profile the
-// CLI's default stays an explicit action (POST /profiles/{name}/default).
+// Which profile a page is about. The console shows every profile at once
+// (dashboard, masthead lamps), so there is no "selected" profile: a page
+// about ONE profile says which in its address — ?profile=NAME — and shows
+// a profile bar to switch (v1.1, Arash: "selecting a profile doesn't make
+// sense when more than one can be displayed"). Forms carry the profile in
+// a hidden field, redirects to profile pages get it appended (the
+// response recorder), and without one a page shows the default profile:
+// the CLI's default (~/.config/telfs/active) if it names a profile, else
+// the first. Making a profile the CLI's default stays an explicit action
+// (POST /profiles/{name}/default).
 
-const profileCookie = "telfs_profile"
-
-type selectedKey struct{}
-
-// noProfileErr is what a page says when there is no profile at all.
+// errNoProfile is what a page says when there is no profile at all.
 var errNoProfile = errors.New("no profile yet — create one (Setup → Profiles)")
 
-// selectedProfile resolves the request's profile ("" when there is none).
-func selectedProfile(r *http.Request) string {
-	if c, err := r.Cookie(profileCookie); err == nil && profileExists(c.Value) {
-		return c.Value
+// profilePages are the pages about one profile: they show the profile bar
+// and their redirects carry the profile.
+var profilePages = []string{"/setup", "/login", "/channel", "/encrypt", "/compression", "/telegram", "/state"}
+
+// isProfilePage reports whether path is (under) one of profilePages.
+func isProfilePage(path string) bool {
+	for _, p := range profilePages {
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
 	}
+	return false
+}
+
+// defaultProfile is the profile a page shows without ?profile=.
+func defaultProfile() string {
 	if a := config.ActiveProfile(); a != "" && profileExists(a) {
 		return a
 	}
@@ -58,22 +63,31 @@ func profileExists(name string) bool {
 	return err == nil && fi.IsDir()
 }
 
-// withSelection puts the request's profile into its context (middleware).
-func withSelection(r *http.Request) (*http.Request, string) {
-	sel := selectedProfile(r)
-	return r.WithContext(context.WithValue(r.Context(), selectedKey{}, sel)), sel
-}
-
-// profileOf is the profile this request acts on.
+// profileOf is the profile a request is about: its profile field (query or
+// form) when it names one, else the default.
 func profileOf(r *http.Request) string {
-	if v, ok := r.Context().Value(selectedKey{}).(string); ok {
-		return v
+	if p := strings.TrimSpace(r.FormValue("profile")); profileExists(p) {
+		return p
 	}
-	return selectedProfile(r)
+	return defaultProfile()
 }
 
-// loadCfg loads the request's profile. It never creates a profile
-// directory (config.LoadFromDir would).
+// queryProfile is profileOf without reading a request body (the
+// middleware: some handlers stream their own body). A form already parsed
+// by the handler counts.
+func queryProfile(r *http.Request) string {
+	vals := r.URL.Query()
+	if r.Form != nil {
+		vals = r.Form
+	}
+	if p := strings.TrimSpace(vals.Get("profile")); profileExists(p) {
+		return p
+	}
+	return defaultProfile()
+}
+
+// loadCfg loads the profile the request is about. It never creates a
+// profile directory (config.LoadFromDir would).
 func loadCfg(r *http.Request) (*config.Config, error) {
 	return loadProfileCfg(profileOf(r))
 }
@@ -92,23 +106,34 @@ func loadProfileCfg(name string) (*config.Config, error) {
 	return config.LoadFromDir(dir)
 }
 
-// setSelected remembers the browser's choice of profile.
-func setSelected(w http.ResponseWriter, name string) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     profileCookie,
-		Value:    name,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   365 * 24 * 60 * 60,
-	})
+// withProfile adds ?profile=NAME to a local URL that has none.
+func withProfile(u, name string) string {
+	if name == "" || strings.Contains(u, "profile=") {
+		return u
+	}
+	sep := "?"
+	if strings.Contains(u, "?") {
+		sep = "&"
+	}
+	return u + sep + "profile=" + url.QueryEscape(name)
 }
 
-// selectedFromWriter is the profile of the request a response belongs to
-// (the middleware's recorder carries it): the masthead names it.
-func selectedFromWriter(w http.ResponseWriter) string {
-	if sr, ok := w.(*statusRecorder); ok {
-		return sr.profile
+// profileTab is one entry of the profile bar.
+type profileTab struct {
+	Name    string
+	URL     string
+	Current bool
+}
+
+// profileBar is the bar a profile page shows (nil elsewhere): one tab per
+// profile, each the same page about that profile.
+func profileBar(path, current string) []profileTab {
+	if !isProfilePage(path) {
+		return nil
 	}
-	return ""
+	var tabs []profileTab
+	for _, n := range listProfileNames() {
+		tabs = append(tabs, profileTab{Name: n, URL: withProfile(path, n), Current: n == current})
+	}
+	return tabs
 }

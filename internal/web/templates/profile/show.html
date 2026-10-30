@@ -1,13 +1,6 @@
 {{define "content"}}
-<h2>Profile: {{.Name}}{{if eq .Name .Active}} <small>selected</small>{{end}}{{if eq .Name .Default}} <small>· CLI default</small>{{end}}</h2>
+<h2>Profile: {{.Name}}{{if eq .Name .Default}} <small>CLI default</small>{{end}}</h2>
 <div class="row profile-actions">
-  {{if ne .Name .Active}}
-  <form method="post" action="/profiles/{{.Name}}/use">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <input type="hidden" name="back" value="/profiles/{{.Name}}">
-    <button type="submit" class="primary" title="Make the Setup, Browse and State pages of this browser act on {{.Name}}">Select</button>
-  </form>
-  {{end}}
   {{if ne .Name .Default}}
   <form method="post" action="/profiles/{{.Name}}/default">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -16,10 +9,14 @@
   {{end}}
   <a class="btn secondary" href="/telegram?profile={{.Name}}">Telegram</a>
   <a class="btn secondary" href="/state?profile={{.Name}}">State</a>
+  <a class="btn secondary" href="/login?profile={{.Name}}">Login</a>
+  <a class="btn secondary" href="/channel?profile={{.Name}}">Channel</a>
+  <a class="btn secondary" href="/encrypt?profile={{.Name}}">Encryption</a>
+  <a class="btn secondary" href="/compression?profile={{.Name}}">Compression</a>
 </div>
 
-{{if and (eq .Name .Active) (or (not .Identity) (not .Channel.Set))}}
-<p><a href="/setup" class="btn primary">Continue the guided setup →</a></p>
+{{if or (not .Identity) (not .Channel.Set)}}
+<p><a href="/setup?profile={{.Name}}" class="btn primary">Continue the guided setup →</a></p>
 {{end}}
 
 <section class="card">
