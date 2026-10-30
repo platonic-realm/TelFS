@@ -1060,28 +1060,44 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}
 		mgrDone <- err
 	}()
-	select {
-	case err := <-firstConnect:
-		if err != nil {
+	// Boot without internet (v1.1 I2): a filesystem whose DB passed the
+	// channel check at an earlier mount mounts at once — local data is
+	// served while the network is still away; the first connection and
+	// the check run in the background, and a definite refusal there stops
+	// the daemon (exit 6), as it used to refuse the mount. A first mount,
+	// or one that just recovered the DB, still waits for both.
+	bootOffline := !dbMissing && channelCheckedBefore(signalCtx, metaStore)
+	if bootOffline {
+		fmt.Fprintln(os.Stderr, "channel checked at an earlier mount: mounting now; connecting to Telegram and checking the channel in the background")
+		go func() {
+			if err := backgroundPreflight(signalCtx, firstConnect, sess, metaStore); err != nil && signalCtx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "telfs: the channel refused this filesystem: %v — stopping\n", err)
+				bgRefusal.Store(&err)
+				_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			}
+		}()
+	} else {
+		select {
+		case err := <-firstConnect:
+			if err != nil {
+				stopMgr()
+				<-mgrDone
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				return fmt.Errorf("%w: %w", errTelegram, err)
+			}
+		case <-signalCtx.Done():
 			stopMgr()
 			<-mgrDone
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return fmt.Errorf("%w: %w", errTelegram, err)
+			return nil
 		}
-	case <-signalCtx.Done():
-		stopMgr()
-		<-mgrDone
-		return nil
-	}
 
-	// Preflight: fail fast (with the actor and the fix named) when the
-	// session identity doesn't match auth_mode or can't access the
-	// bound channel — otherwise the mount comes up "fine" and every
-	// channel RPC dies in a CHANNEL_INVALID retry storm only visible
-	// in the log.
-	{
+		// Preflight: fail fast (with the actor and the fix named) when the
+		// session identity doesn't match auth_mode or can't access the
+		// bound channel — otherwise the mount comes up "fine" and every
+		// channel RPC dies in a CHANNEL_INVALID retry storm only visible
+		// in the log.
 		svc.status("checking access to the channel")
 		verr := svc.retryAtBoot(signalCtx, "channel access", func(ctx context.Context) error {
 			verifyCtx, cancelVerify := context.WithTimeout(ctx, 30*time.Second)
@@ -1096,6 +1112,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			}
 			return fmt.Errorf("mount preflight: %w: %w", errTelegram, verr)
 		}
+		markChannelChecked(signalCtx, metaStore)
 	}
 
 	err = func() error {
@@ -1710,6 +1727,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// signals when the gotd client's run loop has fully torn down.
 	stopMgr()
 	<-mgrDone
+	if p := bgRefusal.Load(); p != nil {
+		return fmt.Errorf("mount preflight: %w: %w", errTelegram, *p)
+	}
 	// Treat clean cancellation as success — the user asked for unmount.
 	if errors.Is(err, context.Canceled) {
 		return nil

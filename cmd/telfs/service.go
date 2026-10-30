@@ -7,12 +7,15 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gotd/td/tgerr"
 
+	"telfs/internal/meta"
 	"telfs/internal/sdnotify"
 	"telfs/internal/tg"
 )
@@ -132,3 +135,72 @@ func (s *service) retryAtBoot(ctx context.Context, what string, step func(contex
 // owners and modes unless --no-default-permissions says otherwise. Without
 // --allow-other only the mounting user reaches the mount; no check needed.
 func ownerChecks(allowOther, optOut bool) bool { return allowOther && !optOut }
+
+// kvChannelChecked records (unix seconds) the last time this filesystem's
+// session reached its channel (VerifyAccess) — the "checked before" a
+// mount without internet relies on (v1.1 I2). Local only, never journaled.
+const kvChannelChecked = "channel_checked_unix"
+
+// bgPreflightRetry is the first wait between background channel checks.
+var bgPreflightRetry = 5 * time.Second
+
+// bgRefusal is set when the background channel check of a mount that came
+// up without waiting for Telegram is refused for good: the daemon stops and
+// exits 6 (errTelegram).
+var bgRefusal atomic.Pointer[error]
+
+func channelCheckedBefore(ctx context.Context, m *meta.Store) bool {
+	b, err := m.GetKV(ctx, kvChannelChecked)
+	return err == nil && len(b) > 0
+}
+
+func markChannelChecked(ctx context.Context, m *meta.Store) {
+	_ = m.PutKVUncounted(ctx, kvChannelChecked, []byte(strconv.FormatInt(time.Now().Unix(), 10)))
+}
+
+// backgroundPreflight is the channel check of a mount that came up without
+// waiting for Telegram: wait for the first connection, then VerifyAccess,
+// retrying while the network or Telegram is unreachable (5 s → 5 min) for
+// as long as the daemon runs. A definite refusal (channel gone, session
+// revoked, wrong account) is returned.
+func backgroundPreflight(ctx context.Context, firstConnect <-chan error, sess interface {
+	VerifyAccess(context.Context) error
+}, m *meta.Store) error {
+	select {
+	case err := <-firstConnect:
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+	case <-ctx.Done():
+		return nil
+	}
+	delay := bgPreflightRetry
+	for {
+		vctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := sess.VerifyAccess(vctx)
+		cancel()
+		if err == nil {
+			markChannelChecked(ctx, m)
+			fmt.Fprintln(os.Stderr, "channel check: ok")
+			return nil
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !retriable(err) {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "channel check: %v — retrying in %s\n", err, delay)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+		if delay *= 2; delay > 5*time.Minute {
+			delay = 5 * time.Minute
+		}
+	}
+}

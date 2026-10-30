@@ -13,6 +13,7 @@ import (
 
 	"github.com/gotd/td/tgerr"
 
+	"telfs/internal/meta"
 	"telfs/internal/tg"
 )
 
@@ -113,5 +114,52 @@ func TestServiceNotifications(t *testing.T) {
 func TestOwnerChecks(t *testing.T) {
 	if !ownerChecks(true, false) || ownerChecks(true, true) || ownerChecks(false, false) {
 		t.Fatal("default_permissions: on with --allow-other unless opted out, off without --allow-other")
+	}
+}
+
+type fakeVerify struct{ errs []error }
+
+func (f *fakeVerify) VerifyAccess(context.Context) error {
+	if len(f.errs) == 0 {
+		return nil
+	}
+	err := f.errs[0]
+	f.errs = f.errs[1:]
+	return err
+}
+
+// A mount that came up without waiting for Telegram (v1.1 I2) checks the
+// channel in the background: it waits out an unreachable network, marks the
+// DB checked once through, and returns a definite refusal.
+func TestBackgroundPreflight(t *testing.T) {
+	old := bgPreflightRetry
+	bgPreflightRetry = time.Millisecond
+	defer func() { bgPreflightRetry = old }()
+	ctx := context.Background()
+	m, err := meta.Open(filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if channelCheckedBefore(ctx, m) {
+		t.Fatal("a new DB is not checked")
+	}
+	connected := make(chan error, 1)
+	connected <- nil
+	if err := backgroundPreflight(ctx, connected, &fakeVerify{errs: []error{tg.ErrNotConnected, context.DeadlineExceeded}}, m); err != nil {
+		t.Fatalf("retriable errors are waited out: %v", err)
+	}
+	if !channelCheckedBefore(ctx, m) {
+		t.Fatal("a passed check marks the DB")
+	}
+	connected <- nil
+	refused := &tgerr.Error{Code: 400, Message: "CHANNEL_INVALID", Type: "CHANNEL_INVALID"}
+	if err := backgroundPreflight(ctx, connected, &fakeVerify{errs: []error{refused}}, m); !errors.Is(err, refused) {
+		t.Fatalf("a refusal is returned: %v", err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := backgroundPreflight(cctx, make(chan error), &fakeVerify{}, m); err != nil {
+		t.Fatalf("a stopping daemon is no refusal: %v", err)
 	}
 }

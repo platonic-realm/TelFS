@@ -989,7 +989,14 @@ For production, run it as a service: `telfs mount --service`
 - never prompts — a prompt-source profile exits 2 at once; the secret
   comes from a file or systemd's encrypted credentials (see
   [Secrets](#secrets));
-- waits while the network or Telegram is unreachable at boot: recovery
+- mounts at once without internet when it can: a filesystem whose
+  local DB reached its channel at an earlier mount is served from local
+  state right away (cached data, listings, writes into staging; reads of
+  uncached data fail after `[read] offline_timeout`), while the first
+  connection and the channel-access check run in the background — a
+  definite refusal there stops the daemon (exit 6);
+- otherwise (a first mount, or one that must recover its DB from the
+  channel) waits while the network or Telegram is unreachable: recovery
   and the channel-access check are retried (5 s doubling to 5 min) on
   network errors, timeouts and Telegram server errors only, and systemd
   is told why (`STATUS=`) and asked for more time
