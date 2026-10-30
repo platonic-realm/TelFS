@@ -1196,20 +1196,17 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		packer.SetWire(pipe.wc)
 		packer.SetPendingIndex(pendingIndex)
 		packer.SetDiskGate(stagingGate)
-		// Cancel pending wires on unlink. When a file is deleted while
-		// some of its chunks are still buffered in the packer (tar
-		// overwriting an extracted tree, rm -rf during an upload, etc.),
-		// uploading those chunks would just produce orphan TG messages
-		// that the packer's PutChunk then FK-rejects. DropInode pulls
-		// them from the queue before the upload happens — saving the
-		// bandwidth AND removing the log spam. Also clears any leftover
-		// index entries for the inode (DropByIno) since the packer
-		// can't reach the index from inside DropInode without help.
+		// Cancel pending uploads on unlink. When a file is deleted while
+		// some of its chunks still wait (tar overwriting an extracted
+		// tree, rm -rf during an upload, a file manager's delete),
+		// uploading them would only produce orphan TG messages that
+		// PutChunk then FK-rejects: the packer's queued chunks are pulled
+		// and every staged wire of the inode — the direct queue's too —
+		// is removed (chunk.DropStagedInode).
 		metaStore.SetInodeDeletedCallback(func(ino int64) {
-			if n := packer.DropInode(ino); n > 0 {
-				fmt.Fprintf(os.Stderr, "[packer] dropped %d pending wire(s) for unlinked ino=%d\n", n, ino)
+			if n := chunk.DropStagedInode(packer, pendingIndex, stagingGate, ino); n > 0 {
+				fmt.Fprintf(os.Stderr, "[staging] deleted ino=%d: dropped %d staged chunk(s) before upload\n", ino, n)
 			}
-			pendingIndex.DropByIno(ino)
 		})
 
 		backend := &telfsfs.Backend{

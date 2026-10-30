@@ -361,3 +361,58 @@ func TestDiskGateRemoveReleasesOnce(t *testing.T) {
 		t.Fatalf("used %d, want 20", used)
 	}
 }
+
+// A file deleted while its full-size chunks wait in the disk-backed queue:
+// the waiting chunks are dropped, never uploaded (S9, 2026-10-30: every one
+// was uploaded and then "dropped orphan chunk … kept for gc"). Only the
+// upload already in flight lands, and is dropped as an orphan.
+func TestQueueModeDeletedFileIsNotUploaded(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	pool, dir := newQueuePool(t, 1, 1<<20)
+	m.SetInodeDeletedCallback(func(ino int64) { DropStagedInode(nil, pool.PendingIndex, pool.Disk, ino) })
+	up := newStageUploader()
+	up.gate = make(chan struct{})
+	ino := newQueueFile(t, m, "f", 64)
+	w, err := NewWriter(ctx, m, newTestCache(t, nil), up, nil, nil, pool, nil, ino, 64, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteAt(ctx, bytes.Repeat([]byte("x"), 64*4), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); !ok(); time.Sleep(5 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for " + what)
+			}
+		}
+	}
+	// One upload in flight (held by the gate), three staged behind it.
+	waitFor("4 staged wires and 1 upload in flight", func() bool {
+		_, files := dirBytes(t, dir)
+		return files == 4 && up.calls.Load() == 1
+	})
+	if err := m.Unlink(ctx, meta.RootIno, "f"); err != nil {
+		t.Fatal(err)
+	}
+	// The callback runs asynchronously; the in-flight wire is removed too
+	// (its upload already holds the bytes).
+	waitFor("the deleted file's staged wires to go", func() bool { _, files := dirBytes(t, dir); return files == 0 })
+	close(up.gate)
+	waitFor("the queue to drain", func() bool { open, _ := pool.OpenStats(); return open == 0 })
+	if c := up.calls.Load(); c != 1 {
+		t.Fatalf("uploader called %d times, want 1 (only the upload already in flight)", c)
+	}
+	if used, _, _ := pool.Disk.Stats(); used != 0 {
+		t.Fatalf("staging gate still counts %d B", used)
+	}
+	if n := countRows(t, m, ino); n != 0 {
+		t.Fatalf("%d chunk rows for a deleted file", n)
+	}
+	w.Close()
+}

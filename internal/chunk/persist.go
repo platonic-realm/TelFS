@@ -73,6 +73,46 @@ func (p *PendingIndex) Lookup(ino int64, idx int32) (string, bool) {
 	return path, ok
 }
 
+// TakeByIno removes every entry for ino and returns their staged paths.
+func (p *PendingIndex) TakeByIno(ino int64) []string {
+	if p == nil {
+		return nil
+	}
+	var paths []string
+	p.mu.Lock()
+	for k, path := range p.m {
+		if k.Ino == ino {
+			paths = append(paths, path)
+			delete(p.m, k)
+		}
+	}
+	p.mu.Unlock()
+	return paths
+}
+
+// DropStagedInode cancels a deleted file's pending uploads: its chunks
+// still waiting in the packer are pulled out, and every staged wire of it
+// still on disk is removed, so a queued direct upload finds its wire gone
+// and drops the chunk instead of uploading it (the upload could only make
+// an orphan message: the chunk_map row's inode is gone). Before this, the
+// disk-backed queue (v1 row 9) uploaded every full-size chunk of a file
+// deleted while it waited — seen on S9 as a stream of "dropped orphan
+// chunk" lines. An upload already in flight still lands and is dropped as
+// an orphan. Inode numbers are never reused (AUTOINCREMENT), so a late call
+// can't hit a newer file. Returns how many staged chunks were dropped.
+func DropStagedInode(packer *Packer, idx *PendingIndex, gate *DiskGate, ino int64) int {
+	n := 0
+	if packer != nil {
+		n += packer.DropInode(ino)
+	}
+	for _, path := range idx.TakeByIno(ino) {
+		if gate.Remove(path) {
+			n++
+		}
+	}
+	return n
+}
+
 // DropByIno removes every entry for ino. Called by Packer.DropInode
 // when an unlink discards in-flight wires; mirrors what
 // DropInode + DeletePending do on disk so the next Reader fallback

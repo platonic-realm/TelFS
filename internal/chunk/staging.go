@@ -127,20 +127,21 @@ func (g *DiskGate) Release(n int64) {
 // Remove deletes a staged wire and releases its bytes — only when THIS call
 // removed the file, so two deleters (the uploader and an unlink, say) can
 // never release the same bytes twice. A nil gate just deletes.
-func (g *DiskGate) Remove(path string) {
+func (g *DiskGate) Remove(path string) bool {
 	if path == "" {
-		return
+		return false
 	}
 	var size int64
 	if fi, err := os.Stat(path); err == nil {
 		size = fi.Size()
 	}
 	if err := os.Remove(path); err != nil {
-		return // already gone (or not removable): nothing to release
+		return false // already gone (or not removable): nothing to release
 	}
 	if g != nil {
 		g.Release(size)
 	}
+	return true
 }
 
 // Stats reports the staged bytes, the cap and whether a writer is waiting.
