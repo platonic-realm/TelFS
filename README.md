@@ -257,7 +257,13 @@ second mount of the same profile (two daemons would share its
 database) and a read-write mount of a filesystem that is already
 mounted under any profile. The mount source in `/proc/mounts` is
 `telfs:<profile>:<fs_uuid>`, so every user and tool can see which
-filesystem is mounted where. **Nothing yet stops a second machine**
+filesystem is mounted where. A mount whose daemon died (crash, OOM,
+`kill -9`) stays in `/proc/mounts` answering "Transport endpoint is not
+connected"; the next `telfs mount` of that profile recognises it — it
+holds the profile lock, so no daemon of the profile is alive — lazily
+unmounts the dead entry on its own mountpoint and goes on (dead bind
+mounts of it elsewhere no longer block it; the log names them for
+their owner to remount). No `ExecStartPre=fusermount3 -uz` needed. **Nothing yet stops a second machine**
 from mounting the same channel read-write — two writers would silently
 lose each other's changes. Mount read-write in one place only; drill
 elsewhere with `--readonly`.

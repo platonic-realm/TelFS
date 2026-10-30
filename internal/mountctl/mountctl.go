@@ -469,7 +469,40 @@ var ErrNoDaemon = errors.New("no telfs mount daemon found")
 // fsUUID may be "" (not known yet, before recovery): then only the
 // profile is checked.
 func WriterConflict(profile, fsUUID string, readOnly bool) string {
-	return writerConflict(ScanMounts(), profile, fsUUID, readOnly)
+	return writerConflict(liveOnly(ScanMounts(), Dead), profile, fsUUID, readOnly)
+}
+
+// Dead reports a FUSE mount whose daemon is gone: the kernel answers
+// ENOTCONN ("Transport endpoint is not connected") for it — left behind by
+// a crash or a kill -9, as are bind-mount views of it. A mount whose
+// daemon merely hangs is not dead: the stat runs with a timeout and no
+// answer counts as alive. A dead mount serves nobody, so it is no writer
+// to guard against (v1.1 I7).
+func Dead(m Mount) bool { return deadPath(m.Point, 2*time.Second) }
+
+func deadPath(path string, timeout time.Duration) bool {
+	ch := make(chan error, 1)
+	go func() {
+		_, err := os.Stat(path)
+		ch <- err
+	}()
+	select {
+	case err := <-ch:
+		return errors.Is(err, syscall.ENOTCONN)
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// liveOnly drops the mounts dead reports dead.
+func liveOnly(mounts []Mount, dead func(Mount) bool) []Mount {
+	out := mounts[:0:0]
+	for _, m := range mounts {
+		if !dead(m) {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func writerConflict(mounts []Mount, profile, fsUUID string, readOnly bool) string {

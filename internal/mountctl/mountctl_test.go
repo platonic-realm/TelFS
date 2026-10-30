@@ -184,3 +184,28 @@ func TestFindByProfileVersionMounts(t *testing.T) {
 		t.Fatal("another profile matched")
 	}
 }
+
+// A dead mount (its daemon gone: the kernel answers ENOTCONN) blocks no
+// new mount — neither the profile's own leftover nor a bind view of it
+// (v1.1 I7); a live one still does.
+func TestWriterConflictSkipsDeadMounts(t *testing.T) {
+	mounts := []Mount{
+		{Source: "telfs:cloud:u1", Point: "/srv/mnt/cloud"},
+		{Source: "telfs:cloud:u1", Point: "/mnt/telfs"},
+	}
+	allDead := func(Mount) bool { return true }
+	if c := writerConflict(liveOnly(mounts, allDead), "cloud", "u1", false); c != "" {
+		t.Fatalf("dead mounts conflict: %s", c)
+	}
+	viewAlive := func(m Mount) bool { return m.Point != "/mnt/telfs" }
+	if c := writerConflict(liveOnly(mounts, viewAlive), "cloud", "u1", false); c == "" {
+		t.Fatal("a live mount of the profile must still conflict")
+	}
+	if len(mounts) != 2 {
+		t.Fatal("liveOnly changed its input")
+	}
+	// A path that answers (or does not exist) is not dead.
+	if deadPath(t.TempDir(), time.Second) || deadPath("/nonexistent/telfs", time.Second) {
+		t.Fatal("only ENOTCONN is dead")
+	}
+}

@@ -814,16 +814,19 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	// Single-writer guard (this machine): one daemon per profile, and no
 	// second read-write mount of a filesystem already mounted — checked
 	// by profile now, by fs_uuid once the DB is open. The profile lock
-	// closes the race of two mounts starting together (released by the
-	// kernel when this process ends, however it ends).
-	if c := mountctl.WriterConflict(cfg.ProfileName(), "", *readonly); c != "" {
-		return fmt.Errorf("mount: %s", c)
-	}
+	// comes first: it closes the race of two mounts starting together,
+	// and — released by the kernel when a daemon ends, however it ends —
+	// holding it proves no daemon of this profile is alive, so this
+	// profile's mounts the kernel reports dead are our own leftovers.
 	lock, err := lockProfile(cfg)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
+	clearDeadMounts(cfg.ProfileName(), mountpoint)
+	if c := mountctl.WriterConflict(cfg.ProfileName(), "", *readonly); c != "" {
+		return fmt.Errorf("mount: %s", c)
+	}
 
 	// --key-header recovers a MISSING local DB; with a DB present it
 	// would be silently ignored, so say so before the slow secret read.
@@ -2905,6 +2908,31 @@ func cmdDebugDumpMsg(ctx context.Context, msgID int) error {
 		_, err := sess.DownloadDocument(ctx, msgID, os.Stdout)
 		return err
 	})
+}
+
+// clearDeadMounts handles this profile's mounts left behind by a daemon
+// that died (crash, OOM, systemctl kill -s KILL): the kernel answers
+// ENOTCONN for them, and the next mount used to refuse with "profile … is
+// already mounted" (v1.1 I7). Called with the profile lock held, so no
+// daemon of this profile is alive. The dead mount on our own mountpoint is
+// lazily unmounted so we can mount there again; any other (a bind-mount
+// view of it) no longer blocks the mount — the guard skips dead mounts —
+// and is named for its owner to remount once this mount is up.
+func clearDeadMounts(profile, mountpoint string) {
+	for _, m := range mountctl.ScanMounts() {
+		if p, ok := mountctl.ProfileOf(m); !ok || p != profile || mountctl.VersionOf(m) != "" || !mountctl.Dead(m) {
+			continue
+		}
+		if m.Point != mountpoint {
+			fmt.Fprintf(os.Stderr, "note: %s is a dead view of profile %s's previous mount (its daemon is gone) — remount it once this mount is up\n", m.Point, profile)
+			continue
+		}
+		if err := mountctl.LazyUnmount(m.Point); err != nil {
+			fmt.Fprintf(os.Stderr, "profile %s's dead mount at %s could not be cleared: %v\n", profile, m.Point, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "cleared profile %s's dead mount at %s (its daemon was gone)\n", profile, m.Point)
+	}
 }
 
 // lockProfile takes an exclusive lock on <profile>/daemon.lock for the
