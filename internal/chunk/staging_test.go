@@ -514,3 +514,21 @@ func TestQueueKickRetries(t *testing.T) {
 		t.Fatalf("kicked %d jobs with none waiting", n)
 	}
 }
+
+// Room (statfs's free space, v1.1 S9): the staging filesystem's free space
+// above the min_free floor, never negative.
+func TestDiskGateRoom(t *testing.T) {
+	g := NewDiskGate(t.TempDir(), 1<<30, 5<<30)
+	g.statfs = func(string) (int64, error) { return 8 << 30, nil }
+	if room, ok := g.Room(); !ok || room != 3<<30 {
+		t.Fatalf("room %d %v", room, ok)
+	}
+	g.statfs = func(string) (int64, error) { return 1 << 30, nil }
+	if room, ok := g.Room(); !ok || room != 0 {
+		t.Fatalf("below the floor: %d %v", room, ok)
+	}
+	g.statfs = func(string) (int64, error) { return 0, errors.New("no") }
+	if _, ok := g.Room(); ok {
+		t.Fatal("unreadable free space is not known")
+	}
+}

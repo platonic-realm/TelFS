@@ -97,6 +97,18 @@ func (b *Backend) Shutdown(ctx context.Context) {
 	b.Pool.Shutdown()
 }
 
+// writeRoom is the space writes still have (see Statfs): 0 on a
+// read-only mount; ok false without a staging gate.
+func (b *Backend) writeRoom() (int64, bool) {
+	if b.ReadOnly {
+		return 0, true
+	}
+	if b.Pool == nil || b.Pool.Disk == nil {
+		return 0, false
+	}
+	return b.Pool.Disk.Room()
+}
+
 // canWrite reports whether the backend supports mutating ops. False when
 // either the write deps aren't wired or ReadOnly was explicitly set.
 func (b *Backend) canWrite() bool {
@@ -154,7 +166,13 @@ func NewRoot(b *Backend) *Node {
 
 // Statfs answers `statfs(2)` / `pathconf(_PC_NAME_MAX)` / df / etc.
 //
-// The TOTAL is fictional — a Telegram channel has no storage quota to
+// With a staging directory (every daemon mount, v1.1 S9) the numbers are
+// real: FREE is what can still be written before writes fail — the
+// staging filesystem's free space above its min_free floor (the staging
+// cap only makes writes wait for uploads) — 0 on a read-only mount, and
+// TOTAL is used + free. File managers showed the fictional 128 PB as is.
+//
+// Without one (the in-memory pipeline of tests) the TOTAL is fictional — a Telegram channel has no storage quota to
 // report, but statfs must return something, so we claim 128 PiB with
 // 4 KiB blocks. The value is deliberately large-but-bounded: an
 // earlier 4 MiB × 4 ZiB choice overflowed some GUI file managers,
@@ -173,6 +191,18 @@ func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	)
 	usedBytes, usedInos := n.backend.usage(ctx)
 	usedBlocks := (uint64(usedBytes) + uint64(bsize) - 1) / uint64(bsize)
+	if room, ok := n.backend.writeRoom(); ok {
+		freeBlocks := uint64(room) / uint64(bsize)
+		out.Blocks = usedBlocks + freeBlocks
+		out.Bfree = freeBlocks
+		out.Bavail = freeBlocks
+		out.Files = fakeFiles
+		out.Ffree = fakeFiles - min(uint64(usedInos), fakeFiles)
+		out.Bsize = bsize
+		out.Frsize = bsize
+		out.NameLen = 255
+		return 0
+	}
 	if usedBlocks > blockCnt {
 		usedBlocks = blockCnt // fictional total exhausted; never underflow
 	}

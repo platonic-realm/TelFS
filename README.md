@@ -896,6 +896,9 @@ filling the disk); if the filesystem would drop below `min_free` with
 nothing of TelFS's left to upload, writes fail with "No space left on
 device". A failed upload is retried from the staged copy until it
 lands; anything still staged at unmount is uploaded at the next mount.
+`df` on the mount shows that limit: free is the staging filesystem's
+free space above `min_free` (what can still be written before writes
+fail), total is used + free; a read-only mount shows nothing free.
 `fsync(2)` returns once the file's data is durable in the staging
 directory (staged copies, the directory and the size fsynced) — it never
 waits for Telegram; `telfs sync --wait` is the way to wait for the

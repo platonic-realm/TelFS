@@ -153,3 +153,22 @@ func (g *DiskGate) Stats() (used, capBytes int64, blocked bool) {
 
 // Dir is the staging directory.
 func (g *DiskGate) Dir() string { return g.dir }
+
+// Room is what can still be written before writes fail: the staging
+// filesystem's free space above the min_free floor (the staging cap only
+// makes writes wait for uploads, it never fails them). ok is false when
+// the free space cannot be read. statfs(2) of the mount reports it as the
+// free space (v1.1 S9).
+func (g *DiskGate) Room() (room int64, ok bool) {
+	if g == nil {
+		return 0, false
+	}
+	free, err := g.statfs(g.dir)
+	if err != nil {
+		return 0, false
+	}
+	if room = free - g.floor; room < 0 {
+		room = 0
+	}
+	return room, true
+}
