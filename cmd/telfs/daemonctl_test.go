@@ -123,7 +123,9 @@ func TestSyncOverControlSocket(t *testing.T) {
 // `telfs status --json` without a daemon: local state only, no secret.
 func TestOfflineStatus(t *testing.T) {
 	ctx := context.Background()
-	dir := filepath.Join(t.TempDir(), "backup")
+	// A profile name no real mount carries: status finds a profile's mount
+	// by name in /proc/mounts, machine-wide (S9 runs a live "backup").
+	dir := filepath.Join(t.TempDir(), "telfs-offline-status-test")
 	if err := os.MkdirAll(filepath.Join(dir, "cache", "pending"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +143,7 @@ func TestOfflineStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Schema != 1 || st.Profile != "backup" || st.Format != 2 || st.Mounted || st.Link != nil || st.PID != nil {
+	if st.Schema != 1 || st.Profile != "telfs-offline-status-test" || st.Format != 2 || st.Mounted || st.Link != nil || st.PID != nil {
 		t.Fatalf("status %+v", st)
 	}
 	if st.Sync.Synced || st.Sync.PendingUploads != 1 || st.Sync.PendingBytes != 10 || st.Sync.JournalUnposted == 0 {
