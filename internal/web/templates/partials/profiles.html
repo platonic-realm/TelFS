@@ -45,7 +45,7 @@
         {{end}}
       </td>
     </tr>
-    {{with .Live}}{{with .LastError}}
+    {{with .Live}}{{with .CurrentError}}
     <tr class="sub"><td></td><td colspan="6"><small class="err-text">last error {{ago .Unix}}: {{.Text}}</small></td></tr>
     {{end}}{{end}}
     {{end}}

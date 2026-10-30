@@ -63,6 +63,9 @@ type statusLink struct {
 	State              string `json:"state"` // ok | busy | down | fault
 	LastSuccessUnix    int64  `json:"last_success_unix"`
 	FloodWaitUntilUnix int64  `json:"flood_wait_until_unix"`
+	// HealthySinceUnix is the first successful RPC after the last error
+	// (v1.1 I8); 0 while none has succeeded since.
+	HealthySinceUnix int64 `json:"healthy_since_unix"`
 }
 
 type statusSync struct {
@@ -125,6 +128,10 @@ type statusUses struct {
 type statusError struct {
 	Text string `json:"text"`
 	Unix int64  `json:"unix"`
+	// RecoveredUnix is when an RPC first succeeded after this error; null
+	// while the link has not recovered from it (v1.1 I8: monitoring used
+	// to read an 8-hour-old timeout as current).
+	RecoveredUnix *int64 `json:"recovered_unix"`
 }
 
 // usesView turns per-key counts into the status block.
@@ -330,7 +337,8 @@ func (d *daemonCtl) status(ctx context.Context) statusV1 {
 		st.KeyHeader, st.CryptoUses = nil, nil
 	}
 	snap := d.sess.Tracker().Snapshot()
-	link := statusLink{State: "ok", LastSuccessUnix: unixOrZero(snap.LastSuccess), FloodWaitUntilUnix: unixOrZero(snap.FloodWaitUntil)}
+	link := statusLink{State: "ok", LastSuccessUnix: unixOrZero(snap.LastSuccess), FloodWaitUntilUnix: unixOrZero(snap.FloodWaitUntil),
+		HealthySinceUnix: unixOrZero(snap.HealthySince)}
 	switch {
 	case !d.sess.Connected():
 		link.State = "down"
@@ -343,9 +351,20 @@ func (d *daemonCtl) status(ctx context.Context) statusV1 {
 	st.Link = &link
 	st.Upload = uploadStatus(d.cfg, d.rate(), d.upLimit)
 	if !snap.LastError.IsZero() {
-		st.LastError = &statusError{Text: snap.LastErrorMsg, Unix: snap.LastError.Unix()}
+		st.LastError = lastErrorStatus(snap)
 	}
 	return st
+}
+
+// lastErrorStatus is the status's last_error: the tracker's last error and,
+// once an RPC has succeeded after it, when.
+func lastErrorStatus(snap tg.Snapshot) *statusError {
+	e := &statusError{Text: snap.LastErrorMsg, Unix: snap.LastError.Unix()}
+	if snap.HealthySince.After(snap.LastError) {
+		r := snap.HealthySince.Unix()
+		e.RecoveredUnix = &r
+	}
+	return e
 }
 
 // uploadStatus is the status's upload block: the configured [upload] pool

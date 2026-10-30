@@ -315,16 +315,17 @@ ever added within it:
   "schema": 1, "telfs_version": "v1.0.0", "profile": "backup", "fs_uuid": "…", "format": 2,
   "mounted": true, "read_only": false, "version_mount": null, "mountpoint": "/srv/telfs/backup",
   "pid": 1234, "log_path": null,
-  "link": {"state": "ok", "last_success_unix": 0, "flood_wait_until_unix": 0},
+  "link": {"state": "ok", "last_success_unix": 0, "flood_wait_until_unix": 0, "healthy_since_unix": 0},
   "sync": {"synced": true, "pending_uploads": 0, "pending_bytes": 0, "journal_unposted": 0,
-           "oldest_pending_age_s": 0},
+           "oldest_pending_age_s": 0, "snapshot_due": ""},
   "snapshot": {"last_msg_id": 0, "last_unix": 0, "journal_ops_since": 0},
   "versions": {"count": 0, "newest": {"name": "…", "created_unix": 0}},
-  "upload": {"connections": 8, "rate_cap_bytes_per_s": 5000000, "rate_bytes_per_s": 0},
+  "upload": {"connections": 8, "rate_cap_bytes_per_s": 5000000, "rate_bytes_per_s": 0,
+             "rate_cap_config_bytes_per_s": 5000000},
   "staging": {"dir": "/…/pending", "pending_bytes": 0, "cap_bytes": 50000000000, "blocked": false},
   "key_header": {"pinned_ok": true, "checked_unix": 0},
   "crypto_uses": {"chunk": 0, "meta": 0, "caption": 0, "warn": false},
-  "last_error": {"text": "…", "unix": 0}
+  "last_error": {"text": "…", "unix": 0, "recovered_unix": null}
 }
 ```
 
@@ -335,7 +336,11 @@ means writes are waiting for uploads (the staging cap or free-space floor
 is reached). Without a running mount the object comes from local state:
 `mounted: false`, `sync` as of the last unmount, the live-only fields
 (`read_only`, `link`, `upload`, …) null; `last_error` is null when there
-was none. `status --json` exits 0 mounted or not (1 only when the
+was none. `last_error` keeps the daemon's last error; `recovered_unix`
+is when an RPC first succeeded after it (null while the link has not
+recovered), and `link.healthy_since_unix` is the same moment seen from
+the link (0 while nothing has succeeded since the last error) — a
+monitor alerts on `last_error` only while `recovered_unix` is null. `status --json` exits 0 mounted or not (1 only when the
 profile cannot be read). `telfs status --json --version NAME` asks that
 version's mount instead (`version_mount` = its name; exit 5 when it is
 not mounted).

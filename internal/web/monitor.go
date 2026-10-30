@@ -48,9 +48,24 @@ type liveStatus struct {
 		Blocked      bool  `json:"blocked"`
 	} `json:"staging"`
 	LastError *struct {
-		Text string `json:"text"`
-		Unix int64  `json:"unix"`
+		Text          string `json:"text"`
+		Unix          int64  `json:"unix"`
+		RecoveredUnix *int64 `json:"recovered_unix"`
 	} `json:"last_error"`
+}
+
+// CurrentError is the daemon's last error while the link has not
+// recovered from it (nil once an RPC succeeded after it — a past error is
+// no current trouble).
+func (l *liveStatus) CurrentError() *struct {
+	Text          string `json:"text"`
+	Unix          int64  `json:"unix"`
+	RecoveredUnix *int64 `json:"recovered_unix"`
+} {
+	if l == nil || l.LastError == nil || l.LastError.RecoveredUnix != nil {
+		return nil
+	}
+	return l.LastError
 }
 
 // StagingPct is the staged share of the staging cap, 0 without a cap.

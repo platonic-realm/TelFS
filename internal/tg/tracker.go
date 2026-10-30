@@ -84,18 +84,22 @@ type Tracker struct {
 	// flood counts) must never lose an entry — the adaptive
 	// controller and the stall watchdog read those numbers exactly
 	// when load is highest.
-	pending     map[int64]pendingRPC
-	totalOK     int64 // count of successful Invokes since start
-	totalErr    int64 // count of errored Invokes since start
-	totalBytes  int64 // sum of request+response payload bytes since start (tx+rx)
-	totalTx     int64 // upload-direction payload (encoded request bytes for upload methods)
-	totalRx     int64 // download-direction payload (response .Bytes for download methods)
-	byMethod    map[string]*MethodCount
-	inFlight    int       // currently outstanding RPCs
-	lastOK      time.Time // wall time of last successful Invoke
-	lastErr     time.Time // wall time of last errored Invoke
-	floodUntil  time.Time // latest (now + FLOOD_WAIT duration) observed — the server-mandated quiet period
-	lastErrText string
+	pending    map[int64]pendingRPC
+	totalOK    int64 // count of successful Invokes since start
+	totalErr   int64 // count of errored Invokes since start
+	totalBytes int64 // sum of request+response payload bytes since start (tx+rx)
+	totalTx    int64 // upload-direction payload (encoded request bytes for upload methods)
+	totalRx    int64 // download-direction payload (response .Bytes for download methods)
+	byMethod   map[string]*MethodCount
+	inFlight   int       // currently outstanding RPCs
+	lastOK     time.Time // wall time of last successful Invoke
+	lastErr    time.Time // wall time of last errored Invoke
+	// healthySince is the first success after the last error (or the
+	// first success at all): monitoring tells a past error from a current
+	// one (v1.1 I8).
+	healthySince time.Time
+	floodUntil   time.Time // latest (now + FLOOD_WAIT duration) observed — the server-mandated quiet period
+	lastErrText  string
 }
 
 // pendingRPC is the accounting-critical slice of an in-flight RPC.
@@ -196,6 +200,9 @@ func (t *Tracker) End(id int64, err error, floodWait time.Duration, rxBytes int)
 		}
 	} else {
 		t.lastOK = now
+		if t.healthySince.IsZero() || t.lastErr.After(t.healthySince) {
+			t.healthySince = now
+		}
 		t.totalOK++
 		mc.OK++
 	}
@@ -226,6 +233,9 @@ type Snapshot struct {
 	LastSuccess  time.Time
 	LastError    time.Time
 	LastErrorMsg string
+	// HealthySince is the first success after LastError (zero while no
+	// RPC has succeeded since it).
+	HealthySince time.Time
 	// FloodWaitUntil is the end of the most recent server-mandated
 	// FLOOD_WAIT quiet period (zero if none observed). While now <
 	// FloodWaitUntil, an absence of successful RPCs is EXPECTED — the
@@ -238,6 +248,14 @@ type Snapshot struct {
 	TotalBytesTx int64         // upload-direction wire bytes
 	TotalBytesRx int64         // download-direction wire bytes
 	PerMethod    []MethodCount // sorted by total count desc
+}
+
+// healthyNow is healthySince, or zero when an error came after it.
+func (t *Tracker) healthyNow() time.Time {
+	if t.lastErr.After(t.healthySince) {
+		return time.Time{}
+	}
+	return t.healthySince
 }
 
 func (t *Tracker) Snapshot() Snapshot {
@@ -270,6 +288,7 @@ func (t *Tracker) Snapshot() Snapshot {
 		Requests:       out,
 		InFlight:       t.inFlight,
 		LastSuccess:    t.lastOK,
+		HealthySince:   t.healthyNow(),
 		LastError:      t.lastErr,
 		LastErrorMsg:   t.lastErrText,
 		FloodWaitUntil: t.floodUntil,

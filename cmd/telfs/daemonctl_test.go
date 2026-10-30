@@ -246,3 +246,18 @@ func TestDescribeUpload(t *testing.T) {
 		}
 	}
 }
+
+// status --json last_error (v1.1 I8): recovered_unix once an RPC has
+// succeeded after the error, null before.
+func TestLastErrorStatus(t *testing.T) {
+	errAt := time.Unix(1_800_000_000, 0)
+	e := lastErrorStatus(tg.Snapshot{LastError: errAt, LastErrorMsg: "timeout"})
+	b, _ := json.Marshal(e)
+	if string(b) != `{"text":"timeout","unix":1800000000,"recovered_unix":null}` {
+		t.Fatalf("unrecovered: %s", b)
+	}
+	e = lastErrorStatus(tg.Snapshot{LastError: errAt, LastErrorMsg: "timeout", HealthySince: errAt.Add(time.Minute)})
+	if e.RecoveredUnix == nil || *e.RecoveredUnix != 1_800_000_060 {
+		t.Fatalf("recovered: %+v", e)
+	}
+}

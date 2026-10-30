@@ -3,6 +3,7 @@ package tg
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // Marshal → Seed into a fresh tracker → totals continue from the
@@ -74,5 +75,31 @@ func TestTrackerSeedStateRejectsGarbage(t *testing.T) {
 	}
 	if got := tr.Snapshot().TotalOK; got != 0 {
 		t.Fatalf("garbage seed mutated counters: %d", got)
+	}
+}
+
+// HealthySince (v1.1 I8): the first success after the last error; zero
+// while the link has not recovered from it.
+func TestTrackerHealthySince(t *testing.T) {
+	tr := NewTracker(16)
+	tr.End(tr.Begin("a", 0), nil, 0, 0)
+	first := tr.Snapshot().HealthySince
+	if first.IsZero() {
+		t.Fatal("the first success starts the healthy period")
+	}
+	time.Sleep(2 * time.Millisecond)
+	tr.End(tr.Begin("a", 0), nil, 0, 0)
+	if !tr.Snapshot().HealthySince.Equal(first) {
+		t.Fatal("more successes do not move it")
+	}
+	time.Sleep(2 * time.Millisecond)
+	tr.End(tr.Begin("b", 0), errors.New("i/o timeout"), 0, 0)
+	if s := tr.Snapshot(); !s.HealthySince.IsZero() || s.LastError.IsZero() {
+		t.Fatalf("after an error: %+v", s.HealthySince)
+	}
+	time.Sleep(2 * time.Millisecond)
+	tr.End(tr.Begin("a", 0), nil, 0, 0)
+	if s := tr.Snapshot(); !s.HealthySince.After(s.LastError) {
+		t.Fatal("the success after the error is the new healthy-since")
 	}
 }
