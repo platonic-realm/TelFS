@@ -965,13 +965,25 @@ with HTMX-polled log tail, lifetime Telegram stats (persisted in the
 profile's SQLite, visible even while the daemon is down), and a file
 browser through a chosen mountpoint.
 
-The masthead carries two lamps for the active profile, read from its
-mount's control socket: **link** (ok / busy / down / fault; it turns
-yellow when the staging directory holds more than 80 % of its cap and
-red, "backlog", when writes are waiting for uploads — a large backlog
-below the cap is normal during a first backup) and **sync** (green when
-the channel alone could recover the filesystem). The Telegram tab shows
-the upload queue, including the staging directory, its bytes and cap.
+**Every profile at once.** Several profiles can run side by side (two
+mounts, two daemons); the console watches all of them without any
+global setting. The dashboard opens with a live table of every profile
+— mount, **link** lamp (ok / busy / down / fault; yellow above 80 % of
+the staging cap, red "backlog" when writes wait for uploads — a large
+backlog below the cap is normal during a first backup), **channel copy**
+lamp (green when the channel alone could recover the filesystem),
+backlog, upload rate and any error the link has not recovered from —
+then every profile's channel and filesystem, then every TelFS mount on
+the machine (bind mounts of a mount show as "view of …" / "also visible
+at …", never as leftovers to unmount). The masthead carries the two
+lamps for each profile; each set opens that profile's Telegram tab
+(upload queue, staging, requests, rate limits — `?profile=NAME`).
+
+**Selection.** The Setup, Browse and State pages act on one profile:
+the one this browser selected (Select on the dashboard or the profile
+page; a cookie), else the CLI's default (`~/.config/telfs/active`), else
+the first profile. Selecting never changes the CLI's default; "Make CLI
+default" on a profile's page does, explicitly.
 
 First-time users land on a guided `/setup` wizard where every step is
 an inline form on one page: create profile → API creds → phone login
@@ -985,12 +997,25 @@ telfs web                                       # 127.0.0.1:8080, no auth
 telfs web --listen 0.0.0.0:8080 --token $(openssl rand -hex 32)
 ```
 
-Loopback bind requires no auth (perimeter = "can reach loopback").
-Non-loopback bind **requires** `--token`; the server refuses to start
-otherwise. Token check via `crypto/subtle.ConstantTimeCompare`; every
-POST form carries a per-session CSRF token. For HTTPS, terminate TLS
-in a reverse proxy in front of localhost (`--tls-cert` / `--tls-key`
-exist but aren't the recommended path).
+**The console has no login of its own.** It can read every profile's
+state and act on every profile (mount, unmount, login, channel), so
+whoever reaches its port is its operator. Loopback bind requires no
+auth (perimeter = "can reach loopback"); keep it that way. Non-loopback
+bind **requires** `--token` (a Bearer token, checked in constant time;
+the server refuses to start otherwise) — usable by scripts, not by a
+browser. Every POST form carries a CSRF token (double-submit cookie).
+
+**Behind a reverse proxy** (the way to reach it from elsewhere): let the
+proxy do the login and TLS and forward to the loopback port with the
+`Host` header rewritten to that address — S9 runs Cloudflare Access →
+tunnel → `127.0.0.1:8400`. A `Host` naming anything but a loopback
+address, a literal IP or the listen host is refused (DNS-rebinding
+defence), so an unrewritten public name gets 403. Cookies and CSRF work
+through the proxy unchanged (the CSRF cookie is `SameSite=Lax`, so the
+proxy's cross-site login redirect does not reset it). Make sure nothing
+but the proxy can reach the port (S9: a firewall rule lets only the
+tunnel connector in). `--tls-cert` / `--tls-key` exist but a proxy is
+the recommended path.
 
 ## Deployment
 

@@ -58,12 +58,18 @@ func (s *State) EnsureCSRF(w http.ResponseWriter, r *http.Request) string {
 	s.mu.Lock()
 	s.csrfs[t] = time.Now()
 	s.mu.Unlock()
+	// Lax, not Strict: behind a login proxy (S9: Cloudflare Access) the
+	// browser arrives at the console through a cross-site redirect, and a
+	// Strict cookie is not sent on it — the console minted a new token and
+	// replaced the cookie, so forms open in other tabs failed with 403.
+	// Lax sends it on top-level GETs only; a cross-site POST still carries
+	// no cookie, so the double-submit check is as strong as before.
 	http.SetCookie(w, &http.Cookie{
 		Name:     csrfCookie,
 		Value:    t,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   60 * 60 * 24,
 	})
 	return t
