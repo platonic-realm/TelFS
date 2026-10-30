@@ -45,6 +45,9 @@ func IsFKViolation(err error) bool {
 // multiple goroutines; SQLite handles serialization internally.
 type Store struct {
 	db *sql.DB
+	// path is the DB file (Durable fsyncs it and its -wal); "" for
+	// read-only opens.
+	path string
 
 	// writeCounter increments on every successful write through this
 	// Store (single-statement exec or committed transaction). The
@@ -133,12 +136,40 @@ func Open(path string) (*Store, error) {
 	// serialize at the SQLite level; busy_timeout absorbs that.
 	db.SetMaxOpenConns(8)
 
-	s := &Store{db: db}
+	s := &Store{db: db, path: path}
 	if err := s.initSchema(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("meta: init schema: %w", err)
 	}
 	return s, nil
+}
+
+// Durable makes every committed transaction survive a power loss. The DB
+// runs in WAL mode with synchronous=NORMAL: a commit is written to the
+// -wal file but fsynced only at the next checkpoint, so a power cut can
+// roll back the last commits (the DB stays consistent). fsync(2) of a
+// file on TelFS calls this after committing the file's size (v1.1 B3),
+// so what fsync promised is on disk: the -wal file (the commits) and the
+// main file are fsynced. A missing -wal (checkpointed away) is fine.
+func (s *Store) Durable() error {
+	if s.path == "" {
+		return nil
+	}
+	for _, p := range []string{s.path + "-wal", s.path} {
+		f, err := os.Open(p)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("meta: durable: %w", err)
+		}
+		err = f.Sync()
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("meta: durable: fsync %s: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // OpenReadOnly opens an EXISTING metadata DB for reading only: SQLite

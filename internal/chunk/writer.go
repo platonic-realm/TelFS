@@ -58,8 +58,12 @@ const DefaultUploadConcurrency = 4
 //     wait for the network round-trips. Subsequent reads of the same
 //     ino block on the pool's per-ino pending barrier until uploads
 //     land, so read-after-write stays coherent. fsync still synchronous.
-//   - Sync (FUSE fsync): dispatch + WAIT this writer's uploadWg +
-//     SetSize. Surfaces any upload error from THIS handle.
+//   - Sync (FUSE fsync): dispatch + WAIT + SetSize. Surfaces any error
+//     from THIS handle. In queue mode (the daemon) it waits only until
+//     the handle's chunks are STAGED, then fsyncs the staged wires, the
+//     staging directory and the DB (v1.1 B3) — durable on this machine,
+//     not yet on Telegram (`telfs sync --wait` is the channel barrier).
+//     Without a staging directory (tests) it waits for the uploads.
 //   - Detach (FUSE release): drop in-memory dirty state. Does NOT cancel
 //     in-flight uploads — they ride pool.UploadCtx, which survives until
 //     Backend.Shutdown.
@@ -115,6 +119,13 @@ type Writer struct {
 	uploadWg  sync.WaitGroup
 	uploading map[int32]chan struct{}
 	uploadErr error
+	// stageWg counts, in queue mode, this handle's dispatched chunks
+	// until their stage 1 ends (wire staged, deduplicated, or put back
+	// dirty); stagedPaths are the wires staged since the last Sync —
+	// what fsync must make durable.
+	stageWg     sync.WaitGroup
+	stagedPaths []string
+	stagedNext  int // len(stagedPaths) at which noteStaged compacts next
 }
 
 type dirtyChunk struct {
@@ -732,10 +743,19 @@ func (w *Writer) Sync(ctx context.Context) error {
 		}
 	}
 	w.mu.Unlock()
-	// Wait for THIS handle's outstanding uploads (per-handle wg, not
-	// the pool's global wg — fsync shouldn't block on every other
-	// handle's pending uploads).
-	w.uploadWg.Wait()
+	queued := w.queueMode()
+	if queued {
+		// Queue mode: wait until this handle's chunks are staged — not
+		// for Telegram. An fsync used to block until the uploads landed:
+		// unkillable for as long as Telegram was unreachable (S9: 17½ min
+		// in fuse_fsync, "task blocked for more than 122 seconds").
+		w.stageWg.Wait()
+	} else {
+		// Wait for THIS handle's outstanding uploads (per-handle wg, not
+		// the pool's global wg — fsync shouldn't block on every other
+		// handle's pending uploads).
+		w.uploadWg.Wait()
+	}
 	w.mu.Lock()
 	stickyErr := w.uploadErr
 	restoredCount := len(w.dirty)
@@ -763,14 +783,66 @@ func (w *Writer) Sync(ctx context.Context) error {
 		}
 		return fmt.Errorf("sync: %d chunk(s) failed to upload and were restored for retry", restoredCount)
 	}
-	if !mod {
-		return nil // nothing written through this handle: leave size and mtime alone
+	if queued {
+		if err := w.syncStaged(); err != nil {
+			if mod {
+				w.mu.Lock()
+				w.modified = true
+				w.mu.Unlock()
+			}
+			return err
+		}
 	}
-	if err := w.meta.SetSize(ctx, w.ino, finalSize); err != nil {
-		w.mu.Lock()
-		w.modified = true
-		w.mu.Unlock()
-		return err
+	if mod {
+		if err := w.meta.SetSize(ctx, w.ino, finalSize); err != nil {
+			w.mu.Lock()
+			w.modified = true
+			w.mu.Unlock()
+			return err
+		}
+	}
+	if queued {
+		// The size just committed, and the rows of chunks that already
+		// landed (or were deduplicated), must survive a power loss too.
+		return w.meta.Durable()
+	}
+	return nil
+}
+
+// syncStaged fsyncs the wires this handle staged since the last Sync and
+// the staging directory (their names). A wire already uploaded and removed
+// is fine: its chunk_map row is in the DB, which Sync makes durable next.
+func (w *Writer) syncStaged() error {
+	w.mu.Lock()
+	paths := w.stagedPaths
+	w.stagedPaths = nil
+	w.mu.Unlock()
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err == nil {
+			err = f.Sync()
+			f.Close()
+		}
+		if err != nil {
+			w.mu.Lock()
+			w.stagedPaths = append(w.stagedPaths, paths...) // try them all again next time
+			w.mu.Unlock()
+			return fmt.Errorf("fsync staged chunk %s: %w", p, err)
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	d, err := os.Open(w.pool.PendingDir)
+	if err != nil {
+		return fmt.Errorf("fsync staging directory: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync staging directory: %w", err)
 	}
 	return nil
 }
@@ -806,6 +878,10 @@ func (w *Writer) dispatchFlushLocked(ctx context.Context, idx int32) error {
 	doneCh := make(chan struct{})
 	w.uploading[idx] = doneCh
 	w.uploadWg.Add(1)
+	queued := w.queueMode()
+	if queued {
+		w.stageWg.Add(1) // Done when uploadOneStaged's stage 1 ends
+	}
 	w.mu.Unlock()
 	// Staging gate, NOT the upload sem: dispatch only waits for RAM
 	// allowance (DefaultStagedCapBytes of in-flight chunk data), never
@@ -822,6 +898,9 @@ func (w *Writer) dispatchFlushLocked(ctx context.Context, idx int32) error {
 		// it so the next Flush can retry.
 		w.mu.Lock()
 		w.uploadWg.Done()
+		if queued {
+			w.stageWg.Done()
+		}
 		delete(w.uploading, idx)
 		close(doneCh)
 		w.dirty[idx] = dc

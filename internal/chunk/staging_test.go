@@ -98,6 +98,20 @@ func countRows(t *testing.T, m *meta.Store, ino int64) int {
 	return len(rows)
 }
 
+// waitQueue waits until every upload registered with the pool has ended
+// (fsync no longer waits for uploads in queue mode — v1.1 B3).
+func waitQueue(t *testing.T, pool *UploadPool) {
+	t.Helper()
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if open, _ := pool.OpenStats(); open == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the upload queue did not drain")
+		}
+	}
+}
+
 // Writes block once the disk cap AND the in-memory hand-off are full, the
 // staging directory never holds more than the cap (+ nothing), and
 // everything lands once uploads resume.
@@ -202,6 +216,7 @@ func TestQueueModeRetriesFromStagedCopy(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Sync did not return")
 	}
+	waitQueue(t, pool)
 	if n := countRows(t, m, ino); n != 2 {
 		t.Fatalf("chunk rows %d, want 2", n)
 	}
@@ -250,6 +265,7 @@ func TestQueueModePackerRetriesStagedBatch(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Sync did not return")
 	}
+	waitQueue(t, pool)
 	rows, _ := m.ListChunks(ctx, ino)
 	if len(rows) != 5 {
 		t.Fatalf("chunk rows %d, want 5", len(rows))
@@ -413,6 +429,54 @@ func TestQueueModeDeletedFileIsNotUploaded(t *testing.T) {
 	}
 	if n := countRows(t, m, ino); n != 0 {
 		t.Fatalf("%d chunk rows for a deleted file", n)
+	}
+	w.Close()
+}
+
+// fsync in queue mode (v1.1 B3): it returns once the handle's chunks are
+// staged — while Telegram is unreachable too (S9: dd conv=fsync blocked in
+// fuse_fsync for 17½ minutes) — with the size committed; the uploads land
+// later from the staged copies.
+func TestQueueModeFsyncDoesNotWaitForTelegram(t *testing.T) {
+	m := newTestMeta(t)
+	ctx := context.Background()
+	pool, dir := newQueuePool(t, 1, 1<<20)
+	up := newStageUploader()
+	up.gate = make(chan struct{}) // Telegram unreachable
+	ino := newQueueFile(t, m, "f", 64)
+	w, err := NewWriter(ctx, m, newTestCache(t, nil), up, nil, nil, pool, nil, ino, 64, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteAt(ctx, bytes.Repeat([]byte("s"), 64*3+10), 0); err != nil { // 4 chunks
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- w.Sync(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fsync waited for Telegram")
+	}
+	if _, files := dirBytes(t, dir); files != 4 {
+		t.Fatalf("%d staged wires after fsync, want 4", files)
+	}
+	if ino, err := m.GetInode(ctx, ino); err != nil || ino.Size != 64*3+10 {
+		t.Fatalf("size after fsync: %+v %v", ino, err)
+	}
+	if n := countRows(t, m, ino); n != 0 {
+		t.Fatalf("%d rows before any upload", n)
+	}
+	close(up.gate) // Telegram is back
+	waitQueue(t, pool)
+	if n := countRows(t, m, ino); n != 4 {
+		t.Fatalf("chunk rows %d, want 4", n)
+	}
+	if _, files := dirBytes(t, dir); files != 0 {
+		t.Fatalf("%d wires left", files)
 	}
 	w.Close()
 }

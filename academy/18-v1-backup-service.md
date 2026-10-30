@@ -112,9 +112,16 @@ keeps it as a sticky error, and `write`/`flush`/`fsync` fail with
 Two smaller decisions: the daemon's status reads the gate's counters and
 an in-memory index of staged files instead of listing a directory that
 may hold 100,000 wires on every two-second poll; and staged wires are
-still not fsynced (a pre-existing choice — after a power loss the
-mount's crash repair cuts files back to what reached the channel and
-names them, chapter 17).
+not fsynced on every write (a pre-existing choice — after a power loss
+the mount's crash repair cuts files back to what reached the channel and
+names them, chapter 17). Since v1.1 `fsync(2)` is the exception: in
+queue mode `Writer.Sync` waits only for its chunks' stage 1 (a second
+wait group, `stageWg`), fsyncs the wires that handle staged, the staging
+directory and — after committing the size — the SQLite `-wal` and main
+file (`meta.Store.Durable`; WAL with `synchronous=NORMAL` fsyncs commits
+only at checkpoints). It used to wait for the uploads: on S9 a
+`dd … conv=fsync` sat unkillable in `fuse_fsync` for 17½ minutes while
+the network was down.
 
 The web console's link lamp used to turn red at 1,000 staged wires — in
 August that many meant the FK-violation cleanup of chapter 14 was

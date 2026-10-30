@@ -28,6 +28,9 @@ func (w *Writer) queueMode() bool {
 // as long as the daemon runs. finish (once) clears the in-flight state,
 // wakes loadForWrite and releases the reservation.
 func (w *Writer) uploadOneStaged(ctx context.Context, idx int32, dc *dirtyChunk, doneCh chan struct{}, res *Reservation) {
+	// Stage 1 ends when this function returns (stage 2 runs from the
+	// queue or the packer): Sync's wait for "staged" ends with it.
+	defer w.stageWg.Done()
 	var once sync.Once
 	finish := func() {
 		once.Do(func() {
@@ -120,6 +123,7 @@ func (w *Writer) uploadOneStaged(ctx context.Context, idx int32, dc *dirtyChunk,
 	}
 	w.pool.PendingIndex.RecordPersist(w.ino, idx, path)
 	staged = true // stage 2 owns finish from here on
+	w.noteStaged(path)
 
 	if packRoute {
 		w.packer.SubmitStaged(w.ino, idx, plainLen, wireLen, path, rowHash, codecUsed, fileSize, func(packResult) {
@@ -194,3 +198,27 @@ func (w *Writer) uploadStagedDirect(ctx context.Context, path string, plainLen i
 	finish()
 	return true
 }
+
+// noteStaged remembers a staged wire for the next Sync (fsync). A handle
+// that writes a lot and never fsyncs would collect paths without end, so
+// past a threshold the ones already uploaded (removed) are dropped; the
+// threshold doubles with what is left (uploads stalled: amortised O(1)).
+func (w *Writer) noteStaged(path string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.stagedPaths = append(w.stagedPaths, path)
+	if len(w.stagedPaths) < max(w.stagedNext, maxStagedPaths) {
+		return
+	}
+	kept := w.stagedPaths[:0]
+	for _, p := range w.stagedPaths {
+		if _, err := os.Stat(p); err == nil {
+			kept = append(kept, p)
+		}
+	}
+	w.stagedPaths = kept
+	w.stagedNext = 2 * len(kept)
+}
+
+// maxStagedPaths bounds stagedPaths between fsyncs (see noteStaged).
+const maxStagedPaths = 4096

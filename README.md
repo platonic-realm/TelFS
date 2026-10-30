@@ -874,6 +874,10 @@ filling the disk); if the filesystem would drop below `min_free` with
 nothing of TelFS's left to upload, writes fail with "No space left on
 device". A failed upload is retried from the staged copy until it
 lands; anything still staged at unmount is uploaded at the next mount.
+`fsync(2)` returns once the file's data is durable in the staging
+directory (staged copies, the directory and the size fsynced) — it never
+waits for Telegram; `telfs sync --wait` is the way to wait for the
+channel. A file deleted while its chunks wait is not uploaded.
 
 Environment overrides:
 
@@ -1051,11 +1055,15 @@ data.
   Telegram document holds at most 2 GiB — roughly 20 M files. Snapshots
   are rare (see [Configuration](#configuration)), so that is the ceiling,
   not the cost.
-- **Staged data is not fsynced.** A write is on the channel only once
-  its staged copy is uploaded; after a power loss the mount's crash
-  repair cuts files back to what reached the channel, and says which
+- **Staged data is durable only once fsynced.** A write is on the
+  channel only once its staged copy is uploaded. `fsync(2)` makes the
+  staged copies, the staging directory and the file's size durable on
+  this machine and returns — it does not wait for Telegram (v1.1); the
+  uploads follow, also after a crash. Data written but never fsynced
+  can be lost in a power cut: the mount's crash repair then cuts the
+  files back to what reached the channel or the disk and says which
   (`<profile>/repair-<time>.tsv`). `telfs sync --wait` tells you when
-  nothing is at risk.
+  the channel alone holds everything.
 - **Versions are read through their own mount** (`mount --readonly
   --version NAME`), not under a directory of the live mount; their
   retention is the caller's (`versions list` / `delete`).
