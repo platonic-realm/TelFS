@@ -1,11 +1,9 @@
 {{define "content"}}
+{{/* Shown only while a step is open; once configured, every step stays reachable from the Setup menu. */}}
+{{if not .Setup.Complete}}
 <section class="card" id="setup-checklist">
-  {{if .Setup.Complete}}
-    <h3>Setup &amp; configuration <small>— <span class="pill ok">all set</span> revisit any step below</small></h3>
-  {{else}}
-    <h3>Setup &amp; configuration <small>— complete these to start using TelFS</small></h3>
-    <p><a href="/setup" class="btn primary">Open the guided setup →</a></p>
-  {{end}}
+  <h3>Setup &amp; configuration <small>— complete these to start using TelFS</small></h3>
+  <p><a href="/setup" class="btn primary">Open the guided setup →</a></p>
   <ol class="plain">
     {{$nextSurfaced := false}}
     {{range .Setup.Steps}}
@@ -34,6 +32,7 @@
     {{end}}
   </ol>
 </section>
+{{end}}
 
 <section class="card">
   <h3>Profile</h3>
