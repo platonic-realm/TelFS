@@ -100,6 +100,10 @@ func (c *Client) Tracker() *Tracker { return c.tracker }
 // changes made via CLI or web take effect without a remount.
 func (c *Client) RateLimiter() *RateLimiter { return c.rateLimit }
 
+// ByteLimiter is the process-wide byte-rate cap on upload parts ([upload]
+// max_rate; changeable while running).
+func (c *Client) ByteLimiter() *ByteLimiter { return c.byteLimit }
+
 // newTG builds a fresh underlying gotd client honoring cfg.DC and the
 // session storage path. Our FloodWaiter (internal/tg/floodwait.go)
 // replaces gotd/contrib's SimpleWaiter — the contrib version capped

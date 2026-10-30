@@ -119,6 +119,10 @@ Usage:
                                       timeout (nothing posted), 5, 6 Telegram.
   telfs versions list [--json]      The registry (from the mount, else local).
   telfs versions delete NAME        Delete a version (refused while mounted).
+  telfs upload limit [RATE]         Show or change the running daemon's
+                                      upload cap (e.g. 3MB/s, 0 = no cap)
+                                      until it stops; [upload] max_rate
+                                      applies again at the next start.
   telfs fsck --quick [--json]       Format 2: every referenced message exists
                                       with its document and every packed extent
                                       fits — nothing downloaded, 100 ids per
@@ -256,6 +260,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdVersions(ctx, args[2:])
 	case "sync":
 		return cmdSync(ctx, args[2:])
+	case "upload":
+		return cmdUpload(ctx, args[2:])
 	case "login":
 		return cmdLogin(ctx, args[2:])
 	case "channel":
@@ -1585,7 +1591,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 			meta: metaStore, sess: sess, pool: pool, poster: journalPoster, snapMgr: snapMgr, counters: pipe.counters,
 			telegram: telegramJSONHandler(sess.Tracker(), cfg, packer, pool, pendingDir, metaStore, adaptive, snapMgr),
 			cache:    cacheJSONHandler(cache),
-			ctx:      signalCtx, keys: pipe.keys, ch: sess}
+			ctx:      signalCtx, keys: pipe.keys, ch: sess, upLimit: client.ByteLimiter()}
 		ctlServed = true
 		go control.Serve(signalCtx, ctlLn, ctlPath, ctl.handler())
 		go ctl.sampleRate(signalCtx)

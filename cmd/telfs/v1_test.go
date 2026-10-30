@@ -49,7 +49,7 @@ func TestUsageListsV1Interface(t *testing.T) {
 	for _, want := range []string{
 		"telfs login", "telfs channel list", "telfs channel set", "telfs channel info", "telfs channel ping",
 		"telfs init", "telfs profile", "telfs mount", "telfs unmount [--timeout D]", "telfs status [--json [--version NAME]]",
-		"telfs sync [--wait] [--timeout D]", "telfs versions create NAME [--timeout D]", "telfs versions list [--json]",
+		"telfs sync [--wait] [--timeout D]", "telfs upload limit [RATE]", "[read]", "telfs versions create NAME [--timeout D]", "telfs versions list [--json]",
 		"telfs versions delete NAME", "telfs fsck --quick [--json]", "telfs restore [--version NAME] [--workers N] SRC DEST",
 		"telfs recover --from-captions", "telfs snapshot", "telfs secret test", "telfs secret change", "telfs session encrypt",
 		"telfs key export", "telfs encrypt status", "telfs fsck [--fix]", "telfs gc [--yes] [--pages N] [--min-age D]",

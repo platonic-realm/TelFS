@@ -280,7 +280,13 @@ telfs sync --wait --timeout 6h # block until everything written before this call
 telfs unmount <mountpoint|profile>   # returns when the daemon has exited (--timeout, default 2m)
 telfs versions create NAME     # see Versions
 telfs fsck --quick [--json]    # every referenced message still on the channel (see Maintenance)
+telfs upload limit [RATE]      # show / change the upload cap until the daemon stops (e.g. 3MB/s, 0 = no cap)
 ```
+
+`telfs upload limit RATE` lets two mounts share one uplink by need (one
+backing off while the other's backup runs); `status --json` shows the cap
+in effect (`upload.rate_cap_bytes_per_s`) next to the configured one
+(`rate_cap_config_bytes_per_s`), which applies again at the next start.
 
 **What `sync --wait` guarantees when it returns 0:** every change made
 through the mount whose call had returned (`write`/`close`/`fsync`/

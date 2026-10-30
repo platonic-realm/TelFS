@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"telfs/internal/control"
 	"telfs/internal/meta"
 	"telfs/internal/snapshot"
+	"telfs/internal/tg"
 )
 
 func newSyncDaemon(t *testing.T) (*daemonCtl, *meta.Store, *chunk.UploadPool) {
@@ -176,20 +178,60 @@ func TestExitCodesV1(t *testing.T) {
 }
 
 // status --json's upload block (spec v1 §3): the configured [upload] pool
-// size and byte-rate cap, and the measured rate.
+// size, the cap in effect and the configured one, and the measured rate.
 func TestUploadStatus(t *testing.T) {
 	cfg := &config.Config{}
-	if got := uploadStatus(cfg, 1234); *got != (statusUpload{Connections: 8, RateCapBytesPerS: 5_000_000, RateBytesPerS: 1234}) {
+	if got := uploadStatus(cfg, 1234, nil); *got != (statusUpload{Connections: 8, RateCapBytesPerS: 5_000_000, RateBytesPerS: 1234, RateCapConfigBytesPerS: 5_000_000}) {
 		t.Fatalf("defaults: %+v", *got)
 	}
 	conns := 0
 	cfg.Upload = config.UploadConfig{Connections: &conns, MaxRate: "0"}
-	if got := uploadStatus(cfg, 0); *got != (statusUpload{}) {
+	if got := uploadStatus(cfg, 0, nil); *got != (statusUpload{}) {
 		t.Fatalf("no pool, no cap: %+v", *got)
 	}
-	b, _ := json.Marshal(uploadStatus(&config.Config{}, 7))
-	if string(b) != `{"connections":8,"rate_cap_bytes_per_s":5000000,"rate_bytes_per_s":7}` {
+	live := tg.NewByteLimiter(5_000_000)
+	live.SetRate(2_000_000)
+	b, _ := json.Marshal(uploadStatus(&config.Config{}, 7, live))
+	if string(b) != `{"connections":8,"rate_cap_bytes_per_s":2000000,"rate_bytes_per_s":7,"rate_cap_config_bytes_per_s":5000000}` {
 		t.Fatalf("JSON %s", b)
+	}
+}
+
+// The upload cap changes while the daemon runs (v1.1 I3).
+func TestUploadLimitRoute(t *testing.T) {
+	d, _, _ := newSyncDaemon(t)
+	d.upLimit = tg.NewByteLimiter(5_000_000)
+	h := d.handler()
+	call := func(method, target string) (int, uploadLimitReply) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(method, target, nil))
+		var rep uploadLimitReply
+		json.Unmarshal(rec.Body.Bytes(), &rep)
+		return rec.Code, rep
+	}
+	if code, rep := call("POST", "/upload/limit?rate=3MB/s"); code != 200 || rep.RateCapBytesPerS != 3_000_000 || rep.RateCapConfigBytesPerS != 5_000_000 {
+		t.Fatalf("set: %d %+v", code, rep)
+	}
+	if d.upLimit.Rate() != 3_000_000 {
+		t.Fatal("the limiter did not change")
+	}
+	for _, bad := range []string{"5", "fast", ""} {
+		if code, rep := call("POST", "/upload/limit?rate="+bad); code != 400 || rep.Error == "" || rep.RateCapBytesPerS != 3_000_000 {
+			t.Errorf("%q: %d %+v", bad, code, rep)
+		}
+	}
+	if code, rep := call("POST", "/upload/limit?rate=0"); code != 200 || rep.RateCapBytesPerS != 0 {
+		t.Fatalf("no cap: %d %+v", code, rep)
+	}
+	if code, rep := call("GET", "/upload/limit"); code != 200 || rep.RateCapBytesPerS != 0 {
+		t.Fatalf("get: %d %+v", code, rep)
+	}
+	if st := uploadStatus(d.cfg, 0, d.upLimit); st.RateCapBytesPerS != 0 || st.RateCapConfigBytesPerS != 5_000_000 {
+		t.Fatalf("status upload %+v", st)
+	}
+	d.readOnly = true
+	if code, _ := call("POST", "/upload/limit?rate=1MB/s"); code != 409 {
+		t.Fatalf("read-only mount: %d", code)
 	}
 }
 

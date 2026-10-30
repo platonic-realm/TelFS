@@ -2,6 +2,7 @@ package tg
 
 import (
 	"context"
+	"sync"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
@@ -23,8 +24,12 @@ const uploadPartMax = 512 << 10
 // is not an upload part passes untouched. The RPC-per-minute RateLimiter
 // (adaptive, FLOOD_WAIT-driven) stays as it is.
 //
+// The cap can change while running (SetRate — the control socket's
+// POST /upload/limit, v1.1 I3), so two daemons can share one uplink by need.
+//
 // A nil *ByteLimiter, or one made with 0, does not limit.
 type ByteLimiter struct {
+	mu  sync.Mutex
 	bps int64
 	lim *rate.Limiter
 }
@@ -32,10 +37,28 @@ type ByteLimiter struct {
 // NewByteLimiter returns a limiter of bytesPerSec bytes per second; 0 (or
 // less) = no cap.
 func NewByteLimiter(bytesPerSec int64) *ByteLimiter {
-	if bytesPerSec <= 0 {
-		return &ByteLimiter{}
+	b := &ByteLimiter{lim: rate.NewLimiter(rate.Inf, uploadPartMax)}
+	b.SetRate(bytesPerSec)
+	return b
+}
+
+// SetRate changes the cap; 0 (or less) = no cap. Waiters already queued
+// adapt (rate.Limiter.SetLimit).
+func (b *ByteLimiter) SetRate(bytesPerSec int64) {
+	if b == nil {
+		return
 	}
-	return &ByteLimiter{bps: bytesPerSec, lim: rate.NewLimiter(rate.Limit(bytesPerSec), uploadPartMax)}
+	if bytesPerSec < 0 {
+		bytesPerSec = 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.bps = bytesPerSec
+	if bytesPerSec == 0 {
+		b.lim.SetLimit(rate.Inf)
+		return
+	}
+	b.lim.SetLimit(rate.Limit(bytesPerSec))
 }
 
 // Rate is the cap in bytes per second; 0 = no cap.
@@ -43,6 +66,8 @@ func (b *ByteLimiter) Rate() int64 {
 	if b == nil {
 		return 0
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.bps
 }
 
@@ -50,7 +75,7 @@ func (b *ByteLimiter) Rate() int64 {
 // concurrent callers: each one reserves its share of the bucket in turn,
 // so together they never exceed the rate (beyond the one-part burst).
 func (b *ByteLimiter) WaitN(ctx context.Context, n int) error {
-	if b == nil || b.lim == nil {
+	if b == nil || b.lim == nil || b.Rate() == 0 {
 		return nil
 	}
 	for n > 0 {

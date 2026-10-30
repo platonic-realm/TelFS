@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -93,9 +94,13 @@ type statusVersion struct {
 }
 
 type statusUpload struct {
-	Connections      int   `json:"connections"`
+	Connections int `json:"connections"`
+	// RateCapBytesPerS is the cap in effect — `telfs upload limit` changes
+	// it while the daemon runs (v1.1 I3); 0 = no cap.
 	RateCapBytesPerS int64 `json:"rate_cap_bytes_per_s"`
 	RateBytesPerS    int64 `json:"rate_bytes_per_s"`
+	// RateCapConfigBytesPerS is [upload] max_rate: the cap at the next start.
+	RateCapConfigBytesPerS int64 `json:"rate_cap_config_bytes_per_s"`
 }
 
 type statusStaging struct {
@@ -197,6 +202,9 @@ type daemonCtl struct {
 	// version is the version a version mount serves ("" for the live
 	// filesystem's mount).
 	version string
+
+	// upLimit is the process's upload byte-rate cap (nil: none known).
+	upLimit *tg.ByteLimiter
 
 	rateMu  sync.Mutex
 	samples []rateSample
@@ -333,7 +341,7 @@ func (d *daemonCtl) status(ctx context.Context) statusV1 {
 		link.State = "busy"
 	}
 	st.Link = &link
-	st.Upload = uploadStatus(d.cfg, d.rate())
+	st.Upload = uploadStatus(d.cfg, d.rate(), d.upLimit)
 	if !snap.LastError.IsZero() {
 		st.LastError = &statusError{Text: snap.LastErrorMsg, Unix: snap.LastError.Unix()}
 	}
@@ -341,11 +349,95 @@ func (d *daemonCtl) status(ctx context.Context) statusV1 {
 }
 
 // uploadStatus is the status's upload block: the configured [upload] pool
-// size and byte-rate cap (checked when the mount started; a read-only
-// mount opens no upload connections) and the measured upload rate.
-func uploadStatus(cfg *config.Config, rate int64) *statusUpload {
+// size (a read-only mount opens no upload connections), the byte-rate cap
+// in effect (live, when the daemon's limiter is known) and the configured
+// one, and the measured upload rate.
+func uploadStatus(cfg *config.Config, rate int64, live *tg.ByteLimiter) *statusUpload {
 	us, _ := cfg.UploadSettings()
-	return &statusUpload{Connections: us.Connections, RateCapBytesPerS: us.MaxRate, RateBytesPerS: rate}
+	st := &statusUpload{Connections: us.Connections, RateCapBytesPerS: us.MaxRate, RateBytesPerS: rate, RateCapConfigBytesPerS: us.MaxRate}
+	if live != nil {
+		st.RateCapBytesPerS = live.Rate()
+	}
+	return st
+}
+
+// uploadLimitReply is GET/POST /upload/limit.
+type uploadLimitReply struct {
+	RateCapBytesPerS       int64  `json:"rate_cap_bytes_per_s"`
+	RateCapConfigBytesPerS int64  `json:"rate_cap_config_bytes_per_s"`
+	Error                  string `json:"error,omitempty"`
+}
+
+// uploadLimit is GET /upload/limit (the cap in effect) and POST
+// /upload/limit?rate=RATE (change it until the daemon stops — [upload]
+// max_rate is the cap again at the next start). RATE as in config.toml:
+// "3MB/s", "800KiB/s", "0" = no cap.
+func (d *daemonCtl) uploadLimit(w http.ResponseWriter, r *http.Request) {
+	us, _ := d.cfg.UploadSettings()
+	rep := uploadLimitReply{RateCapConfigBytesPerS: us.MaxRate}
+	if d.upLimit == nil || d.readOnly {
+		rep.Error = "this mount uploads nothing (read-only)"
+		writeJSON(w, http.StatusConflict, rep)
+		return
+	}
+	if r.Method == http.MethodPost {
+		n, err := config.ParseByteRate(r.URL.Query().Get("rate"))
+		if err == nil && n != 0 && n < config.MinUploadMaxRate {
+			err = fmt.Errorf("%q: below the 64 KiB/s floor (\"0\" = no cap)", r.URL.Query().Get("rate"))
+		}
+		if err != nil {
+			rep.RateCapBytesPerS = d.upLimit.Rate()
+			rep.Error = "upload limit: " + err.Error()
+			writeJSON(w, http.StatusBadRequest, rep)
+			return
+		}
+		d.upLimit.SetRate(n)
+		fmt.Fprintf(os.Stderr, "[upload] byte-rate cap set to %s over the control socket (until the daemon stops)\n", rateText(n))
+	}
+	rep.RateCapBytesPerS = d.upLimit.Rate()
+	writeJSON(w, http.StatusOK, rep)
+}
+
+// rateText renders a cap: "5.0 MB/s", or "no cap".
+func rateText(n int64) string {
+	if n <= 0 {
+		return "no cap"
+	}
+	return fmt.Sprintf("%.1f MB/s", float64(n)/1e6)
+}
+
+// cmdUpload is `telfs upload limit [RATE]`: show or change the running
+// daemon's upload cap (no secret; exit 5 when not mounted).
+func cmdUpload(ctx context.Context, args []string) error {
+	if len(args) == 0 || args[0] != "limit" || len(args) > 2 {
+		return errors.New("usage: telfs upload limit [RATE]   (RATE e.g. 3MB/s, 800KiB/s, 0 = no cap; until the daemon stops)")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	method, path := http.MethodGet, "/upload/limit"
+	if len(args) == 2 {
+		method, path = http.MethodPost, "/upload/limit?rate="+url.QueryEscape(args[1])
+	}
+	req, err := http.NewRequestWithContext(ctx, method, control.BaseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := ctlClient(cfg, 10*time.Second).Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: profile %s: %v", errNotMounted, cfg.ProfileName(), err)
+	}
+	defer resp.Body.Close()
+	var rep uploadLimitReply
+	if err := json.NewDecoder(resp.Body).Decode(&rep); err != nil {
+		return fmt.Errorf("upload limit: %w (an older daemon without the route? restart it with this binary)", err)
+	}
+	if rep.Error != "" {
+		return errors.New(rep.Error)
+	}
+	fmt.Printf("upload cap: %s (config.toml [upload] max_rate: %s)\n", rateText(rep.RateCapBytesPerS), rateText(rep.RateCapConfigBytesPerS))
+	return nil
 }
 
 // ownLogPath is where this daemon's stdout goes, when that is a regular
@@ -509,6 +601,8 @@ func (d *daemonCtl) handler() http.Handler {
 	// GET /uploads/open: the inodes with uploads in flight (`telfs
 	// restore` of the live filesystem: their data in the DB may not be
 	// their current content).
+	mux.HandleFunc("GET /upload/limit", d.uploadLimit)
+	mux.HandleFunc("POST /upload/limit", d.uploadLimit)
 	mux.HandleFunc("GET /uploads/open", func(w http.ResponseWriter, _ *http.Request) {
 		rep := openUploads{Inos: []int64{}}
 		if d.pool != nil && d.pool.Pending != nil {
