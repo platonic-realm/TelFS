@@ -63,6 +63,14 @@ type Mount struct {
 	Source   string
 	Point    string
 	ReadOnly bool // mounted with the "ro" option
+	// Dev is the mount's device ("major:minor" from
+	// /proc/self/mountinfo): a bind mount of a TelFS mount shares it, so
+	// entries with one Dev are views of one FUSE mount (Views). Root is
+	// the directory of the filesystem the entry shows ("/" unless a bind
+	// mount of a subdirectory). Both "" when only /proc/mounts was
+	// readable.
+	Dev  string
+	Root string
 }
 
 // sourceFields splits a P1+ mount source into profile, fs_uuid, rest.
@@ -91,8 +99,94 @@ func VersionOf(m Mount) string {
 	return ""
 }
 
-// ScanMounts returns every fuse.telfs entry currently in /proc/mounts.
+// ScanMounts returns every fuse.telfs entry currently mounted, in mount
+// order, from /proc/self/mountinfo (or /proc/mounts without Dev and Root).
 func ScanMounts() []Mount {
+	if ms, err := scanMountInfo("/proc/self/mountinfo"); err == nil {
+		return ms
+	}
+	return scanProcMountsFile()
+}
+
+// scanMountInfo parses mountinfo(5): "ID PARENT MAJ:MIN ROOT POINT OPTS
+// [OPTIONAL…] - FSTYPE SOURCE SUPEROPTS".
+func scanMountInfo(path string) ([]Mount, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var out []Mount
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		sep := -1
+		for i := 6; i < len(fields); i++ {
+			if fields[i] == "-" {
+				sep = i
+				break
+			}
+		}
+		if len(fields) < 6 || sep < 0 || sep+2 >= len(fields) || fields[sep+1] != "fuse.telfs" {
+			continue
+		}
+		m := Mount{Source: unescapeMount(fields[sep+2]), Point: unescapeMount(fields[4]),
+			Dev: fields[2], Root: unescapeMount(fields[3])}
+		for _, o := range strings.Split(fields[5], ",") {
+			if o == "ro" {
+				m.ReadOnly = true
+			}
+		}
+		out = append(out, m)
+	}
+	return out, sc.Err()
+}
+
+// Views maps each mount that is a view of another (same Dev: a bind mount)
+// to the mount it shows — the one its daemon mounted (FindDaemonPid), else
+// the first in mount order. S9 binds its mounts to /mnt/telfs and
+// /mnt/offsite: those are views, never leftovers to unmount (v1.1 W2).
+func Views(mounts []Mount) map[string]string {
+	return views(mounts, func(p string) bool { _, ok := FindDaemonPid(p); return ok })
+}
+
+func views(mounts []Mount, hasDaemon func(string) bool) map[string]string {
+	byDev := map[string][]Mount{}
+	var devs []string
+	for _, m := range mounts {
+		if m.Dev == "" {
+			continue
+		}
+		if _, ok := byDev[m.Dev]; !ok {
+			devs = append(devs, m.Dev)
+		}
+		byDev[m.Dev] = append(byDev[m.Dev], m)
+	}
+	out := map[string]string{}
+	for _, d := range devs {
+		group := byDev[d]
+		if len(group) < 2 {
+			continue
+		}
+		primary := group[0].Point
+		for _, m := range group {
+			if hasDaemon(m.Point) {
+				primary = m.Point
+				break
+			}
+		}
+		for _, m := range group {
+			if m.Point != primary {
+				out[m.Point] = primary
+			}
+		}
+	}
+	return out
+}
+
+// scanProcMountsFile is ScanMounts from /proc/mounts (no Dev, no Root).
+func scanProcMountsFile() []Mount {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
 		return nil
@@ -272,11 +366,15 @@ func FindLiveByProfile(profile string) (pid int, mountpoint string, found bool, 
 }
 
 func findByProfile(mounts []Mount, profile string, liveOnly bool) (pid int, mountpoint string, found bool, err error) {
+	return findByProfileWith(mounts, profile, liveOnly, FindDaemonPid)
+}
+
+func findByProfileWith(mounts []Mount, profile string, liveOnly bool, daemonPid func(string) (int, bool)) (pid int, mountpoint string, found bool, err error) {
 	if profile == "" {
 		return 0, "", false, nil
 	}
 	var unknown []string
-	version := ""
+	version, live := "", ""
 	for _, m := range mounts {
 		p, ok := ProfileOf(m)
 		if !ok {
@@ -287,15 +385,25 @@ func findByProfile(mounts []Mount, profile string, liveOnly bool) (pid int, moun
 			continue
 		}
 		if VersionOf(m) == "" {
-			pid, _ := FindDaemonPid(m.Point)
-			return pid, m.Point, true, nil
+			// A bind view of the mount carries the same source: the
+			// entry its daemon mounted is the one to report (v1.1 W2).
+			if pid, ok := daemonPid(m.Point); ok {
+				return pid, m.Point, true, nil
+			}
+			if live == "" {
+				live = m.Point
+			}
+			continue
 		}
 		if !liveOnly && version == "" {
 			version = m.Point
 		}
 	}
+	if live != "" {
+		return 0, live, true, nil
+	}
 	if version != "" {
-		pid, _ := FindDaemonPid(version)
+		pid, _ := daemonPid(version)
 		return pid, version, true, nil
 	}
 	if len(unknown) > 0 {

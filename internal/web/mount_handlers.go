@@ -28,11 +28,13 @@ type mountRow struct {
 	AgeSeconds int64
 	Origin     string // "supervised" | "adopted (started outside this web)"
 	Pid        int
-	HasLog     bool // true when LogPath is non-empty — controls whether the detail page link is useful
+	HasLog     bool     // true when LogPath is non-empty — controls whether the detail page link is useful
+	AlsoAt     []string // bind views of this mount (v1.1 W2)
 }
 
 func (s *Server) mountList(w http.ResponseWriter, r *http.Request) {
 	d := mountListData{pageBase: s.basePage(w, r)}
+	alsoAt := AlsoVisibleAt()
 	for _, mp := range s.sup.List() {
 		st := mp.Status()
 		origin := "supervised"
@@ -57,6 +59,7 @@ func (s *Server) mountList(w http.ResponseWriter, r *http.Request) {
 			Origin:     origin,
 			Pid:        mp.Pid,
 			HasLog:     mp.LogPath != "",
+			AlsoAt:     alsoAt[mp.Mountpoint],
 		})
 	}
 	d.External = s.sup.ExternalMounts()

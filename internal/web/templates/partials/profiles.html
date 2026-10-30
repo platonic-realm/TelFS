@@ -68,7 +68,7 @@
     <tr>
       <td><code>{{.Point}}</code></td>
       <td>{{with .Profile}}{{.}}{{else}}<small>unknown</small>{{end}}</td>
-      <td>{{if .Version}}version <code>{{.Version}}</code>{{else if .ReadOnly}}read-only{{else}}read-write{{end}}</td>
+      <td>{{if .Version}}version <code>{{.Version}}</code>{{else if .ReadOnly}}read-only{{else}}read-write{{end}}{{with .ViewOf}}<br><small>view of <code>{{.}}</code></small>{{end}}</td>
     </tr>
     {{end}}
     </tbody>

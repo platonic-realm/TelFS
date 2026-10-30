@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -480,6 +481,11 @@ func (s *Supervisor) UnmountExternal(mountpoint string) error {
 		}
 	}
 	s.mu.Unlock()
+	// A bind view of a mount (S9: /mnt/telfs, /mnt/offsite) is no leftover:
+	// it belongs to whoever bound it (v1.1 W2).
+	if primary, ok := mountctl.Views(mountctl.ScanMounts())[mountpoint]; ok {
+		return fmt.Errorf("%s is a view of the mount at %s (a bind mount of it) — not a leftover; it belongs to whatever bound it there", mountpoint, primary)
+	}
 	// Confirm the mountpoint is actually a fuse.telfs entry right now.
 	found := false
 	for _, m := range scanProcMounts() {
@@ -502,18 +508,45 @@ func (s *Supervisor) UnmountExternal(mountpoint string) error {
 // in List(); this is the residual list of "we see a mount but can't
 // find the daemon", surfaced as a warning in the UI.
 func (s *Supervisor) ExternalMounts() []string {
-	all := scanProcMounts()
+	mounts := mountctl.ScanMounts()
+	views := mountctl.Views(mounts)
 	s.mu.Lock()
 	tracked := make(map[string]struct{}, len(s.procs))
 	for _, p := range s.procs {
 		tracked[p.Mountpoint] = struct{}{}
 	}
 	s.mu.Unlock()
-	out := make([]string, 0, len(all))
-	for _, m := range all {
-		if _, ok := tracked[m]; !ok {
-			out = append(out, m)
+	out := make([]string, 0, len(mounts))
+	for _, m := range mounts {
+		if _, ok := tracked[m.Point]; ok {
+			continue
 		}
+		if _, view := views[m.Point]; view {
+			continue // shown as "also visible at" on its mount's row (v1.1 W2)
+		}
+		out = append(out, m.Point)
+	}
+	return out
+}
+
+// AlsoVisibleAt maps a mountpoint to the other places its mount is visible
+// at (bind views), each with "(read-only)" when that view is.
+func AlsoVisibleAt() map[string][]string {
+	mounts := mountctl.ScanMounts()
+	ro := map[string]bool{}
+	for _, m := range mounts {
+		ro[m.Point] = m.ReadOnly
+	}
+	out := map[string][]string{}
+	for view, primary := range mountctl.Views(mounts) {
+		label := view
+		if ro[view] {
+			label += " (read-only)"
+		}
+		out[primary] = append(out[primary], label)
+	}
+	for _, v := range out {
+		sort.Strings(v)
 	}
 	return out
 }

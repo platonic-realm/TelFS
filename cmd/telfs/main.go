@@ -669,6 +669,11 @@ func cmdUnmount(_ context.Context, args []string) error {
 	var mountpoint string
 	var pid int
 	if abs, err := filepath.Abs(target); err == nil && mountctl.IsMounted(abs) {
+		// A bind view of a mount (S9: /mnt/telfs) is no daemon's mount:
+		// stopping "its" daemon would take the mount away everywhere.
+		if primary, view := mountctl.Views(mountctl.ScanMounts())[abs]; view {
+			return fmt.Errorf("unmount: %s is a view (bind mount) of the TelFS mount at %s — unmount the view with umount, or stop the filesystem with `telfs unmount %s`", abs, primary, primary)
+		}
 		mountpoint = abs
 		pid, _ = mountctl.FindDaemonPid(abs)
 	} else if p, mp, ok, ferr := mountctl.FindLiveByProfile(target); ok {

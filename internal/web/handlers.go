@@ -139,14 +139,17 @@ type mountView struct {
 	Profile  string // "" when the source does not name one
 	Version  string // a version mount's version
 	ReadOnly bool
+	ViewOf   string // a bind view of the mount at this point (v1.1 W2)
 }
 
 // mountList is every TelFS mount on the machine, with the profile it
 // serves — bind mounts of a filesystem (S9: /mnt/offsite) included.
 func mountList() []mountView {
 	var out []mountView
-	for _, m := range mountctl.ScanMounts() {
-		v := mountView{Point: m.Point, Version: mountctl.VersionOf(m), ReadOnly: m.ReadOnly}
+	mounts := mountctl.ScanMounts()
+	views := mountctl.Views(mounts)
+	for _, m := range mounts {
+		v := mountView{Point: m.Point, Version: mountctl.VersionOf(m), ReadOnly: m.ReadOnly, ViewOf: views[m.Point]}
 		if strings.HasPrefix(m.Source, mountctl.SourcePrefix) {
 			v.Profile, _ = mountctl.ProfileOf(m)
 		}

@@ -2,6 +2,7 @@ package mountctl
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -207,5 +208,38 @@ func TestWriterConflictSkipsDeadMounts(t *testing.T) {
 	// A path that answers (or does not exist) is not dead.
 	if deadPath(t.TempDir(), time.Second) || deadPath("/nonexistent/telfs", time.Second) {
 		t.Fatal("only ENOTCONN is dead")
+	}
+}
+
+// /proc/self/mountinfo with S9's layout: two daemon mounts, a rw and a ro
+// bind window of them, and an unrelated filesystem (v1.1 W2).
+func TestScanMountInfoAndViews(t *testing.T) {
+	info := filepath.Join(t.TempDir(), "mountinfo")
+	os.WriteFile(info, []byte(`22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+101 22 0:61 / /srv/services/telfs/data/mnt/cloud rw,nosuid,nodev,relatime shared:50 - fuse.telfs telfs:cloud:a972 rw,user_id=944,group_id=943,allow_other
+102 22 0:62 / /srv/services/telfs/data/mnt/backup rw,nosuid,nodev,relatime shared:51 - fuse.telfs telfs:backup:3b06 rw,user_id=944,group_id=943,allow_other
+103 22 0:61 / /mnt/telfs rw,nosuid,nodev,relatime shared:50 - fuse.telfs telfs:cloud:a972 rw,user_id=944,group_id=943,allow_other
+104 22 0:62 /photos /mnt/off\040site ro,nosuid,nodev,relatime shared:51 - fuse.telfs telfs:backup:3b06 rw,user_id=944,group_id=943,allow_other
+`), 0o600)
+	ms, err := scanMountInfo(info)
+	if err != nil || len(ms) != 4 {
+		t.Fatalf("%d mounts, %v", len(ms), err)
+	}
+	if m := ms[3]; m.Point != "/mnt/off site" || !m.ReadOnly || m.Dev != "0:62" || m.Root != "/photos" || m.Source != "telfs:backup:3b06" {
+		t.Fatalf("view entry %+v", m)
+	}
+	daemons := map[string]bool{"/srv/services/telfs/data/mnt/cloud": true, "/srv/services/telfs/data/mnt/backup": true}
+	v := views(ms, func(p string) bool { return daemons[p] })
+	if len(v) != 2 || v["/mnt/telfs"] != "/srv/services/telfs/data/mnt/cloud" || v["/mnt/off site"] != "/srv/services/telfs/data/mnt/backup" {
+		t.Fatalf("views %v", v)
+	}
+	// Daemon gone (both entries dead): the first in mount order is the mount.
+	if v := views(ms, func(string) bool { return false }); v["/mnt/telfs"] != "/srv/services/telfs/data/mnt/cloud" {
+		t.Fatalf("no daemon: %v", v)
+	}
+	// unmount <profile> names the daemon's own entry even when a view comes first.
+	reordered := []Mount{ms[2], ms[0]}
+	if _, mp, ok, _ := findByProfileWith(reordered, "cloud", true, func(p string) (int, bool) { return 7, daemons[p] }); !ok || mp != "/srv/services/telfs/data/mnt/cloud" {
+		t.Fatalf("unmount cloud → %q", mp)
 	}
 }

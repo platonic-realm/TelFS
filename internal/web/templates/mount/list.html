@@ -14,7 +14,7 @@
           {{if .HasLog}}<a href="/mount/{{pathEscape .Profile}}"><strong>{{.Profile}}</strong></a>
           {{else}}<strong>{{.Profile}}</strong>{{end}}
         </td>
-        <td><code>{{.Mountpoint}}</code></td>
+        <td><code>{{.Mountpoint}}</code>{{range .AlsoAt}}<br><small>also visible at <code>{{.}}</code></small>{{end}}</td>
         <td><small>{{.Origin}}</small></td>
         <td><small>{{if .Pid}}{{.Pid}}{{else}}—{{end}}</small></td>
         <td><span class="pill {{.StatusKind}}">{{.Status}}</span></td>
