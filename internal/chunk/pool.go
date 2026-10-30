@@ -83,6 +83,7 @@ type UploadPool struct {
 
 	qmu       sync.Mutex
 	queue     []*stagedJob
+	backoff   map[*stagedJob]*time.Timer // jobs waiting out a retry delay
 	qsignal   chan struct{}
 	qstart    sync.Once
 	busy      atomic.Int32
@@ -178,12 +179,43 @@ func (p *UploadPool) worker() {
 		if d > stagedRetryMax || d <= 0 {
 			d = stagedRetryMax
 		}
-		time.AfterFunc(d, func() {
-			if p.uploadCtx.Err() == nil {
+		p.qmu.Lock()
+		if p.backoff == nil {
+			p.backoff = map[*stagedJob]*time.Timer{}
+		}
+		p.backoff[j] = time.AfterFunc(d, func() {
+			p.qmu.Lock()
+			_, waiting := p.backoff[j]
+			delete(p.backoff, j)
+			p.qmu.Unlock()
+			if waiting && p.uploadCtx.Err() == nil {
 				p.push(j)
 			}
 		})
+		p.qmu.Unlock()
 	}
+}
+
+// KickRetries ends every staged job's retry delay now and starts its
+// backoff over: the link is back (v1.1 I6). During a long outage the
+// delays grow to stagedRetryMax (5 min); without this a chunk staged
+// before the outage waited out its delay after the network returned.
+// Returns how many jobs it woke.
+func (p *UploadPool) KickRetries() int {
+	p.qmu.Lock()
+	var woken []*stagedJob
+	for j, t := range p.backoff {
+		if t.Stop() {
+			woken = append(woken, j)
+		}
+		delete(p.backoff, j)
+	}
+	p.qmu.Unlock()
+	for _, j := range woken {
+		j.attempt = 0
+		p.push(j)
+	}
+	return len(woken)
 }
 
 // runStagedJob runs a job, turning a panic into "finished" (logged by the

@@ -163,3 +163,36 @@ func TestBackgroundPreflight(t *testing.T) {
 		t.Fatalf("a stopping daemon is no refusal: %v", err)
 	}
 }
+
+// The link comes back = the first success after it was down: down after
+// an error, or after linkDownAfter of silence with work pending.
+func TestLinkStateObserve(t *testing.T) {
+	t0 := time.Unix(1_800_000_000, 0)
+	var l linkState
+	if l.observe(t0, time.Time{}, true, t0) {
+		t.Fatal("the first success is no recovery")
+	}
+	if l.observe(t0, t0.Add(time.Second), true, t0.Add(2*time.Second)) || !l.down {
+		t.Fatal("an error after the last success: down")
+	}
+	if !l.observe(t0.Add(5*time.Second), t0.Add(time.Second), true, t0.Add(5*time.Second)) || l.down {
+		t.Fatal("a success after an error: back")
+	}
+	// Hanging calls record no error: silence with work pending.
+	ok := t0.Add(5 * time.Second)
+	if l.observe(ok, time.Time{}, true, ok.Add(10*time.Second)) || l.down {
+		t.Fatal("10 s of silence is not down yet")
+	}
+	if l.observe(ok, time.Time{}, true, ok.Add(linkDownAfter)) || !l.down {
+		t.Fatal("silence with work pending for linkDownAfter: down")
+	}
+	if !l.observe(ok.Add(time.Minute), time.Time{}, true, ok.Add(time.Minute)) {
+		t.Fatal("the next success: back")
+	}
+	// Idle silence is not an outage.
+	var idle linkState
+	idle.observe(t0, time.Time{}, false, t0)
+	if idle.observe(t0, time.Time{}, false, t0.Add(time.Hour)) || idle.down {
+		t.Fatal("an idle link is not down")
+	}
+}

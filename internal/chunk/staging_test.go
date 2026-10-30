@@ -480,3 +480,37 @@ func TestQueueModeFsyncDoesNotWaitForTelegram(t *testing.T) {
 	}
 	w.Close()
 }
+
+// When the link is back (v1.1 I6) a staged job waiting out its retry
+// delay runs at once instead.
+func TestQueueKickRetries(t *testing.T) {
+	pool, _ := newQueuePool(t, 1, 1<<20)
+	pool.retryBase = time.Hour
+	var runs atomic.Int32
+	done := make(chan struct{})
+	pool.EnqueueStaged(func(ctx context.Context) bool {
+		if runs.Add(1) == 1 {
+			return false // the link is down: retry later (in an hour)
+		}
+		close(done)
+		return true
+	})
+	for deadline := time.Now().Add(5 * time.Second); runs.Load() < 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the job never ran")
+		}
+	}
+	for deadline := time.Now().Add(5 * time.Second); pool.KickRetries() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no job in backoff to kick")
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the kicked job did not run again")
+	}
+	if n := pool.KickRetries(); n != 0 {
+		t.Fatalf("kicked %d jobs with none waiting", n)
+	}
+}

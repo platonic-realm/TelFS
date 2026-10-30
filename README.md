@@ -854,9 +854,14 @@ the rate is above what the account is allowed: lower `max_rate` or
 `connections`. When connections cannot be made (network cut, firewall,
 out of file descriptors) TelFS spaces its attempts out — 0.2 s after a
 failure, doubling to 5 s, until a server answers — instead of redialing
-in a loop; and when no upload connection has answered a part for 2
-minutes, uploads go over the main connection for a while (1 min,
-doubling to 10 min while that repeats; the log says so).
+in a loop; a connection attempt gives up after 10 s (a network that
+silently drops packets would otherwise hold it for the kernel's ~2 min
+of SYN retries); and when no upload connection has answered a part for
+2 minutes, uploads go over the main connection for a while (1 min,
+doubling to 10 min while that repeats; the log says so). When the link
+comes back after an outage, uploads waiting out their retry delay
+(which grows to 5 min) start at once (`[watchdog] link is back`); a
+connection that stays silent for 60 s while uploads wait is rebuilt.
 
 **Snapshots (format 2).** The journal holds every change, including
 where each chunk lives, so the newest snapshot plus the journal after it

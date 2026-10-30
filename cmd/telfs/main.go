@@ -1553,7 +1553,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		// mandated FLOOD_WAIT window is in effect), fire the
 		// SessionManager's Reconnect signal so a wedged MTProto
 		// connection auto-recovers without manual restart.
-		go stallWatchdog(signalCtx, pool, mgr, client.Tracker())
+		go stallWatchdog(signalCtx, pool, packer, mgr, client.Tracker())
 
 		// Format 2: check that the channel's pinned key message exists
 		// and matches the local key header — at mount and every 6 h.
@@ -1807,34 +1807,25 @@ func daemonStatusHandler(profile, mountpoint string, format int) http.HandlerFun
 	}
 }
 
-// stallWatchdog periodically samples RPC-level progress and triggers a
-// session reconnect when there's pending chunk work but not a single
-// successful RPC in the last stallThreshold.
-//
-// Progress is measured at the RPC level (tracker.TotalOK), NOT at
-// whole-chunk completions: a 64 MiB tier chunk is ~128 rate-limited
-// SaveBigFilePart calls, so its first chunk completion can be minutes
-// away even on a healthy connection. The old chunk-level probe
-// declared that a stall, reconnected, threw away every uploaded part,
-// and looped — big files could never finish.
-//
-// A server-mandated FLOOD_WAIT quiet period (tracker.FloodWaitUntil)
-// also suppresses the watchdog: no RPC succeeds during the sleep by
-// design, and reconnecting doesn't shorten the server-side window —
-// it just burns quota re-uploading parts.
-//
-// On stall: logs to stderr (visible in daemon log) + calls
-// mgr.Reconnect (tears down the gotd session, re-establishes via
-// the SessionManager's run loop). Cooldown between reconnects
-// prevents a thrash loop if the underlying network is genuinely down.
-func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionManager, tr *tg.Tracker) {
-	const sampleInterval = 30 * time.Second
-	const stallThreshold = 90 * time.Second
-	const reconnectCooldown = 2 * time.Minute
+// stallWatchdog watches the link while the mount runs:
+//   - when chunk work is pending and no RPC has succeeded for
+//     stallThreshold (outside a server-mandated FLOOD_WAIT), it forces an
+//     MTProto reconnect, so a wedged connection recovers without a restart;
+//   - when the link comes back after being down (v1.1 I6), staged uploads
+//     and the packer retry at once instead of waiting out their backoff,
+//     which grows to 5 min during a long outage (S9: the network returned
+//     at 23:45:35, a staged chunk landed only at ~23:49:30).
+func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, packer *chunk.Packer, mgr *tg.SessionManager, tr *tg.Tracker) {
+	const (
+		sampleInterval    = 5 * time.Second
+		stallThreshold    = 60 * time.Second
+		reconnectCooldown = 90 * time.Second
+	)
 	var (
 		lastOK        int64
 		stalledSince  time.Time
 		lastReconnect time.Time
+		link          linkState
 	)
 	tick := time.NewTicker(sampleInterval)
 	defer tick.Stop()
@@ -1845,6 +1836,15 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionM
 		case <-tick.C:
 			pending := pool.Pending.Total()
 			snap := tr.Snapshot()
+			if link.observe(snap.LastSuccess, snap.LastError, pending > 0, time.Now()) {
+				n := pool.KickRetries()
+				if packer != nil {
+					packer.KickRetries()
+				}
+				if n > 0 {
+					fmt.Fprintf(os.Stderr, "[watchdog] link is back: retrying %d staged upload(s) now\n", n)
+				}
+			}
 			if pending == 0 || snap.TotalOK != lastOK {
 				// Idle (nothing pending) OR RPCs are landing.
 				stalledSince = time.Time{}
@@ -1873,10 +1873,37 @@ func stallWatchdog(ctx context.Context, pool *chunk.UploadPool, mgr *tg.SessionM
 					"Forcing MTProto reconnect.\n",
 				pending, elapsed.Round(time.Second))
 			mgr.Reconnect()
+			link.down = true
 			lastReconnect = time.Now()
 			stalledSince = time.Time{} // give the new session a chance
 		}
 	}
+}
+
+// linkState tells when the link to Telegram came back. It is down when the
+// newest RPC event was an error, or when work was pending and nothing
+// succeeded for linkDownAfter (calls into a dead connection may simply
+// hang, recording no error); the first success after that is "back".
+type linkState struct {
+	seenOK time.Time
+	down   bool
+}
+
+const linkDownAfter = 30 * time.Second
+
+// observe takes one sample and reports whether the link just came back.
+func (l *linkState) observe(lastOK, lastErr time.Time, pending bool, now time.Time) (back bool) {
+	if lastOK.After(l.seenOK) {
+		l.seenOK = lastOK
+		if l.down {
+			l.down = false
+			return true
+		}
+	}
+	if lastErr.After(lastOK) || (pending && now.Sub(lastOK) >= linkDownAfter) {
+		l.down = true
+	}
+	return false
 }
 
 // cacheJSONHandler emits the LRU disk cache's live state — size,

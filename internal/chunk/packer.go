@@ -376,6 +376,22 @@ func (p *Packer) requeue(rs []packReq, err error) {
 	fmt.Fprintf(os.Stderr, "[packer] %d staged chunk(s) kept for retry in %s: %v\n", len(rs), d, err)
 }
 
+// KickRetries ends a failed batch's retry delay now (the link is back,
+// v1.1 I6) and starts the backoff over.
+func (p *Packer) KickRetries() {
+	p.mu.Lock()
+	waiting := !p.retryUntil.IsZero() && time.Now().Before(p.retryUntil)
+	p.retryUntil = time.Time{}
+	p.retryN = 0
+	p.mu.Unlock()
+	if waiting {
+		select {
+		case p.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func (p *Packer) submit(req packReq) <-chan packResult {
 	ch := make(chan packResult, 1)
 	req.result = ch

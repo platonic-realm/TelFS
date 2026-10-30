@@ -35,9 +35,16 @@ const (
 	dialBackoffMax  = 5 * time.Second
 )
 
+// dialTimeout bounds one TCP connect. Without it a dial into a network
+// that silently drops packets waits for the kernel's SYN retries (~2 min
+// on Linux), and once the network is back the next retransmit can be a
+// minute away — S9 saw uploads resume only minutes after the network
+// returned (v1.1 I6).
+const dialTimeout = 10 * time.Second
+
 func newDialGate(dial dcs.DialFunc) *dialGate {
 	if dial == nil {
-		var d net.Dialer
+		d := net.Dialer{Timeout: dialTimeout}
 		dial = d.DialContext
 	}
 	return &dialGate{dial: dial, base: dialBackoffBase, max: dialBackoffMax}
