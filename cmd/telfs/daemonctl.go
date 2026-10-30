@@ -240,6 +240,21 @@ type syncTok struct {
 	journal      int64  // journal seq to be posted, fixed once those uploads landed
 	journalFixed bool
 	created      time.Time
+	// A sync token lives while a client waits on it (v1.1 S10): waiters
+	// counts the long-polls in progress, lastSeen is when the last one
+	// ended. Tokens used to be dropped one hour after they were made —
+	// a `sync --wait` of a long backup then got 404 (S9 waited in
+	// 50-minute rounds to stay inside it). Guarded by daemonCtl.syncMu.
+	waiters  int
+	lastSeen time.Time
+}
+
+// syncTokIdle is how long a token outlives its last waiter.
+const syncTokIdle = 2 * time.Minute
+
+// abandoned reports a token no client waits on any more.
+func (t *syncTok) abandoned(now time.Time) bool {
+	return t.waiters == 0 && now.Sub(t.lastSeen) > syncTokIdle
 }
 
 // sampleRate records the upload byte counter every 10 s (for the rate in
@@ -562,13 +577,13 @@ func (d *daemonCtl) handler() http.Handler {
 			d.syncToks = map[uint64]*syncTok{}
 		}
 		for id, t := range d.syncToks {
-			if time.Since(t.created) > time.Hour {
+			if t.abandoned(time.Now()) {
 				delete(d.syncToks, id)
 			}
 		}
 		d.syncNext++
 		id := d.syncNext
-		d.syncToks[id] = &syncTok{reg: reg, created: time.Now()}
+		d.syncToks[id] = &syncTok{reg: reg, created: time.Now(), lastSeen: time.Now()}
 		d.syncMu.Unlock()
 		if d.poster != nil {
 			d.poster.Kick()
@@ -584,11 +599,20 @@ func (d *daemonCtl) handler() http.Handler {
 		}
 		d.syncMu.Lock()
 		t := d.syncToks[id]
+		if t != nil {
+			t.waiters++
+		}
 		d.syncMu.Unlock()
 		if t == nil {
 			writeJSON(w, http.StatusNotFound, syncReply{Error: "unknown or expired sync token"})
 			return
 		}
+		defer func() {
+			d.syncMu.Lock()
+			t.waiters--
+			t.lastSeen = time.Now()
+			d.syncMu.Unlock()
+		}()
 		deadline := time.Now().Add(maxWait)
 		for {
 			rep := d.syncCheck(r.Context(), t)

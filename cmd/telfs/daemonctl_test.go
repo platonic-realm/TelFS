@@ -261,3 +261,30 @@ func TestLastErrorStatus(t *testing.T) {
 		t.Fatalf("recovered: %+v", e)
 	}
 }
+
+// A sync token lives while a client waits (v1.1 S10), however old it is;
+// it goes syncTokIdle after its last waiter left.
+func TestSyncTokenLifetime(t *testing.T) {
+	now := time.Now()
+	old := &syncTok{created: now.Add(-3 * time.Hour), lastSeen: now.Add(-3 * time.Hour), waiters: 1}
+	if old.abandoned(now) {
+		t.Fatal("a 3-hour-old token with a waiter is alive")
+	}
+	old.waiters = 0
+	old.lastSeen = now.Add(-time.Minute)
+	if old.abandoned(now) {
+		t.Fatal("a token whose waiter left a minute ago is alive")
+	}
+	old.lastSeen = now.Add(-syncTokIdle - time.Second)
+	if !old.abandoned(now) {
+		t.Fatal("a token nobody waited on for syncTokIdle is dropped")
+	}
+	// Through the routes: an old token being waited on survives a new begin.
+	d, _, _ := newSyncDaemon(t)
+	d.syncToks = map[uint64]*syncTok{7: {created: now.Add(-2 * time.Hour), lastSeen: now}}
+	rec := httptest.NewRecorder()
+	d.handler().ServeHTTP(rec, httptest.NewRequest("POST", "/sync/begin", nil))
+	if _, ok := d.syncToks[7]; !ok {
+		t.Fatal("a recently waited-on token was dropped by age")
+	}
+}
