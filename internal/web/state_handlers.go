@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 
 	"telfs/internal/chunk"
 	"telfs/internal/config"
@@ -41,8 +43,15 @@ type stateShowData struct {
 	Stats meta.Stats
 	KV    []meta.MetaKVEntry
 
-	// Partial-file repair candidates from the read-only scan.
-	Partials []meta.RepairReport
+	// Partial-file repair candidates from the read-only scan, and the
+	// first rows of them the panel lists.
+	Partials      []meta.RepairReport
+	PartialsShown []meta.RepairReport
+
+	// FileBytes is the logical size of every file; SnapUnix when the
+	// last snapshot was taken (0 = unknown).
+	FileBytes int64
+	SnapUnix  int64
 
 	// Warning when a fuse.telfs mount is live (repair while writes are
 	// happening can collide). Best-effort: /proc/mounts can't attribute
@@ -180,6 +189,13 @@ func (s *Server) stateData(w http.ResponseWriter, r *http.Request) stateShowData
 	}
 	if parts, err := mstore.ScanPartialFiles(ctx, stagedCheckerFor(d.PendingDir)); err == nil {
 		d.Partials = parts
+		d.PartialsShown = parts[:min(len(parts), 20)]
+	}
+	if u, err := mstore.Usage(ctx); err == nil {
+		d.FileBytes = u.FileBytes
+	}
+	if v, err := mstore.GetKV(ctx, snapshot.KVLastSnapUnix); err == nil {
+		d.SnapUnix, _ = strconv.ParseInt(strings.TrimSpace(string(v)), 10, 64)
 	}
 	return d
 }

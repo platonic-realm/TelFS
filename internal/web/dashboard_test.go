@@ -380,7 +380,22 @@ func TestNavigation(t *testing.T) {
 	req := httptest.NewRequest("GET", "/partials/state?profile=cloud", nil)
 	req.Host = "127.0.0.1"
 	h.ServeHTTP(rec, req)
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Inodes") || strings.Contains(rec.Body.String(), "<html") {
-		t.Fatalf("state partial: %d %s", rec.Code, rec.Body.String())
+	body := rec.Body.String()
+	if rec.Code != 200 || strings.Contains(body, "<html") {
+		t.Fatalf("state partial: %d %s", rec.Code, body)
+	}
+	for _, want := range []string{`class="figures"`, ">Files<", `class="checks"`, "on the channel", "no damage", "This machine"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("state panel lacks %q", want)
+		}
+	}
+}
+
+// Figures read compactly: exact to 9,999, then K and M.
+func TestCompactNum(t *testing.T) {
+	for n, want := range map[int64]string{0: "0", 999: "999", 1284: "1,284", 12_900: "12.9K", 40_000: "40K", 1_103_308: "1.1M", 2_000_000: "2M"} {
+		if got := compactNum(n); got != want {
+			t.Errorf("%d: %q, want %q", n, got, want)
+		}
 	}
 }

@@ -278,6 +278,10 @@ func tmplFuncs() template.FuncMap {
 		// rate renders bytes per second the way config.toml writes it
 		// (decimal MB/s: max_rate = "5MB/s").
 		"rate": rateText,
+		// compact renders a count for a figure: 1,284 · 12.9K · 1.1M.
+		"compact": compactNum,
+		"int64": func(i int) int64 { return int64(i) },
+		"sub":   func(a, b int) int { return a - b },
 		// md renders `code` spans in help text as <code> (the text is
 		// escaped first).
 		"md":        mdCode,

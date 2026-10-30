@@ -337,3 +337,20 @@ func mdCode(s string) template.HTML {
 	}
 	return template.HTML(b.String())
 }
+
+// compactNum renders a count the way a figure reads best: exact up to
+// 9,999 (with a thousands separator), then 12.9K, 1.1M.
+func compactNum(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		return trimZero(fmt.Sprintf("%.1f", float64(n)/1e6)) + "M"
+	case n >= 10_000:
+		return trimZero(fmt.Sprintf("%.1f", float64(n)/1e3)) + "K"
+	case n >= 1_000:
+		return fmt.Sprintf("%d,%03d", n/1000, n%1000)
+	default:
+		return fmt.Sprint(n)
+	}
+}
+
+func trimZero(s string) string { return strings.TrimSuffix(s, ".0") }
