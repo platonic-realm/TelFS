@@ -25,7 +25,8 @@ import (
 // versionMountOpts are the `telfs mount` flags a version mount uses.
 type versionMountOpts struct {
 	name, mountpoint                    string
-	allowOther, debug, service          bool
+	allowOther, defaultPerms            bool
+	debug, service                      bool
 	cacheCap, memCacheCap, blobPrefetch string
 	prefetchWindow, prefetchConcurrency int
 }
@@ -317,13 +318,14 @@ func serveVersion(signalCtx context.Context, cfg *config.Config, o versionMountO
 		}
 	}()
 	server, err := telfsfs.Mount(telfsfs.MountOptions{
-		MountPoint: o.mountpoint,
-		AllowOther: o.allowOther,
-		Debug:      o.debug,
-		Profile:    cfg.ProfileName(),
-		FSUUID:     fsUUID,
-		Version:    o.name,
-		ReadOnly:   true,
+		MountPoint:         o.mountpoint,
+		AllowOther:         o.allowOther,
+		DefaultPermissions: o.defaultPerms,
+		Debug:              o.debug,
+		Profile:            cfg.ProfileName(),
+		FSUUID:             fsUUID,
+		Version:            o.name,
+		ReadOnly:           true,
 	}, backend)
 	if err != nil {
 		return err

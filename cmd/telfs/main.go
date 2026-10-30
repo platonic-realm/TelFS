@@ -91,7 +91,10 @@ Usage:
       --key-header FILE             Recover with a key export (missing DB only).
       --metrics-addr ADDR           Also serve Prometheus /metrics over TCP
                                       (off by default).
-      --allow-other --debug --no-recover
+      --allow-other                 Let other users in; the kernel checks the
+                                      stored owners and modes
+                                      (--no-default-permissions: no checks).
+      --debug --no-recover
       --cache-cap --mem-cache-cap --prefetch-window --prefetch-concurrency
       --blob-prefetch               Cache and read tuning (telfs mount -h).
   telfs unmount [--timeout D] <mountpoint|profile>
@@ -710,7 +713,8 @@ func cmdUnmount(_ context.Context, args []string) error {
 func cmdMount(signalCtx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
 	readonly := fs.Bool("readonly", false, "mount read-only (rejects all write ops with EROFS)")
-	allowOther := fs.Bool("allow-other", false, "allow other users to access the mount (FUSE -o allow_other; requires user_allow_other in /etc/fuse.conf)")
+	allowOther := fs.Bool("allow-other", false, "allow other users to access the mount (FUSE -o allow_other; requires user_allow_other in /etc/fuse.conf); the kernel then checks every access against the stored owners and modes (default_permissions)")
+	noDefaultPerms := fs.Bool("no-default-permissions", false, "with --allow-other: do NOT let the kernel check owners and modes — every local user reads and writes everything (the behaviour before v1.1)")
 	debug := fs.Bool("debug", false, "log every FUSE op")
 	noRecover := fs.Bool("no-recover", false, "never recover from the channel: with no local DB the mount fails instead (a filesystem is created only by telfs init)")
 	metricsAddr := fs.String("metrics-addr", "", "also serve Prometheus /metrics (and /telegram, /cache) over TCP at this address, e.g. 127.0.0.1:9090. Off by default: status, sync and the web console use the profile's owner-only control socket.")
@@ -782,7 +786,7 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	}
 	if *versionName != "" {
 		return mountVersion(signalCtx, cfg, versionMountOpts{name: *versionName, mountpoint: mountpoint,
-			allowOther: *allowOther, debug: *debug, service: *serviceFlag, cacheCap: *cacheCap,
+			allowOther: *allowOther, defaultPerms: ownerChecks(*allowOther, *noDefaultPerms), debug: *debug, service: *serviceFlag, cacheCap: *cacheCap,
 			memCacheCap: *memCacheCap, blobPrefetch: *blobPrefetch,
 			prefetchWindow: *prefetchWindow, prefetchConcurrency: *prefetchConcurrency})
 	}
@@ -1334,12 +1338,13 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		}()
 
 		server, err := telfsfs.Mount(telfsfs.MountOptions{
-			MountPoint: mountpoint,
-			AllowOther: *allowOther,
-			Debug:      *debug,
-			Profile:    cfg.ProfileName(),
-			FSUUID:     fsUUID,
-			ReadOnly:   *readonly,
+			MountPoint:         mountpoint,
+			AllowOther:         *allowOther,
+			DefaultPermissions: ownerChecks(*allowOther, *noDefaultPerms),
+			Debug:              *debug,
+			Profile:            cfg.ProfileName(),
+			FSUUID:             fsUUID,
+			ReadOnly:           *readonly,
 		}, backend)
 		if err != nil {
 			return err
@@ -1568,6 +1573,13 @@ func cmdMount(signalCtx context.Context, args []string) error {
 		go control.Serve(signalCtx, ctlLn, ctlPath, ctl.handler())
 		go ctl.sampleRate(signalCtx)
 
+		if *allowOther {
+			if ownerChecks(*allowOther, *noDefaultPerms) {
+				fmt.Println("Other users: allowed; the kernel checks every access against the stored owners and modes (default_permissions).")
+			} else {
+				fmt.Println("WARNING: --no-default-permissions: every local user can read and write everything on this mount.")
+			}
+		}
 		fmt.Printf("Mounted at %s. Press ^C to unmount.\n", mountpoint)
 		svc.markReady(mountpoint)
 		<-signalCtx.Done()

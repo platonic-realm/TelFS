@@ -126,3 +126,9 @@ func (s *service) retryAtBoot(ctx context.Context, what string, step func(contex
 		}
 	}
 }
+
+// ownerChecks says whether a mount passes default_permissions (v1.1 B2):
+// with --allow-other the kernel checks every access against the stored
+// owners and modes unless --no-default-permissions says otherwise. Without
+// --allow-other only the mounting user reaches the mount; no check needed.
+func ownerChecks(allowOther, optOut bool) bool { return allowOther && !optOut }

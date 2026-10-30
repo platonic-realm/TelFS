@@ -29,6 +29,12 @@ type MountOptions struct {
 	// ReadOnly adds the kernel "ro" option (the backend refuses writes
 	// with EROFS too); visible in /proc/mounts.
 	ReadOnly bool
+	// DefaultPermissions adds the kernel "default_permissions" option:
+	// the kernel checks every access against the stored owner and mode
+	// (TelFS itself checks nothing). The mount sets it whenever
+	// AllowOther is on (v1.1 B2): without it every local account that
+	// reaches the mount reads and writes everything.
+	DefaultPermissions bool
 }
 
 // Mount creates and starts a FUSE server backed by b at opts.MountPoint.
@@ -45,6 +51,16 @@ type MountOptions struct {
 // to tear down the *Session that owns the underlying gotd client.
 func Mount(opts MountOptions, b *Backend) (*serverHandle, error) {
 	root := NewRoot(b)
+	fuseOpts := fuseOptions(opts)
+	srv, err := gofuse.Mount(opts.MountPoint, root, fuseOpts)
+	if err != nil {
+		return nil, fmt.Errorf("fs: mount %s: %w", opts.MountPoint, err)
+	}
+	return &serverHandle{srv: srv, mountpoint: opts.MountPoint}, nil
+}
+
+// fuseOptions turns MountOptions into go-fuse's options.
+func fuseOptions(opts MountOptions) *gofuse.Options {
 	fuseOpts := &gofuse.Options{}
 	fuseOpts.MountOptions.Debug = opts.Debug
 	fuseOpts.MountOptions.AllowOther = opts.AllowOther
@@ -58,6 +74,9 @@ func Mount(opts MountOptions, b *Backend) (*serverHandle, error) {
 	}
 	if opts.ReadOnly {
 		fuseOpts.MountOptions.Options = append(fuseOpts.MountOptions.Options, "ro")
+	}
+	if opts.DefaultPermissions {
+		fuseOpts.MountOptions.Options = append(fuseOpts.MountOptions.Options, "default_permissions")
 	}
 	// CAP_WRITEBACK_CACHE lets the kernel coalesce small writes into the
 	// MaxWrite-sized requests we already handle efficiently. For workloads
@@ -110,10 +129,5 @@ func Mount(opts MountOptions, b *Backend) (*serverHandle, error) {
 	// background prefetches; raising it lets the prefetcher and
 	// foreground reads coexist freely.
 	fuseOpts.MountOptions.MaxBackground = 64
-
-	srv, err := gofuse.Mount(opts.MountPoint, root, fuseOpts)
-	if err != nil {
-		return nil, fmt.Errorf("fs: mount %s: %w", opts.MountPoint, err)
-	}
-	return &serverHandle{srv: srv, mountpoint: opts.MountPoint}, nil
+	return fuseOpts
 }

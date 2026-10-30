@@ -109,3 +109,9 @@ func TestServiceNotifications(t *testing.T) {
 		t.Fatalf("stopping %q", got)
 	}
 }
+
+func TestOwnerChecks(t *testing.T) {
+	if !ownerChecks(true, false) || ownerChecks(true, true) || ownerChecks(false, false) {
+		t.Fatal("default_permissions: on with --allow-other unless opted out, off without --allow-other")
+	}
+}

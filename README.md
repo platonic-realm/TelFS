@@ -224,7 +224,15 @@ telfs mount [--readonly [--version NAME]] [--service] [--key-header FILE]
             [--allow-other] [--debug] [--no-recover] [--metrics-addr ADDR] <mountpoint>
 ```
 
-`--allow-other` needs `user_allow_other` in `/etc/fuse.conf`.
+`--allow-other` needs `user_allow_other` in `/etc/fuse.conf`. With it,
+the kernel checks every access against the owners and modes TelFS
+stores (`default_permissions`) — the same rules as on a local disk;
+`--no-default-permissions` turns that off (every local user can then
+read and write everything, the behaviour before v1.1). Every file
+carries the uid/gid of whoever created it; the root directory belongs
+to whoever ran `telfs init` (mode 0755), so other accounts may need a
+one-time `chown`/`chmod` of the mount's root (as root, through the
+mount).
 `--debug` logs every FUSE op (very chatty). `--service` is for systemd
 (see [Running unattended](#running-unattended)), `--key-header` for a
 recovery without the pinned key message (see [Recovery](#recovery)).
