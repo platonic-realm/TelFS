@@ -1,0 +1,80 @@
+{{define "profiles_panel"}}
+<section class="card" id="profiles-panel" hx-get="/partials/profiles" hx-trigger="every 5s" hx-swap="outerHTML">
+  <h3>Profiles <small>— every profile, live (5 s). The selected one is what the Setup, Browse and State pages act on.</small></h3>
+  {{if .Monitors}}
+  <table class="ledger">
+    <thead><tr>
+      <th>Profile</th><th>Mount</th><th>Link</th><th>Channel copy</th>
+      <th class="num">Backlog</th><th class="num">Upload</th><th></th>
+    </tr></thead>
+    <tbody>
+    {{range .Monitors}}
+    <tr{{if .Selected}} class="selected"{{end}}>
+      <td>
+        <a href="/profiles/{{.Name}}"><strong>{{.Name}}</strong></a>
+        {{if .Selected}}<span class="pill acc" title="The Setup, Browse and State pages act on this profile">selected</span>{{end}}
+        {{with .Err}}<br><small class="err-text">{{.}}</small>{{end}}
+      </td>
+      <td>
+        {{with .Mountpoint}}<code>{{.}}</code>{{else}}{{if .Online}}<small>mounted</small>{{else}}<small>not mounted</small>{{end}}{{end}}
+        {{if .ReadOnly}}<small>· read-only</small>{{end}}
+      </td>
+      <td><span class="pill {{.LinkKind}}" title="{{.LinkTip}}">{{.LinkLabel}}</span></td>
+      <td><span class="pill {{.SyncKind}}" title="{{.SyncTip}}">{{.SyncLabel}}</span></td>
+      <td class="num">
+        {{with .Live}}
+          {{.Sync.PendingUploads}} upload(s) · {{humanBytes .Sync.PendingBytes}}
+          {{if .Staging.CapBytes}}<br><small{{if .Staging.Blocked}} class="err-text"{{end}}>staged {{printf "%.0f" .StagingPct}} % of {{humanBytes .Staging.CapBytes}}{{if .Staging.Blocked}} — writes wait{{end}}</small>{{end}}
+          {{if .Sync.JournalUnposted}}<br><small>{{.Sync.JournalUnposted}} journal op(s) to post</small>{{end}}
+          {{with .Sync.SnapshotDue}}<br><small title="{{.}}">snapshot owed</small>{{end}}
+        {{else}}<small>—</small>{{end}}
+      </td>
+      <td class="num">
+        {{with .Live}}{{with .Upload}}
+          {{humanBytes .RateBytesPerS}}/s
+          <br><small>{{.Connections}} conn{{if .RateCapBytesPerS}} · cap {{humanBytes .RateCapBytesPerS}}/s{{end}}</small>
+        {{else}}<small>—</small>{{end}}{{else}}<small>—</small>{{end}}
+      </td>
+      <td class="actions">
+        <a class="btn small muted" href="/telegram?profile={{.Name}}" title="RPCs, queues and rate limits of {{.Name}}">Telegram</a>
+        {{if not .Selected}}
+        <form class="inline-form" method="post" action="/profiles/{{.Name}}/use">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <button class="small" type="submit" title="Make the Setup, Browse and State pages act on {{.Name}}">Select</button>
+        </form>
+        {{end}}
+      </td>
+    </tr>
+    {{with .Live}}{{with .LastError}}
+    <tr class="sub"><td></td><td colspan="6"><small class="err-text">last error {{ago .Unix}}: {{.Text}}</small></td></tr>
+    {{end}}{{end}}
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+    <p><em>No profiles.</em> <a href="/profiles/new">Create one</a>.</p>
+  {{end}}
+</section>
+{{end}}
+
+{{define "mounts_panel"}}
+<section class="card" id="mounts-panel" hx-get="/partials/status" hx-trigger="every 10s" hx-swap="outerHTML">
+  <h3>Mounts <small>— every TelFS mount on this machine (10 s)</small></h3>
+  {{if .MountList}}
+  <table class="ledger">
+    <thead><tr><th>Mountpoint</th><th>Profile</th><th>Kind</th></tr></thead>
+    <tbody>
+    {{range .MountList}}
+    <tr>
+      <td><code>{{.Point}}</code></td>
+      <td>{{with .Profile}}{{.}}{{else}}<small>unknown</small>{{end}}</td>
+      <td>{{if .Version}}version <code>{{.Version}}</code>{{else if .ReadOnly}}read-only{{else}}read-write{{end}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+    <p><em>No TelFS mounts.</em></p>
+  {{end}}
+</section>
+{{end}}

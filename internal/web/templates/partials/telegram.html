@@ -1,5 +1,5 @@
 {{define "telegram_panel"}}
-<section id="tg-panel" hx-get="/partials/telegram" hx-trigger="every 2s" hx-swap="outerHTML">
+<section id="tg-panel" hx-get="/partials/telegram{{with .Profile}}?profile={{.}}{{end}}" hx-trigger="every 2s" hx-swap="outerHTML">
 {{if not .Online}}
 <div class="panel error">
   <p><strong>Daemon /telegram endpoint unreachable.</strong></p>

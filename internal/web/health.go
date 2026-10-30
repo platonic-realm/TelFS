@@ -2,14 +2,18 @@ package web
 
 import (
 	"fmt"
+	"html/template"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
-// healthPartial renders the small one-line pill that lives in the
-// header on every page. Polled every 5 s via HTMX. Reads from the
-// running daemon's /telegram JSON over the profile's control socket
-// (no daemon → red pill).
+// healthPartial renders the masthead lamps on every page: one pair per
+// profile that has a filesystem or a running daemon — every profile, not
+// only the selected one, because several run at once (S9: backup and
+// cloud). Polled every 5 s via HTMX. Each pair reads its own daemon's
+// /telegram JSON over that profile's control socket (no daemon → red).
 //
 // Status rules — keep them simple so an operator can predict what
 // turns the pill yellow vs red without reading code:
@@ -31,20 +35,36 @@ import (
 // BYTES are to the cap, and whether writes actually wait.
 func (s *Server) healthPartial(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	state := s.fetchTelegramStatePartial(r)
-	kind, label, tip := classifyHealth(state)
-	// Two lamps in one swap target: link health + channel sync. The
-	// sync lamp answers "is the channel a complete copy — could I
-	// lose this machine right now?" (see classifySync); green means
-	// yes, including the offline "as of last unmount" case.
-	fmt.Fprintf(w,
-		`<span id="health-pill" class="pill-pair" hx-get="/partials/health" hx-trigger="every 5s" hx-swap="outerHTML">`+
+	_, _ = io.WriteString(w, renderLamps(lampProfiles(monitorProfiles(r.Context(), monLamps))))
+}
+
+// renderLamps is the masthead fragment: per profile its name and two
+// lamps — link health, and channel sync ("is the channel a complete copy —
+// could I lose this machine right now?", see classifySync) — linking to
+// that profile's Telegram page.
+func renderLamps(profiles []profileMonitor) string {
+	var b strings.Builder
+	b.WriteString(`<span id="health-pill" class="lamp-sets" hx-get="/partials/health" hx-trigger="every 5s" hx-swap="outerHTML">`)
+	if len(profiles) == 0 {
+		b.WriteString(`<span class="pill muted" title="No profile yet — Setup → Guided wizard.">no profile</span>`)
+	}
+	for _, p := range profiles {
+		cls := "lamp-set"
+		if p.Selected {
+			cls += " selected"
+		}
+		fmt.Fprintf(&b, `<a class="%s" href="/telegram?profile=%s" title="%s">`+
+			`<span class="lamp-name">%s</span>`+
 			`<span class="pill %s" title="%s">%s</span>`+
 			`<span class="pill %s" title="%s">%s</span>`+
-			`</span>`,
-		kind, htmlAttr(tip), label,
-		state.SyncKind, htmlAttr(state.SyncTip), state.SyncLabel,
-	)
+			`</a>`,
+			cls, url.QueryEscape(p.Name), htmlAttr("Profile "+p.Name+" — open its Telegram page"),
+			template.HTMLEscapeString(p.Name),
+			p.LinkKind, htmlAttr(p.LinkTip), p.LinkLabel,
+			p.SyncKind, htmlAttr(p.SyncTip), p.SyncLabel)
+	}
+	b.WriteString(`</span>`)
+	return b.String()
 }
 
 func classifyHealth(state tgPageData) (kind, label, tip string) {

@@ -19,6 +19,7 @@ import (
 	"telfs/internal/config"
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
+	"telfs/internal/mountctl"
 	"telfs/internal/snapshot"
 )
 
@@ -37,13 +38,14 @@ type dashboardData struct {
 	ChunkSize int64
 	Crypto    cryptoView
 	LastSnap  string
-	Files     []fileStat
-	CacheSize int64
-	CacheN    int
 	Mounts    []string
 	Profiles  []string
 	Active    string
 	Setup     setupChecklist
+	// Monitors is every profile's row (dashboard tables); MountList every
+	// TelFS mount on the machine with the profile it serves.
+	Monitors  []profileMonitor
+	MountList []mountView
 }
 
 // setupChecklist surfaces which onboarding steps are still pending so
@@ -97,30 +99,60 @@ type cryptoView struct {
 	Argon   string
 }
 
-type fileStat struct {
-	Label string
-	Size  int64
-	Mtime string
-}
-
 type flashData struct{ Kind, Msg string }
 
+// dashboardIndex: every profile first (live table, the selected one
+// marked), then the setup checklist while a step is open, then every
+// profile's channel and filesystem, then every TelFS mount.
 func (s *Server) dashboardIndex(w http.ResponseWriter, r *http.Request) {
 	d := s.loadDashboard(r.Context(), w, r)
-	s.renderTemplate(w, "dashboard.html", d)
+	d.Monitors = monitorProfiles(r.Context(), monFull)
+	d.MountList = mountList()
+	s.renderTemplateWith(w, "dashboard.html", d, "templates/partials/profiles.html")
 }
 
+// profilesPanelData is the polled profile table's data (the same field
+// names as dashboardData, so the block renders from either).
+type profilesPanelData struct {
+	CSRF     string
+	Monitors []profileMonitor
+}
+
+// profilesPartial re-renders the dashboard's profile table every 5 s.
+// Never through loadDashboard: that consumes the flash before the user
+// sees it. EnsureCSRF reuses the browser's token (no rotation), so the
+// table's Select buttons keep working across polls.
+func (s *Server) profilesPartial(w http.ResponseWriter, r *http.Request) {
+	d := profilesPanelData{CSRF: s.state.EnsureCSRF(w, r), Monitors: monitorProfiles(r.Context(), monLive)}
+	s.renderPartialBlock(w, "partials/profiles.html", "profiles_panel", d)
+}
+
+// statusPartial re-renders the dashboard's mount list (every 10 s).
 func (s *Server) statusPartial(w http.ResponseWriter, r *http.Request) {
-	// Partial polls every 10s; MUST NOT go through loadDashboard
-	// because that calls basePage → ConsumeFlash + EnsureCSRF. The
-	// flash would be silently eaten before the user saw it, and a
-	// server restart between page render and form submit would
-	// rotate the CSRF cookie under the form. Build a minimal data
-	// shape with only what the partial template references.
-	d := struct {
-		Mounts []string
-	}{Mounts: activeMounts()}
-	s.renderPartial(w, "partials/status.html", d)
+	d := struct{ MountList []mountView }{MountList: mountList()}
+	s.renderPartialBlock(w, "partials/profiles.html", "mounts_panel", d)
+}
+
+// mountView is one fuse.telfs entry in /proc/mounts.
+type mountView struct {
+	Point    string
+	Profile  string // "" when the source does not name one
+	Version  string // a version mount's version
+	ReadOnly bool
+}
+
+// mountList is every TelFS mount on the machine, with the profile it
+// serves — bind mounts of a filesystem (S9: /mnt/offsite) included.
+func mountList() []mountView {
+	var out []mountView
+	for _, m := range mountctl.ScanMounts() {
+		v := mountView{Point: m.Point, Version: mountctl.VersionOf(m), ReadOnly: m.ReadOnly}
+		if strings.HasPrefix(m.Source, mountctl.SourcePrefix) {
+			v.Profile, _ = mountctl.ProfileOf(m)
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // setupWizardData drives the /setup page. CurrentIdx is the 0-based
@@ -308,25 +340,6 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 		d.DataDir = cfg.DataDir
 		if cfg.Channel.ID != 0 {
 			d.Channel = channelView{Set: true, ID: cfg.Channel.ID, Title: cfg.Channel.Title}
-		}
-		// Per-file stats.
-		for _, f := range []struct {
-			Path  string
-			Label string
-		}{
-			{cfg.ConfigPath(), "config.toml"},
-			{cfg.SessionPath(), "session.enc"},
-			{cfg.DBPath(), "db.sqlite"},
-		} {
-			if info, err := os.Stat(f.Path); err == nil {
-				d.Files = append(d.Files, fileStat{Label: f.Label, Size: info.Size(), Mtime: info.ModTime().Format("2006-01-02 15:04:05")})
-			} else {
-				d.Files = append(d.Files, fileStat{Label: f.Label})
-			}
-		}
-		if total, n, err := dirStats(cfg.CachePath()); err == nil {
-			d.CacheSize = total
-			d.CacheN = n
 		}
 		// Same stat-first guard as the show page — opening meta
 		// auto-bootstraps a db.sqlite, which we don't want on the

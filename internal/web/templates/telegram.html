@@ -1,5 +1,10 @@
 {{define "content"}}
-<h2>Telegram connection</h2>
+<h2>Telegram connection{{with .Profile}} <small>— profile {{.}}</small>{{end}}</h2>
+{{if gt (len .Profiles) 1}}
+<nav class="tabs" aria-label="Profile">
+  {{range .Profiles}}<a href="/telegram?profile={{.}}"{{if eq . $.Profile}} class="active"{{end}}>{{.}}</a>{{end}}
+</nav>
+{{end}}
 
 {{template "telegram_panel" .}}
 
@@ -56,6 +61,7 @@
   </dl>
   <form method="post" action="/telegram/ratelimit">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="profile" value="{{.Profile}}">
     <label>
       Upload cap (req/min) — 0 disables
       <input type="number" name="upload_per_minute" min="0" placeholder="0" value="{{if gt .RateLimitPerMin 0}}{{.RateLimitPerMin}}{{end}}">

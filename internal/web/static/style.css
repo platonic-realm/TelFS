@@ -427,14 +427,66 @@ button.danger:hover, .btn.danger:hover {
   border-color: var(--lamp-err);
   color: var(--paper);
 }
-/* Masthead lamp pair: link health + channel sync share one HTMX swap
-   target (span#health-pill). Inline-flex so the two pills sit on the
-   pill row like siblings. */
-.pill-pair {
+/* Masthead lamps: one set per profile (name + link health + channel
+   sync), all in one HTMX swap target (span#health-pill). Several profiles
+   run at once, so each set carries its profile's name and a rule
+   separates the sets. A set links to that profile's Telegram page. */
+.lamp-sets {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px 0;
+  align-items: center;
+}
+.lamp-set + .lamp-set {
+  border-left: 1px solid var(--rule-strong);
+  margin-left: 12px;
+  padding-left: 12px;
+}
+.lamp-set {
   display: inline-flex;
   gap: 6px;
   align-items: center;
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  padding-bottom: 1px;
 }
+.lamp-set:hover { border-bottom-color: var(--copper); }
+.lamp-name {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+
+/* Ledger tables with one row per profile: the selected profile's row
+   hangs on a copper tick — the wire's colour, the only accent. */
+table.ledger th:first-child, table.ledger td:first-child { padding-left: 10px; }
+table.ledger tr.selected > td:first-child { box-shadow: inset 2px 0 0 var(--copper); }
+table.ledger tr.sub > td { border-bottom-style: dotted; padding-top: 0; }
+.err-text { color: var(--lamp-err); }
+
+/* Tabs: one per profile on pages that show one profile at a time. */
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 16px;
+  border-bottom: 1px solid var(--rule);
+}
+.tabs a {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  text-decoration: none;
+  color: var(--ink-muted);
+  padding: 6px 10px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tabs a:hover { color: var(--ink); }
+.tabs a.active { color: var(--ink); border-bottom-color: var(--copper); }
 /* Busy state: ui.js disables the submit button on slow posts (mount
    stop/start block until the daemon actually finishes). Dim + progress
    cursor so the held state reads as "working", not "broken". */

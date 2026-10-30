@@ -31,9 +31,9 @@
     </details>
   </nav>
   <div class="header-extras">
-    <a class="pill acc" href="/profiles" title="Active profile — every page operates on this profile">{{with activeProfile}}{{.}}{{else}}no profile{{end}}</a>
-    <span id="health-pill" class="pill muted" title="Loading…"
-          hx-get="/partials/health" hx-trigger="load, every 5s" hx-swap="outerHTML">link…</span>
+    <a class="pill acc" href="/profiles" title="Selected profile — the Setup, Browse and State pages act on it; the lamps show every profile">{{with activeProfile}}{{.}}{{else}}no profile{{end}}</a>
+    <span id="health-pill" class="lamp-sets"
+          hx-get="/partials/health" hx-trigger="load, every 5s" hx-swap="outerHTML"><span class="pill muted" title="Loading…">link…</span></span>
     <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode">◐</button>
   </div>
   </div>

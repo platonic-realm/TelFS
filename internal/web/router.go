@@ -22,6 +22,7 @@ func (s *Server) registerRoutes() {
 	// Dashboard + status partial (auto-refresh).
 	s.mux.HandleFunc("GET /{$}", s.dashboardIndex)
 	s.mux.HandleFunc("GET /partials/status", s.statusPartial)
+	s.mux.HandleFunc("GET /partials/profiles", s.profilesPartial)
 	s.mux.HandleFunc("GET /partials/health", s.healthPartial)
 
 	// First-run setup wizard. Steps are inline forms posting to the
@@ -191,6 +192,8 @@ func tmplFuncs() template.FuncMap {
 		// without threading a field through each page's data struct.
 		// Cheap: one file read per page render.
 		"activeProfile": config.ActiveProfile,
+		// ago renders a unix time as a terse age ("3 h ago").
+		"ago": ago,
 		// pctOf / pctOf64: render a "filled %" for the queue visual
 		// bars. Clamped to [0, 100] so an over-target buffer (rare —
 		// the packer flushes on threshold) still produces a sane bar.

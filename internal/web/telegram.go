@@ -181,6 +181,10 @@ type tgRequest struct {
 
 type tgPageData struct {
 	pageBase
+	// Profile is the profile this page shows (?profile=, default the
+	// selected one); Profiles lists every profile for the tabs.
+	Profile      string
+	Profiles     []string
 	Source       string // URL we fetched from (for the help text)
 	Online       bool   // did the fetch succeed
 	FetchError   string // explanation if Online is false
@@ -260,12 +264,8 @@ func classifySync(d *tgPageData) {
 // fully-snapshotted FS ends with an empty table). chunk_map rows are
 // only ever written with the daemon up, so "clean at last shutdown"
 // carries over to now.
-func loadOfflineSync(ctx context.Context, data *tgPageData) {
-	cfg, err := config.Load()
-	if err != nil {
-		return
-	}
-	mstore, err := openMetaExisting()
+func loadOfflineSync(ctx context.Context, cfg *config.Config, data *tgPageData) {
+	mstore, err := openMetaRead(cfg)
 	if err != nil {
 		return
 	}
@@ -304,9 +304,10 @@ func loadOfflineSync(ctx context.Context, data *tgPageData) {
 	}
 }
 
-// telegramPage renders the connection-state + request-log view. Data
-// comes from the active profile's mount daemon, over its control socket
-// (a `source=` URL reads a daemon started with --metrics-addr instead).
+// telegramPage renders the connection-state + request-log view of one
+// profile (?profile=NAME, default the selected one). Data comes from that
+// profile's mount daemon, over its control socket (a `source=` URL reads a
+// daemon started with --metrics-addr instead).
 func (s *Server) telegramPage(w http.ResponseWriter, r *http.Request) {
 	data := s.fetchTelegramState(w, r)
 	// Parse the partial alongside the page so {{template
@@ -332,29 +333,71 @@ func (s *Server) telegramPartial(w http.ResponseWriter, r *http.Request) {
 // poll doesn't consume the flash or rotate CSRF. The partial
 // template doesn't reference any pageBase fields anyway.
 func (s *Server) fetchTelegramStatePartial(r *http.Request) tgPageData {
-	url := controlSource
-	if v, ok := sanitizeSourceURL(r.URL.Query().Get("source")); ok {
-		url = v
-	}
-	data := tgPageData{
-		Source:  url,
-		NowUnix: time.Now().Unix(),
-	}
-	populateTGState(&data, url)
-	if !data.Online {
-		loadPersistedTGStats(r.Context(), &data)
-		loadOfflineSync(r.Context(), &data)
-	}
-	classifySync(&data)
+	cfg, name, err := requestProfile(r)
+	data := tgPageData{Profile: name, NowUnix: time.Now().Unix()}
+	fillTGState(r.Context(), &data, cfg, err, sourceFor(r))
 	return data
+}
+
+// sourceFor is where the daemon state comes from: the profile's control
+// socket, or a loopback `source=` URL (a daemon with --metrics-addr).
+func sourceFor(r *http.Request) string {
+	if v, ok := sanitizeSourceURL(r.URL.Query().Get("source")); ok {
+		return v
+	}
+	return controlSource
+}
+
+// fillTGState fetches one profile's daemon state, falls back to its local
+// state when no daemon answers, and sets the sync lamp.
+func fillTGState(ctx context.Context, data *tgPageData, cfg *config.Config, cfgErr error, url string) {
+	data.Source = url
+	if cfgErr != nil {
+		data.FetchError = cfgErr.Error()
+		classifySync(data)
+		return
+	}
+	populateTGState(data, cfg, url)
+	if !data.Online {
+		loadPersistedTGStats(ctx, cfg, data)
+		loadOfflineSync(ctx, cfg, data)
+	}
+	classifySync(data)
+}
+
+// requestProfile is the profile a page shows: ?profile=NAME (or the form
+// field) when it names an existing profile, else the selected one.
+// Monitoring is per profile; the selection is only the default. A missing
+// profile is an error, never created (LoadFromDir would make its dir).
+func requestProfile(r *http.Request) (*config.Config, string, error) {
+	name := strings.TrimSpace(r.FormValue("profile"))
+	if name == "" {
+		name = config.ActiveProfile()
+	}
+	if name == "" {
+		cfg, err := config.Load()
+		return cfg, "", err
+	}
+	if err := config.ValidateProfileName(name); err != nil {
+		return nil, name, err
+	}
+	dir, err := config.ProfileDir(name)
+	if err != nil {
+		return nil, name, err
+	}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		return nil, name, fmt.Errorf("no profile %q", name)
+	}
+	cfg, err := config.LoadFromDir(dir)
+	return cfg, name, err
 }
 
 // loadPersistedTGStats fills the totals from the profile DB's
 // persisted TrackerState when the daemon is unreachable — the stats
 // stay consistent across daemon restarts and outages instead of
 // disappearing with the process.
-func loadPersistedTGStats(ctx context.Context, data *tgPageData) {
-	mstore, err := openMetaExisting()
+func loadPersistedTGStats(ctx context.Context, cfg *config.Config, data *tgPageData) {
+	mstore, err := openMetaRead(cfg)
 	if err != nil {
 		return
 	}
@@ -414,23 +457,20 @@ func sanitizeSourceURL(v string) (string, bool) {
 // fetchTelegramState pulls + parses the daemon's /telegram JSON for
 // the full-page render (CSRF + flash needed for the form).
 func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPageData {
-	url := controlSource
-	if v, ok := sanitizeSourceURL(r.URL.Query().Get("source")); ok {
-		url = v
-	}
+	cfg, name, err := requestProfile(r)
 	data := tgPageData{
 		pageBase:                s.basePage(w, r),
-		Source:                  url,
+		Profile:                 name,
+		Profiles:                listProfileNames(),
 		NowUnix:                 time.Now().Unix(),
-		RateLimitPerMin:         readRateLimitFromMeta(r.Context()),
-		DownloadRateLimitPerMin: readDownloadRateLimitFromMeta(r.Context()),
+		RateLimitPerMin:         -1,
+		DownloadRateLimitPerMin: -1,
 	}
-	populateTGState(&data, url)
-	if !data.Online {
-		loadPersistedTGStats(r.Context(), &data)
-		loadOfflineSync(r.Context(), &data)
+	if err == nil {
+		data.RateLimitPerMin = readRateLimitFromMeta(r.Context(), cfg)
+		data.DownloadRateLimitPerMin = readDownloadRateLimitFromMeta(r.Context(), cfg)
 	}
-	classifySync(&data)
+	fillTGState(r.Context(), &data, cfg, err, sourceFor(r))
 	return data
 }
 
@@ -438,11 +478,11 @@ func (s *Server) fetchTelegramState(w http.ResponseWriter, r *http.Request) tgPa
 // order. Pure function so both fetchTelegramState (full page) and
 // fetchTelegramStatePartial (htmx fragment) can share the network
 // step without dragging in basePage's CSRF/flash side effects.
-func populateTGState(data *tgPageData, url string) {
+func populateTGState(data *tgPageData, cfg *config.Config, url string) {
 	var resp *http.Response
 	var err error
 	if url == controlSource {
-		resp, err = daemonGet("/telegram")
+		resp, err = daemonGetFor(cfg, "/telegram")
 	} else {
 		resp, err = httpClient.Get(url)
 	}
@@ -486,9 +526,9 @@ func populateTGState(data *tgPageData, url string) {
 // itself is wedged and the user needs to know.
 var httpClient = &http.Client{Timeout: 2 * time.Second}
 
-// controlSource is the default daemon source: the active profile's
-// owner-only control socket (spec v1 §3). A `source=` URL (loopback only)
-// still reads a daemon started with --metrics-addr over TCP.
+// controlSource is the default daemon source: the profile's owner-only
+// control socket (spec v1 §3). A `source=` URL (loopback only) still reads
+// a daemon started with --metrics-addr over TCP.
 const controlSource = "the profile's control socket"
 
 // daemonGet fetches path from the active profile's running daemon over its
@@ -498,6 +538,11 @@ func daemonGet(path string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	return daemonGetFor(cfg, path)
+}
+
+// daemonGetFor fetches path from cfg's profile's running daemon.
+func daemonGetFor(cfg *config.Config, path string) (*http.Response, error) {
 	return control.Client(control.Path(cfg.DataDir), 2*time.Second).Get(control.BaseURL + path)
 }
 
@@ -512,8 +557,28 @@ func openMetaExisting() (*meta.Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	return openMetaExistingFor(cfg)
+}
+
+// openMetaExistingFor is openMetaExisting for a named profile's config
+// (writes: the rate-limit form).
+func openMetaExistingFor(cfg *config.Config) (*meta.Store, error) {
 	if _, err := os.Stat(cfg.DBPath()); err != nil {
 		return nil, fmt.Errorf("metadata DB not found at %s", cfg.DBPath())
+	}
+	return meta.Open(cfg.DBPath())
+}
+
+// openMetaRead opens a profile's existing meta DB for reading only: no
+// schema work, no writes, safe next to the profile's running daemon (the
+// monitoring paths read every profile every few seconds). Falls back to a
+// normal open where SQLite refuses a read-only one.
+func openMetaRead(cfg *config.Config) (*meta.Store, error) {
+	if _, err := os.Stat(cfg.DBPath()); err != nil {
+		return nil, fmt.Errorf("metadata DB not found at %s", cfg.DBPath())
+	}
+	if m, err := meta.OpenReadOnly(cfg.DBPath(), false); err == nil {
+		return m, nil
 	}
 	return meta.Open(cfg.DBPath())
 }
@@ -523,8 +588,8 @@ func openMetaExisting() (*meta.Store, error) {
 // meta DB can't be read (no active profile, DB missing, schema not
 // yet initialized) so the template can flag the "unknown" case
 // distinctly from "explicitly unlimited" (0).
-func readRateLimitFromMeta(ctx context.Context) int {
-	mstore, err := openMetaExisting()
+func readRateLimitFromMeta(ctx context.Context, cfg *config.Config) int {
+	mstore, err := openMetaRead(cfg)
 	if err != nil {
 		return -1
 	}
@@ -538,8 +603,8 @@ func readRateLimitFromMeta(ctx context.Context) int {
 
 // readDownloadRateLimitFromMeta mirrors readRateLimitFromMeta but
 // for the download-direction lane.
-func readDownloadRateLimitFromMeta(ctx context.Context) int {
-	mstore, err := openMetaExisting()
+func readDownloadRateLimitFromMeta(ctx context.Context, cfg *config.Config) int {
+	mstore, err := openMetaRead(cfg)
 	if err != nil {
 		return -1
 	}
@@ -565,6 +630,13 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
+	// The form carries the profile its page showed: the limits are that
+	// profile's, whichever profile is selected.
+	cfg, name, cfgErr := requestProfile(r)
+	back := "/telegram"
+	if name != "" {
+		back += "?profile=" + neturl.QueryEscape(name)
+	}
 	parseN := func(field string) (int, bool, error) {
 		raw := strings.TrimSpace(r.FormValue(field))
 		if raw == "" {
@@ -584,18 +656,23 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 	downN, downSet, downErr := parseN("download_per_minute")
 	if upErr != nil {
 		SetFlash(w, "error", "upload rate limit: "+upErr.Error())
-		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
 	if downErr != nil {
 		SetFlash(w, "error", "download rate limit: "+downErr.Error())
-		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
-	mstore, err := openMetaExisting()
+	if cfgErr != nil {
+		SetFlash(w, "error", "profile: "+cfgErr.Error())
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	mstore, err := openMetaExistingFor(cfg)
 	if err != nil {
 		SetFlash(w, "error", "meta: "+err.Error())
-		http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
 	defer mstore.Close()
@@ -603,7 +680,7 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 	if upSet {
 		if err := mstore.SetTGRateLimitPerMin(r.Context(), upN); err != nil {
 			SetFlash(w, "error", "set upload rate limit: "+err.Error())
-			http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+			http.Redirect(w, r, back, http.StatusSeeOther)
 			return
 		}
 		if upN == 0 {
@@ -615,7 +692,7 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 	if downSet {
 		if err := mstore.SetTGDownloadRateLimitPerMin(r.Context(), downN); err != nil {
 			SetFlash(w, "error", "set download rate limit: "+err.Error())
-			http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+			http.Redirect(w, r, back, http.StatusSeeOther)
 			return
 		}
 		if downN == 0 {
@@ -629,7 +706,7 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 		// owes a snapshot so the change reaches the channel soon.
 		if err := snapshot.MarkDue(r.Context(), mstore, "rate-limit settings changed"); err != nil {
 			SetFlash(w, "error", "applied, but marking a snapshot owed failed: "+err.Error())
-			http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+			http.Redirect(w, r, back, http.StatusSeeOther)
 			return
 		}
 	}
@@ -638,5 +715,5 @@ func (s *Server) telegramSetRateLimit(w http.ResponseWriter, r *http.Request) {
 	} else {
 		SetFlash(w, "ok", "applied: "+strings.Join(bits, ", ")+" — daemon picks it up within 5 s")
 	}
-	http.Redirect(w, r, "/telegram", http.StatusSeeOther)
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
