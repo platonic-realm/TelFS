@@ -103,6 +103,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /state", s.stateShow)
 	s.mux.HandleFunc("POST /state/repair", s.stateRepair)
 	s.mux.HandleFunc("GET /partials/repair-progress", s.stateRepairProgress)
+	s.mux.HandleFunc("GET /partials/state", s.statePartial)
 
 	// Mount supervisor.
 	s.mux.HandleFunc("GET /mount", s.mountList)
@@ -174,6 +175,25 @@ func (s *Server) renderPartial(w http.ResponseWriter, name string, data any) {
 // of the shared "content" name — that's the right pattern when the
 // partial is ALSO embedded into a full page, since two "content"
 // defines in one parse set collide.
+// renderPartialFiles renders block from several template files (a
+// fragment that embeds others).
+func (s *Server) renderPartialFiles(w http.ResponseWriter, block string, data any, files ...string) {
+	paths := make([]string, len(files))
+	for i, f := range files {
+		paths[i] = "templates/" + f
+	}
+	t, err := template.New("").Funcs(funcsFor(w)).ParseFS(templatesFS, paths...)
+	if err != nil {
+		s.opts.Logger.Printf("partial parse %v: %v", files, err)
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := t.ExecuteTemplate(w, block, data); err != nil {
+		s.opts.Logger.Printf("partial exec %v [%s]: %v", files, block, err)
+	}
+}
+
 func (s *Server) renderPartialBlock(w http.ResponseWriter, name, block string, data any) {
 	t, err := template.New("").Funcs(funcsFor(w)).
 		ParseFS(templatesFS, "templates/"+name)

@@ -116,20 +116,31 @@ type stateMountRow struct {
 	Origin     string
 }
 
+// stateShow: the State page became the dashboard's "Local state" panel
+// (Arash, 2026-10-30): old links land on that profile's panel.
 func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
-	d := stateShowData{pageBase: s.basePage(w, r), Profiles: listProfileNames()}
+	http.Redirect(w, r, "/#state-"+url.PathEscape(profileOf(r)), http.StatusSeeOther)
+}
+
+// statePartial is one profile's local state for the dashboard panel,
+// loaded when the panel is opened (its repair scan reads every file).
+func (s *Server) statePartial(w http.ResponseWriter, r *http.Request) {
+	d := s.stateData(w, r)
+	s.renderPartialFiles(w, "state_panel", d, "partials/state.html", "state/repair_progress.html")
+}
+
+// stateData gathers one profile's local state (?profile=).
+func (s *Server) stateData(w http.ResponseWriter, r *http.Request) stateShowData {
+	d := stateShowData{pageBase: pageBase{CSRF: s.state.EnsureCSRF(w, r), Path: r.URL.Path}, Profiles: listProfileNames()}
 	cfg, name, err := requestProfile(r)
 	d.Profile = name
 	if err != nil {
-		SetFlash(w, "error", "config: "+err.Error())
-		s.renderTemplateWith(w, "state/show.html", d, "templates/partials/cache.html")
-		return
+		return d
 	}
 	d.DataDir = cfg.DataDir
 	d.DBPath = cfg.DBPath()
 	d.CachePath = cfg.CachePath()
 	d.PendingDir = cfg.StagingDir()
-
 	if info, err := os.Stat(cfg.DBPath()); err == nil {
 		d.DBSize = info.Size()
 	}
@@ -146,31 +157,14 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	d.CacheLive = fetchCacheLive(cfg)
-	d.MountActive = len(activeMounts()) > 0
+	_, _, d.MountActive, _ = mountctl.FindLiveByProfile(name)
 	d.Repair = s.repair.Snapshot()
-	for _, mp := range s.sup.List() {
-		origin := "supervised"
-		if mp.Adopted {
-			origin = "adopted"
-		}
-		d.Mounts = append(d.Mounts, stateMountRow{
-			Profile:    mp.Profile,
-			Mountpoint: mp.Mountpoint,
-			Status:     mp.Status(),
-			Origin:     origin,
-		})
-	}
-	d.External = s.sup.ExternalMounts()
-
 	if _, err := os.Stat(cfg.DBPath()); err != nil {
-		s.renderTemplateWith(w, "state/show.html", d, "templates/partials/cache.html")
-		return
+		return d
 	}
-	mstore, err := meta.Open(cfg.DBPath())
+	mstore, err := openMetaRead(cfg)
 	if err != nil {
-		SetFlash(w, "error", "meta.Open: "+err.Error())
-		s.renderTemplateWith(w, "state/show.html", d, "templates/partials/cache.html")
-		return
+		return d
 	}
 	defer mstore.Close()
 	d.HasMeta = true
@@ -187,8 +181,7 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 	if parts, err := mstore.ScanPartialFiles(ctx, stagedCheckerFor(d.PendingDir)); err == nil {
 		d.Partials = parts
 	}
-
-	s.renderTemplateWith(w, "state/show.html", d, "templates/state/repair_progress.html", "templates/partials/cache.html")
+	return d
 }
 
 // stateRepair kicks off a RepairPartialFiles run in the background
@@ -203,7 +196,7 @@ func (s *Server) stateRepair(w http.ResponseWriter, r *http.Request) {
 	}
 	force := r.FormValue("force") == "1"
 	cfg, name, err := requestProfile(r)
-	back := "/state?profile=" + url.QueryEscape(name)
+	back := "/#state-" + url.PathEscape(name)
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
 		http.Redirect(w, r, back, http.StatusSeeOther)

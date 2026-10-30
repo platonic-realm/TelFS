@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"html/template"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -123,7 +125,8 @@ func TestDashboardRendersEveryProfile(t *testing.T) {
 		t.Fatal("order must be profiles, then channels, then filesystems")
 	}
 	for _, want := range []string{"TelFS-backup", "TelFS-cloud", `href="/telegram?profile=backup"`,
-		`href="/state?profile=cloud"`, "/mnt/offsite"} {
+		`href="#state-cloud"`, `id="state-cloud"`, `hx-get="/partials/state?profile=cloud"`, "/mnt/offsite",
+		`href="/browse/dir?at=%2fsrv%2fmnt%2fbackup"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("dashboard lacks %q", want)
 		}
@@ -258,7 +261,7 @@ func TestPageProfile(t *testing.T) {
 	}
 	out := b.String()
 	for _, want := range []string{`class="profile-bar"`, `href="/telegram?profile=cloud"`, `class="active" aria-current="page">backup`,
-		`hx-get="/partials/telegram?profile=backup"`, `name="profile" value="backup"`, `href="/state?profile=backup"`, `/static/style.css?v=`} {
+		`hx-get="/partials/telegram?profile=backup"`, `name="profile" value="backup"`, `/static/style.css?v=`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("telegram page lacks %q", want)
 		}
@@ -332,5 +335,52 @@ func TestTelegramSetUploadLimit(t *testing.T) {
 	}
 	if !strings.Contains(rec.Header().Get("Set-Cookie"), "3.0+MB") {
 		t.Errorf("flash %q", rec.Header().Get("Set-Cookie"))
+	}
+}
+
+// The tabs: Dashboard, Telegram, Mounts, Setup — Browse lives in Mounts,
+// State in the Dashboard (Arash, 2026-10-30); their old URLs redirect.
+func TestNavigation(t *testing.T) {
+	isolate(t)
+	mkProfile(t, "cloud", "c", true)
+	out := render(t, "telegram.html", tgPageData{Profile: "cloud"}, "templates/partials/telegram.html")
+	nav := out[strings.Index(out, "<nav>"):strings.Index(out, "</nav>")]
+	order := []string{">Dashboard<", ">Telegram<", ">Mounts<", ">Setup ▾<"}
+	last := -1
+	for _, tab := range order {
+		i := strings.Index(nav, tab)
+		if i < 0 || i < last {
+			t.Fatalf("tab %s missing or out of order in %s", tab, nav)
+		}
+		last = i
+	}
+	for _, gone := range []string{">Browse<", ">State<"} {
+		if strings.Contains(nav, gone) {
+			t.Errorf("%s is no tab any more", gone)
+		}
+	}
+
+	exe, _ := os.Executable()
+	srv, err := New(Options{Listen: "127.0.0.1:0", SelfPath: exe, Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.middleware(srv.mux)
+	for target, want := range map[string]string{"/state?profile=cloud": "/#state-cloud", "/browse": "/mount"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", target, nil)
+		req.Host = "127.0.0.1"
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != want {
+			t.Errorf("%s → %d %q, want %q", target, rec.Code, rec.Header().Get("Location"), want)
+		}
+	}
+	// The panel's content: one profile's state as a fragment.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/partials/state?profile=cloud", nil)
+	req.Host = "127.0.0.1"
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Inodes") || strings.Contains(rec.Body.String(), "<html") {
+		t.Fatalf("state partial: %d %s", rec.Code, rec.Body.String())
 	}
 }

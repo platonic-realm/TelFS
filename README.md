@@ -170,7 +170,7 @@ every step is an inline form on that one page:
    You land on the mount's page with a live log.
 
 That's it — the daemon runs detached (it survives closing `telfs
-web`), your files are at the mountpoint, and the Files tab browses
+web`), your files are at the mountpoint, and the Mounts tab browses
 them from the browser. Day-to-day driving — start/stop mounts, log
 tails, Telegram traffic stats, rate limits — all lives in the same
 UI. To make the console permanent, run `telfs web` as a user systemd
@@ -963,7 +963,10 @@ dashboard, profile CRUD + export/import, multi-step phone login with
 logout, one-click channel binding, encryption init, mount supervisor
 with HTMX-polled log tail, lifetime Telegram stats (persisted in the
 profile's SQLite, visible even while the daemon is down), and a file
-browser through a chosen mountpoint.
+browser for each mount. Four tabs: **Dashboard** (every profile, its
+channel, filesystem and local state), **Telegram** (one profile's
+connection), **Mounts** (every mount: start, stop, log, browse its
+files) and **Setup**.
 
 **Every profile at once.** Several profiles can run side by side (two
 mounts, two daemons); the console watches all of them without any
@@ -974,16 +977,18 @@ uploads — a large backlog below the cap is normal during a first
 backup), **channel copy** lamp (green when the channel alone could
 recover the filesystem), what waits to upload (with a staging meter),
 upload rate and cap, and any error the link has not recovered from —
-then every profile's channel and filesystem, then every TelFS mount on
-the machine (bind mounts of a mount show as "view of …" / "also visible
-at …", never as leftovers to unmount). The masthead carries the two
+then every profile's channel and filesystem, then each profile's
+**local state** (inodes, chunks, journal, cache and the crash repair —
+a panel that loads when opened, since the repair scan reads every file),
+then every TelFS mount on the machine (bind mounts of a mount show as
+"view of …" / "also visible at …", never as leftovers to unmount). The masthead carries the two
 lamps for each profile; each set opens that profile's Telegram tab
 (upload queue, staging, requests, rate limits, and the upload cap — it
 can be changed there while the mount runs, like `telfs upload limit`;
 `?profile=NAME`).
 
 **Pages about one profile** (Setup, Login, Channel, Encryption,
-Compression, Telegram, State) say which in their address —
+Compression, Telegram) say which in their address —
 `?profile=NAME` — and show a profile bar at the top to switch to the
 same page about another profile; their forms and redirects keep it.
 There is no "selected" profile: without `?profile=` a page shows the

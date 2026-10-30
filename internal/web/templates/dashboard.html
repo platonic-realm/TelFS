@@ -84,5 +84,17 @@
   </div>
 </section>
 
+{{if .Monitors}}
+<section class="card" id="local-state">
+  <h3>Local state <small>— per profile: inodes, chunks, journal, cache, repair · opens on demand</small></h3>
+  {{range .Monitors}}
+  <details class="state-details" id="state-{{.Name}}">
+    <summary><strong>{{.Name}}</strong>{{if .HasDB}} <small>{{.FS.ShortUUID}} · format {{.FS.Format}} · DB {{humanBytes .FS.DBBytes}}</small>{{else}} <small>no local filesystem</small>{{end}}</summary>
+    <div class="state-body" hx-get="/partials/state?profile={{.Name}}" hx-trigger="toggle once from:closest details" hx-swap="innerHTML"><p><small>Loading…</small></p></div>
+  </details>
+  {{end}}
+</section>
+{{end}}
+
 {{template "mounts_panel" .}}
 {{end}}

@@ -19,31 +19,12 @@ import (
 // 2 GiB; oversized uploads should split into multiple files anyway.
 const browseMaxUploadBytes = 2 * 1024 * 1024 * 1024
 
-// ── /browse — pick a mountpoint ───────────────────────────────────
-
-type browsePickData struct {
-	pageBase
-	Mounts []browseMountChoice
-}
-
-type browseMountChoice struct {
-	Path  string
-	Label string // "supervised: profile" or "external"
-}
+// ── /browse — now the Mounts tab ──────────────────────────────────
 
 func (s *Server) browsePick(w http.ResponseWriter, r *http.Request) {
-	d := browsePickData{pageBase: s.basePage(w, r)}
-	for _, mp := range s.sup.List() {
-		d.Mounts = append(d.Mounts, browseMountChoice{
-			Path:  mp.Mountpoint,
-			Label: "supervised: " + mp.Profile,
-		})
-	}
-	for _, ext := range s.sup.ExternalMounts() {
-		d.Mounts = append(d.Mounts, browseMountChoice{Path: ext, Label: "external"})
-	}
-	sort.Slice(d.Mounts, func(i, j int) bool { return d.Mounts[i].Path < d.Mounts[j].Path })
-	s.renderTemplate(w, "browse/pick.html", d)
+	// Browsing lives in the Mounts tab now (each mount has a Browse
+	// button): the old picker page lands there.
+	http.Redirect(w, r, "/mount", http.StatusSeeOther)
 }
 
 // ── /browse/dir?at=<mount>&p=<rel> ────────────────────────────────

@@ -1,0 +1,106 @@
+{{define "state_panel"}}
+{{/* One profile's local state, loaded into the dashboard's "Local state"
+     panel when it is opened (GET /partials/state?profile=NAME). It used to
+     be the State page; its repair scan reads every file, so it only runs
+     on demand. */}}
+<div class="state-grid">
+  <div>
+    <h4>Where</h4>
+    <dl>
+      <dt>Data dir</dt><dd><code>{{.DataDir}}</code></dd>
+      <dt>DB</dt><dd>{{humanBytes .DBSize}}</dd>
+      <dt>Cache</dt><dd>{{humanBytes .CacheSize}} · {{.CacheN}} file(s)</dd>
+      <dt>Staged</dt><dd>{{.PendingCount}} wire(s) · {{humanBytes .PendingBytes}}<br><small><code>{{.PendingDir}}</code></small></dd>
+    </dl>
+  </div>
+  {{if .HasMeta}}
+  <div>
+    <h4>Inodes</h4>
+    <dl>
+      <dt>files</dt><dd>{{.Stats.InodesFiles}}</dd>
+      <dt>dirs</dt><dd>{{.Stats.InodesDirs}}</dd>
+      <dt>symlinks</dt><dd>{{.Stats.InodesSymlinks}}</dd>
+      <dt>total</dt><dd>{{.Stats.InodesTotal}}</dd>
+    </dl>
+  </div>
+  <div>
+    <h4>Chunks</h4>
+    <dl>
+      <dt>chunk rows</dt><dd>{{.Stats.ChunkRows}}</dd>
+      <dt>messages</dt><dd>{{.Stats.DistinctTGMsgs}} <small>(packing: many chunks share one)</small></dd>
+      <dt>bytes</dt><dd>{{humanBytes .Stats.TotalChunkBytes}}</dd>
+      <dt>dedup entries</dt><dd>{{.Stats.ChunkBlobs}}</dd>
+    </dl>
+  </div>
+  <div>
+    <h4>Journal &amp; snapshot</h4>
+    <dl>
+      <dt>journal rows</dt><dd>{{.Stats.JournalRows}}</dd>
+      <dt>to post</dt><dd>{{.Stats.JournalUnposted}}</dd>
+      <dt>highest seq</dt><dd>{{.Stats.LastJournalSeq}}</dd>
+      {{if gt .Stats.LastPostedAt 0}}<dt>last post</dt><dd>{{formatTime .Stats.LastPostedAt}}</dd>{{end}}
+      {{if .Stats.LastSnapshotMsgID}}<dt>snapshot</dt><dd>msg <code>{{.Stats.LastSnapshotMsgID}}</code></dd>{{end}}
+    </dl>
+  </div>
+  {{end}}
+  <div>
+    <h4>Chunk cache</h4>
+    {{if .CacheLive}}
+    <dl>
+      <dt>used</dt><dd>{{humanBytes .CacheLive.SizeBytes}} of {{humanBytes .CacheLive.CapBytes}}
+        <div class="qbar"><div class="qbar-fill" style="width: {{printf "%.1f" .CacheLive.UsedPct}}%"></div></div></dd>
+      <dt>hit ratio</dt><dd>{{printf "%.1f" .CacheLive.HitPct}} % <small>({{.CacheLive.Hits}} / {{.CacheLive.Misses}} since the mount started)</small></dd>
+    </dl>
+    {{else}}
+    <p><small>Live numbers need a running mount of this profile. On disk: {{humanBytes .CacheSize}} in {{.CacheN}} file(s).</small></p>
+    {{end}}
+  </div>
+</div>
+
+{{if not .HasMeta}}
+<p><em>No metadata DB yet for this profile.</em> A mount recovers it from the channel; the <a href="/setup?profile={{.Profile}}">guided setup</a> creates a new filesystem.</p>
+{{else}}
+<h4>Repair</h4>
+{{if .Partials}}
+  <p>Found <strong>{{len .Partials}}</strong> file(s) with a gap in their chunks (a daemon died mid-upload). Repair cuts each back to its longest complete start; the cut-off messages become orphans for <code>telfs gc</code>.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>ino</th><th>first gap</th><th>chunks</th><th class="num">size before</th><th class="num">after</th></tr></thead>
+    <tbody>
+      {{range .Partials}}
+      <tr><td><code>{{.Ino}}</code></td><td>idx {{.FirstGapAt}}</td><td>{{.OldChunks}} → {{.NewChunks}}</td><td class="num">{{humanBytes .OldSize}}</td><td class="num">{{humanBytes .NewSize}}</td></tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+{{else}}
+  <p><span class="pill ok">clean</span> <small>No file has a gap in its chunks. A mount's startup pass repairs one automatically.</small></p>
+{{end}}
+{{if .Partials}}
+<form method="post" action="/state/repair">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="profile" value="{{.Profile}}">
+  {{if .MountActive}}
+    <p><small><strong>{{.Profile}} is mounted:</strong> a repair can race with the daemon's own writes — stop the mount (Mounts tab) first, or accept the risk.</small></p>
+    <label><input type="checkbox" name="force" value="1"> Run anyway</label>
+  {{end}}
+  <button type="submit" {{if and .Repair .Repair.IsRunning}}disabled{{end}}>{{if and .Repair .Repair.IsRunning}}Running…{{else}}Run repair{{end}}</button>
+</form>
+{{end}}
+{{template "repair_progress" .}}
+
+<details class="raw-kv">
+  <summary><small>meta_kv — raw keys and values</small></summary>
+  {{if .KV}}
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>key</th><th>value</th><th class="num">bytes</th></tr></thead>
+    <tbody>
+      {{range .KV}}<tr><td><code>{{.Key}}</code></td><td><code>{{.Value}}</code></td><td class="num">{{.Bytes}}</td></tr>{{end}}
+    </tbody>
+  </table>
+  </div>
+  {{else}}<p><small>empty</small></p>{{end}}
+</details>
+{{end}}
+{{end}}

@@ -14,10 +14,8 @@
   <h1><a href="/">TELFS</a></h1>
   <nav>
     <a href="/" class="{{activeNav .Path "/"}}">Dashboard</a>
-    <a href="/browse" class="{{activeNav .Path "/browse"}}">Browse</a>
-    <a href="/mount" class="{{activeNav .Path "/mount"}}">Mounts</a>
     <a href="{{pp "/telegram"}}" class="{{activeNav .Path "/telegram"}}">Telegram</a>
-    <a href="{{pp "/state"}}" class="{{activeNav .Path "/state"}}">State</a>
+    <a href="/mount" class="{{activeNav .Path "/mount"}}{{activeNav .Path "/browse"}}">Mounts</a>
     <details class="nav-group">
       <summary>Setup ▾</summary>
       <div class="nav-menu">

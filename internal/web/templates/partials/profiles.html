@@ -37,7 +37,7 @@
       </td>
       <td class="actions">
         <a href="/telegram?profile={{.Name}}" title="Requests, queue and upload cap of {{.Name}}">Telegram</a>
-        <a href="/state?profile={{.Name}}" title="Local state of {{.Name}}: inodes, chunks, journal, cache">State</a>
+        <a href="#state-{{.Name}}" title="Local state of {{.Name}}: inodes, chunks, journal, cache, repair (below)">State</a>
       </td>
     </tr>
     {{with .Live}}{{with .CurrentError}}
@@ -63,7 +63,7 @@
     <tbody>
     {{range .MountList}}
     <tr>
-      <td><code>{{.Point}}</code></td>
+      <td><code>{{.Point}}</code>{{if not .ViewOf}} <small><a href="/browse/dir?at={{.Point}}">browse</a></small>{{end}}</td>
       <td>{{with .Profile}}{{.}}{{else}}<small>unknown</small>{{end}}</td>
       <td>{{if .Version}}version <code>{{.Version}}</code>{{else if .ReadOnly}}read-only{{else}}read-write{{end}}{{with .ViewOf}}<br><small>view of <code>{{.}}</code></small>{{end}}</td>
     </tr>

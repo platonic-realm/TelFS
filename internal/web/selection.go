@@ -27,7 +27,7 @@ var errNoProfile = errors.New("no profile yet — create one (Setup → Profiles
 
 // profilePages are the pages about one profile: they show the profile bar
 // and their redirects carry the profile.
-var profilePages = []string{"/setup", "/login", "/channel", "/encrypt", "/compression", "/telegram", "/state"}
+var profilePages = []string{"/setup", "/login", "/channel", "/encrypt", "/compression", "/telegram"}
 
 // isProfilePage reports whether path is (under) one of profilePages.
 func isProfilePage(path string) bool {

@@ -70,4 +70,20 @@
       if (!d.contains(e.target)) d.removeAttribute('open');
     });
   });
+
+  // ── a link to a <details> opens it ──────────────────────────────
+  // The dashboard's "Local state" panels (#state-NAME) load when opened;
+  // the profile table's State links, a profile page and the old /state
+  // URL point at them.
+  function openHashTarget() {
+    var id = decodeURIComponent(location.hash.slice(1));
+    if (!id) return;
+    var el = document.getElementById(id);
+    if (el && el.tagName === 'DETAILS') {
+      el.open = true;
+      el.scrollIntoView({ block: 'start' });
+    }
+  }
+  window.addEventListener('hashchange', openHashTarget);
+  document.addEventListener('DOMContentLoaded', openHashTarget);
 })();

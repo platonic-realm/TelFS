@@ -3,7 +3,7 @@
 
 <section class="card">
   <h3>All mounts</h3>
-  <p><small>Both web-supervised mounts AND daemons started from the CLI (<code>telfs mount …</code>) appear here. The web reconciles against <code>/proc/mounts</code> on every load so anything you run from a shell shows up immediately — same Stop, log tail, and detail-page features.</small></p>
+  <p><small>Every TelFS mount on this machine — started here, from a shell (<code>telfs mount …</code>) or by a service. Browse its files, tail its log (profile name), or stop it.</small></p>
   {{if .Mounts}}
   <table>
     <thead><tr><th>Profile</th><th>Mountpoint</th><th>Origin</th><th>PID</th><th>Status</th><th>Started</th><th></th></tr></thead>
@@ -20,6 +20,7 @@
         <td><span class="pill {{.StatusKind}}">{{.Status}}</span></td>
         <td><small>{{if .Started}}{{.Started}}{{else}}—{{end}}</small></td>
         <td class="actions">
+          {{if eq .Status "running"}}<a class="btn small" href="/browse/dir?at={{.Mountpoint}}" title="Browse the files at {{.Mountpoint}}">Browse</a>{{end}}
           <form method="post" action="/mount/stop" style="display:inline"
                 onsubmit="return confirm('Stop the mount at {{.Mountpoint}}? Any process with open files there will see I/O errors.');">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -47,6 +48,7 @@
       <tr>
         <td><code>{{.}}</code></td>
         <td class="actions">
+          <a class="btn small" href="/browse/dir?at={{.}}">Browse</a>
           <form method="post" action="/mount/unmount-external" style="display:inline"
                 onsubmit="return confirm('Unmount {{.}}? Any process with open files there will see I/O errors.');">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">

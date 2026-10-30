@@ -478,6 +478,39 @@ table.ledger tr.sub > td { border-bottom-style: dotted; padding-top: 0; }
 .table-scroll > table { min-width: 640px; }
 .qbar.mini { max-width: 160px; margin: 5px 0 3px auto; }
 
+/* The dashboard's "Local state": one collapsible panel per profile; its
+   content loads when opened (htmx, toggle). */
+.state-details { border-top: 1px solid var(--rule); padding: 8px 0; }
+.state-details:first-of-type { border-top: 0; }
+.state-details > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+}
+.state-details > summary::-webkit-details-marker { display: none; }
+.state-details > summary::before { content: "▸"; color: var(--copper); width: 1em; }
+.state-details[open] > summary::before { content: "▾"; }
+.state-details > summary small { color: var(--ink-subtle); }
+.state-body { padding: 6px 0 4px 1.6em; }
+.state-body h4 {
+  margin: 14px 0 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink-subtle);
+}
+.state-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0 28px;
+}
+.state-grid dl { grid-template-columns: minmax(90px, max-content) 1fr; }
+.raw-kv { margin-top: 14px; }
+.raw-kv > summary { cursor: pointer; color: var(--ink-subtle); }
+
 /* The profile bar: a page about one profile names it at the top and
    switches to the same page about another (?profile=NAME). */
 .profile-bar {
