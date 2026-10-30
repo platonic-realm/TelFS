@@ -93,6 +93,10 @@ type Config struct {
 	// row 2).
 	Upload UploadConfig `toml:"upload,omitempty"`
 
+	// Read is how long a read of data that is not cached may wait for
+	// Telegram (v1.1, B1).
+	Read ReadConfig `toml:"read,omitempty"`
+
 	// DataDir is the resolved location of the .telfs/ directory. Not serialized.
 	DataDir string `toml:"-"`
 }
@@ -637,6 +641,41 @@ func (c *Config) SnapshotPolicy() (everyOps int64, every time.Duration, err erro
 		every = d
 	}
 	return everyOps, every, nil
+}
+
+// ReadConfig is `[read]` in config.toml (v1.1, B1).
+//
+//	[read]
+//	offline_timeout = "60s"  # a read making no progress this long fails with EIO ("0" = wait for ever)
+//
+// Only reads of data that is not cached reach Telegram. While Telegram is
+// unreachable such a read used to wait for as long as the outage lasted;
+// now it fails once it has made NO progress (no connection, no bytes) for
+// offline_timeout. A slow download that still moves is never cut off.
+type ReadConfig struct {
+	OfflineTimeout string `toml:"offline_timeout,omitempty"`
+}
+
+// DefaultReadOfflineTimeout is [read] offline_timeout when unset.
+const DefaultReadOfflineTimeout = 60 * time.Second
+
+// ReadOfflineTimeout returns [read] offline_timeout (0 = no limit).
+func (c *Config) ReadOfflineTimeout() (time.Duration, error) {
+	v := strings.TrimSpace(c.Read.OfflineTimeout)
+	if v == "" {
+		return DefaultReadOfflineTimeout, nil
+	}
+	if v == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("[read] offline_timeout: %w (e.g. \"60s\", \"2m\", \"0\" = no limit)", err)
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("[read] offline_timeout = %q: use at least 1s, or \"0\" for no limit", v)
+	}
+	return d, nil
 }
 
 // UploadConfig is `[upload]` in config.toml (spec v1, row 2).

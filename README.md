@@ -802,7 +802,18 @@ every = "24h"                 # or after this long, if anything changed (default
 connections = 8               # upload connections to the account's data centre (default 8; 0 = the main connection only; max 32)
 parts_per_upload = 2          # 512 KiB parts of one upload in flight at once (default 2; 1..16)
 max_rate = "5MB/s"            # byte-rate cap on upload parts (default 5 MB/s; "0" = no cap; at least 64KiB/s)
+
+[read]
+offline_timeout = "60s"       # a read of uncached data that makes no progress this long fails with EIO (default 60s; "0" = wait)
 ```
+
+**Reads while Telegram is unreachable.** Listing, `stat` and reading
+cached data never touch Telegram. A read of data that is not cached
+does; while Telegram is unreachable it fails with an I/O error once it
+has made no progress — no connection, no bytes — for `offline_timeout`
+(it used to wait for as long as the outage lasted). A slow download
+that still moves is never cut off. `telfs restore` uses the same limit
+(it then exits 6 and a re-run resumes).
 
 **Uploads.** Telegram keeps an account's files in one data centre, often
 far away (S9's account: DC5, ~170 ms round trip), and one TCP connection

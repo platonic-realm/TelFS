@@ -195,6 +195,8 @@ config.toml (per profile; see README "Configuration"):
   [snapshot] every_ops (default 500000), every (default 24h)   — format 2
   [upload]   connections (default 8), parts_per_upload (default 2),
              max_rate (default 5MB/s)
+  [read]     offline_timeout (default 60s): an uncached read with no
+             progress that long fails with EIO ("0" = wait)
 
 Environment:
   TELFS_PROFILE    Active profile name (overrides ~/.config/telfs/active)
@@ -794,6 +796,10 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	offlineTimeout, err := cfg.ReadOfflineTimeout()
+	if err != nil {
+		return err
+	}
 
 	// Single-writer guard (this machine): one daemon per profile, and no
 	// second read-write mount of a filesystem already mounted — checked
@@ -1089,7 +1095,9 @@ func cmdMount(signalCtx context.Context, args []string) error {
 	}
 
 	err = func() error {
-		fetcher := &chunk.TGFetcher{Session: sess}
+		// A read of uncached data fails (EIO) once it has made no progress
+		// for [read] offline_timeout — it used to wait out the whole outage.
+		fetcher := &chunk.TGFetcher{Session: sess, OfflineTimeout: offlineTimeout}
 		// Cache cap resolution: --cache-cap flag wins, then config's
 		// cache_cap, then chunk.DefaultCacheCapBytes. A parse error on
 		// the flag aborts (operator typo, fail loudly); a parse error

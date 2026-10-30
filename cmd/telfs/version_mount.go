@@ -265,7 +265,11 @@ func mountVersion(signalCtx context.Context, cfg *config.Config, o versionMountO
 // stop signal.
 func serveVersion(signalCtx context.Context, cfg *config.Config, o versionMountOpts, sess *tg.Session, vstore *meta.Store,
 	wc chunk.WireCodec, codec compress.Codec, chunkSize int64, fsUUID string, v wire.AnchorVersion, cacheDir string, svc *service) error {
-	fetcher := &chunk.TGFetcher{Session: sess}
+	offlineTimeout, err := cfg.ReadOfflineTimeout()
+	if err != nil {
+		return err
+	}
+	fetcher := &chunk.TGFetcher{Session: sess, OfflineTimeout: offlineTimeout}
 	capBytes, err := cacheCapFrom(o.cacheCap, cfg)
 	if err != nil {
 		return err

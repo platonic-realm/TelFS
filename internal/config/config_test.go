@@ -370,3 +370,17 @@ func TestParseByteRate(t *testing.T) {
 		}
 	}
 }
+
+func TestReadOfflineTimeout(t *testing.T) {
+	for v, want := range map[string]time.Duration{"": DefaultReadOfflineTimeout, "0": 0, "90s": 90 * time.Second, " 2m ": 2 * time.Minute} {
+		c := &Config{Read: ReadConfig{OfflineTimeout: v}}
+		if got, err := c.ReadOfflineTimeout(); err != nil || got != want {
+			t.Errorf("%q: %v %v, want %v", v, got, err, want)
+		}
+	}
+	for _, bad := range []string{"soon", "500ms", "-1s", "60"} {
+		if _, err := (&Config{Read: ReadConfig{OfflineTimeout: bad}}).ReadOfflineTimeout(); err == nil || !strings.Contains(err.Error(), "[read]") {
+			t.Errorf("%q accepted: %v", bad, err)
+		}
+	}
+}

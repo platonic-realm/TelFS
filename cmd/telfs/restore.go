@@ -77,6 +77,10 @@ func cmdRestore(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	offlineTimeout, err := cfg.ReadOfflineTimeout()
+	if err != nil {
+		return err
+	}
 	dest, err := checkRestoreDest(cfg, destArg, mountctl.ScanProcMounts())
 	if err != nil {
 		return err
@@ -193,7 +197,7 @@ func cmdRestore(ctx context.Context, args []string) error {
 	res, err := restore.Run(ctx, plan, restore.Options{
 		Dest:      dest,
 		Codec:     wc,
-		Download:  tgDownloader{f: &chunk.TGFetcher{Session: sess}},
+		Download:  tgDownloader{f: &chunk.TGFetcher{Session: sess, OfflineTimeout: offlineTimeout}},
 		Workers:   *workers,
 		Retriable: retriable,
 		Telegram:  telegramFailure,
