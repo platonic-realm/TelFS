@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"time"
-
-	"telfs/internal/config"
 )
 
 // registerRoutes binds the P1 surface. Subsequent phases add login,
@@ -42,6 +40,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /profiles/{name}/api", s.profilesSetAPI)
 	s.mux.HandleFunc("POST /profiles/{name}/secret", s.profilesSetSecret)
 	s.mux.HandleFunc("POST /profiles/{name}/use", s.profilesUse)
+	s.mux.HandleFunc("POST /profiles/{name}/default", s.profilesDefault)
 	s.mux.HandleFunc("POST /profiles/{name}/delete", s.profilesDelete)
 	// POST + CSRF, not GET: the bundle contains session.json — a live
 	// MTProto session = full Telegram account takeover. A GET could be
@@ -136,7 +135,7 @@ func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 // the templates root.
 func (s *Server) renderTemplateWith(w http.ResponseWriter, name string, data any, extras ...string) {
 	files := append([]string{"templates/layout.html", "templates/" + name}, extras...)
-	t, err := template.New("").Funcs(tmplFuncs()).ParseFS(templatesFS, files...)
+	t, err := template.New("").Funcs(funcsFor(w)).ParseFS(templatesFS, files...)
 	if err != nil {
 		s.opts.Logger.Printf("template parse %s: %v", name, err)
 		http.Error(w, "template error", http.StatusInternalServerError)
@@ -161,7 +160,7 @@ func (s *Server) renderPartial(w http.ResponseWriter, name string, data any) {
 // partial is ALSO embedded into a full page, since two "content"
 // defines in one parse set collide.
 func (s *Server) renderPartialBlock(w http.ResponseWriter, name, block string, data any) {
-	t, err := template.New("").Funcs(tmplFuncs()).
+	t, err := template.New("").Funcs(funcsFor(w)).
 		ParseFS(templatesFS, "templates/"+name)
 	if err != nil {
 		s.opts.Logger.Printf("partial parse %s: %v", name, err)
@@ -178,6 +177,17 @@ func (s *Server) renderPartialBlock(w http.ResponseWriter, name, block string, d
 // here so a page and its partials see the same functions; otherwise
 // {{template ...}} embeds fail when the helper exists on the page's
 // FuncMap but not the partial's.
+// funcsFor is tmplFuncs bound to the request w answers: activeProfile is
+// that request's selected profile.
+func funcsFor(w http.ResponseWriter) template.FuncMap {
+	f := tmplFuncs()
+	if sr, ok := w.(*statusRecorder); ok {
+		sel := sr.profile
+		f["activeProfile"] = func() string { return sel }
+	}
+	return f
+}
+
 func tmplFuncs() template.FuncMap {
 	return template.FuncMap{
 		"humanBytes": humanBytesTpl,
@@ -187,11 +197,10 @@ func tmplFuncs() template.FuncMap {
 		// "adopted:/path/to/mnt" — a raw slash would split the
 		// segment and 404 the route.
 		"pathEscape": url.PathEscape,
-		// activeProfile reads the active profile at render time so the
-		// masthead can show which profile every page operates on
-		// without threading a field through each page's data struct.
-		// Cheap: one file read per page render.
-		"activeProfile": config.ActiveProfile,
+		// activeProfile names the profile the pages act on; funcsFor
+		// binds it to the request (the browser's selection). Without a
+		// request (tests) it is the selection's fallback.
+		"activeProfile": func() string { return selectedProfile(&http.Request{Header: http.Header{}}) },
 		// ago renders a unix time as a terse age ("3 h ago").
 		"ago": ago,
 		// pctOf / pctOf64: render a "filled %" for the queue visual

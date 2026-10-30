@@ -35,7 +35,7 @@ import (
 // BYTES are to the cap, and whether writes actually wait.
 func (s *Server) healthPartial(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, renderLamps(lampProfiles(monitorProfiles(r.Context(), monLamps))))
+	_, _ = io.WriteString(w, renderLamps(lampProfiles(monitorProfiles(r.Context(), monLamps, profileOf(r)))))
 }
 
 // renderLamps is the masthead fragment: per profile its name and two

@@ -69,8 +69,11 @@ type cacheLiveStats struct {
 // fetchCacheLive pulls /cache from the running daemon and parses it.
 // Returns nil on any failure (network, JSON, non-200) — the caller
 // treats nil as "fall back to on-disk stats from dirStats".
-func fetchCacheLive() *cacheLiveStats {
-	resp, err := daemonGet("/cache")
+func fetchCacheLive(cfg *config.Config) *cacheLiveStats {
+	if cfg == nil {
+		return nil
+	}
+	resp, err := daemonGetFor(cfg, "/cache")
 	if err != nil {
 		return nil
 	}
@@ -112,13 +115,13 @@ type stateMountRow struct {
 
 func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 	d := stateShowData{pageBase: s.basePage(w, r)}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
 		s.renderTemplateWith(w, "state/show.html", d, "templates/partials/cache.html")
 		return
 	}
-	d.Profile = config.ActiveProfile()
+	d.Profile = profileOf(r)
 	d.DataDir = cfg.DataDir
 	d.DBPath = cfg.DBPath()
 	d.CachePath = cfg.CachePath()
@@ -139,7 +142,7 @@ func (s *Server) stateShow(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	d.CacheLive = fetchCacheLive()
+	d.CacheLive = fetchCacheLive(cfg)
 	d.MountActive = len(activeMounts()) > 0
 	d.Repair = s.repair.Snapshot()
 	for _, mp := range s.sup.List() {
@@ -201,7 +204,7 @@ func (s *Server) stateRepair(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/state", http.StatusSeeOther)
 		return
 	}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
 		http.Redirect(w, r, "/state", http.StatusSeeOther)

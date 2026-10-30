@@ -1,5 +1,5 @@
 {{define "content"}}
-<h2>Profile: {{.Name}} {{if eq .Name .Active}}<small>(active)</small>{{end}}</h2>
+<h2>Profile: {{.Name}}{{if eq .Name .Active}} <small>selected</small>{{end}}{{if eq .Name .Default}} <small>· CLI default</small>{{end}}</h2>
 
 {{if and (eq .Name .Active) (or (not .Identity) (not .Channel.Set))}}
 <p><a href="/setup" class="btn primary">Continue the guided setup →</a></p>
@@ -104,7 +104,14 @@
     {{if ne .Name .Active}}
     <form method="post" action="/profiles/{{.Name}}/use" style="display:inline">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <button type="submit">Make active</button>
+      <input type="hidden" name="back" value="/profiles/{{.Name}}">
+      <button type="submit" title="Make the Setup, Browse and State pages of this browser act on {{.Name}}">Select</button>
+    </form>
+    {{end}}
+    {{if ne .Name .Default}}
+    <form method="post" action="/profiles/{{.Name}}/default" style="display:inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" class="secondary" title="telfs commands without TELFS_PROFILE use {{.Name}} (what `telfs profile use` sets)">Make CLI default</button>
     </form>
     {{end}}
     <form method="post" action="/profiles/{{.Name}}/export" style="display:inline">

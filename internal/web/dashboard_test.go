@@ -2,9 +2,11 @@ package web
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -60,7 +62,7 @@ func dashboardFixture(t *testing.T) dashboardData {
 	}
 	ctx := context.Background()
 	return dashboardData{CSRF: "tok", Profile: "cloud", Active: "cloud",
-		Monitors: monitorProfiles(ctx, monFull), MountList: []mountView{
+		Monitors: monitorProfiles(ctx, monFull, "cloud"), MountList: []mountView{
 			{Point: "/srv/mnt/backup", Profile: "backup"}, {Point: "/mnt/offsite", Profile: "backup", ReadOnly: true}}}
 }
 
@@ -100,7 +102,7 @@ func TestMonitorWithoutActiveProfile(t *testing.T) {
 	isolate(t)
 	mkProfile(t, "backup", "b", true)
 	mkProfile(t, "cloud", "c", true)
-	ms := monitorProfiles(context.Background(), monLive)
+	ms := monitorProfiles(context.Background(), monLive, "")
 	if len(ms) != 2 || ms[0].Selected || ms[1].Selected {
 		t.Fatalf("%+v", ms)
 	}
@@ -206,5 +208,66 @@ func TestTelegramPageProfileTabs(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("telegram page lacks %q", want)
 		}
+	}
+}
+
+// The console's selection is per browser (v1.1 W1): cookie, else the CLI's
+// default, else the first profile; Select sets only the cookie, the CLI
+// default is a separate action; a bad cookie falls through.
+func TestProfileSelection(t *testing.T) {
+	isolate(t)
+	mkProfile(t, "backup", "b", true)
+	mkProfile(t, "cloud", "c", true)
+	req := func(cookie string) *http.Request {
+		r := httptest.NewRequest("GET", "/", nil)
+		if cookie != "" {
+			r.AddCookie(&http.Cookie{Name: profileCookie, Value: cookie})
+		}
+		return r
+	}
+	if got := selectedProfile(req("")); got != "backup" {
+		t.Fatalf("no cookie, no CLI default: %q, want the first profile", got)
+	}
+	config.SetActiveProfile("cloud")
+	if got := selectedProfile(req("")); got != "cloud" {
+		t.Fatalf("the CLI default: %q", got)
+	}
+	if got := selectedProfile(req("backup")); got != "backup" {
+		t.Fatalf("the browser's choice wins: %q", got)
+	}
+	if got := selectedProfile(req("../etc")); got != "cloud" {
+		t.Fatalf("a bad cookie falls through: %q", got)
+	}
+	if cfg, err := loadProfileCfg("ghost"); err == nil || cfg != nil {
+		t.Fatal("a missing profile loads")
+	}
+
+	s := &Server{state: NewState()}
+	post := func(target string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", target, strings.NewReader("csrf=0123456789abcdef0123456789abcdef&back=//evil.example"))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.AddCookie(&http.Cookie{Name: "telfs_csrf", Value: "0123456789abcdef0123456789abcdef"})
+		r.SetPathValue("name", "backup")
+		rec := httptest.NewRecorder()
+		if strings.HasSuffix(target, "/use") {
+			s.profilesUse(rec, r)
+		} else {
+			s.profilesDefault(rec, r)
+		}
+		return rec
+	}
+	rec := post("/profiles/backup/use")
+	if c := rec.Result().Cookies(); len(c) == 0 || !slices.ContainsFunc(c, func(c *http.Cookie) bool { return c.Name == profileCookie && c.Value == "backup" }) {
+		t.Fatalf("Select sets no cookie: %v (status %d)", c, rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/" {
+		t.Fatalf("redirect %q: an outside back= must not be followed", loc)
+	}
+	if config.ActiveProfile() != "cloud" {
+		t.Fatal("Select changed the CLI default")
+	}
+	post("/profiles/backup/default")
+	if config.ActiveProfile() != "backup" {
+		t.Fatal("Make CLI default did not")
 	}
 }

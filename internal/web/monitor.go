@@ -142,9 +142,8 @@ const (
 
 // monitorProfiles reads every profile, concurrently (one wedged daemon
 // costs its 2 s timeout once, not once per profile).
-func monitorProfiles(ctx context.Context, level monLevel) []profileMonitor {
+func monitorProfiles(ctx context.Context, level monLevel, selected string) []profileMonitor {
 	names := listProfileNames()
-	selected := config.ActiveProfile()
 	out := make([]profileMonitor, len(names))
 	var wg sync.WaitGroup
 	for i, name := range names {

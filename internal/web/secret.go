@@ -150,7 +150,7 @@ func (s *Server) setupInit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		SetFlash(w, "error", err.Error())
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)

@@ -5,7 +5,6 @@ import (
 	"os"
 
 	"telfs/internal/compress"
-	"telfs/internal/config"
 	"telfs/internal/meta"
 )
 
@@ -21,7 +20,7 @@ type compressShowData struct {
 
 func (s *Server) compressShow(w http.ResponseWriter, r *http.Request) {
 	d := compressShowData{pageBase: s.basePage(w, r)}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		s.renderTemplate(w, "compress/show.html", d)
 		return
@@ -58,7 +57,7 @@ type compressInitData struct {
 
 func (s *Server) compressInitForm(w http.ResponseWriter, r *http.Request) {
 	d := compressInitData{pageBase: s.basePage(w, r), CurrentCodec: compress.NameNone}
-	if cfg, err := config.Load(); err == nil {
+	if cfg, err := loadCfg(r); err == nil {
 		if _, err := os.Stat(cfg.DBPath()); err == nil {
 			if mstore, err := meta.Open(cfg.DBPath()); err == nil {
 				if has, err := mstore.HasAnyChunks(r.Context()); err == nil && has {

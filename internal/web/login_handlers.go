@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	"telfs/internal/config"
 	"telfs/internal/mountctl"
 	"telfs/internal/secret"
 )
@@ -44,8 +43,8 @@ type phone1Data struct {
 }
 
 func (s *Server) loginPhoneForm(w http.ResponseWriter, r *http.Request) {
-	d := phone1Data{pageBase: s.basePage(w, r), Profile: config.ActiveProfile()}
-	if cfg, err := config.Load(); err == nil {
+	d := phone1Data{pageBase: s.basePage(w, r), Profile: profileOf(r)}
+	if cfg, err := loadCfg(r); err == nil {
 		d.NeedAPI = cfg.RequireAPI() != nil
 		d.APIID = cfg.APIID
 		if cfg.HasSession() && cfg.Identity != nil {
@@ -76,13 +75,13 @@ func (s *Server) loginLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
 		return
 	}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
 		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
 		return
 	}
-	profile := config.ActiveProfile()
+	profile := profileOf(r)
 	if pid, mp, ok, ferr := mountctl.FindByProfile(profile); ferr != nil {
 		SetFlash(w, "error", fmt.Sprintf("profile %q: %v", profile, ferr))
 		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
@@ -118,7 +117,7 @@ func (s *Server) loginPhoneStart(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
 		return
 	}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
 		http.Redirect(w, r, "/login/phone", http.StatusSeeOther)
@@ -165,7 +164,7 @@ func (s *Server) loginPhoneStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess := newLoginSession(config.ActiveProfile())
+	sess := newLoginSession(profileOf(r))
 	s.logins.Add(sess)
 	http.SetCookie(w, &http.Cookie{
 		Name:  loginCookie,

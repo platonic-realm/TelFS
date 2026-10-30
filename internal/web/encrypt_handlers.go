@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"os"
 
-	"telfs/internal/config"
 	"telfs/internal/crypto"
 	"telfs/internal/meta"
 )
@@ -22,7 +21,7 @@ type encryptShowData struct {
 
 func (s *Server) encryptShow(w http.ResponseWriter, r *http.Request) {
 	d := encryptShowData{pageBase: s.basePage(w, r)}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		s.renderTemplate(w, "crypto/show.html", d)
 		return
@@ -57,7 +56,7 @@ type encryptInitData struct {
 
 func (s *Server) encryptInitForm(w http.ResponseWriter, r *http.Request) {
 	d := encryptInitData{pageBase: s.basePage(w, r)}
-	if cfg, err := config.Load(); err == nil {
+	if cfg, err := loadCfg(r); err == nil {
 		if _, err := os.Stat(cfg.DBPath()); err == nil {
 			if mstore, err := meta.Open(cfg.DBPath()); err == nil {
 				if has, err := mstore.HasAnyChunks(r.Context()); err == nil && has {

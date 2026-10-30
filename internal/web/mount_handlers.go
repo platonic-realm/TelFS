@@ -88,7 +88,7 @@ func (s *Server) mountNewForm(w http.ResponseWriter, r *http.Request) {
 	d := mountNewData{
 		pageBase:       s.basePage(w, r),
 		Profiles:       listProfileNames(),
-		DefaultProfile: config.ActiveProfile(),
+		DefaultProfile: profileOf(r),
 	}
 	s.renderTemplate(w, "mount/new.html", d)
 }

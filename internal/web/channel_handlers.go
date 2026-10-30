@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"telfs/internal/config"
 	"telfs/internal/secret"
 	"telfs/internal/tg"
 )
@@ -25,7 +24,7 @@ type channelShowData struct {
 
 func (s *Server) channelShow(w http.ResponseWriter, r *http.Request) {
 	d := channelShowData{pageBase: s.basePage(w, r)}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		s.renderTemplate(w, "channel/show.html", d)
 		return
@@ -53,7 +52,7 @@ type channelListData struct {
 
 func (s *Server) channelList(w http.ResponseWriter, r *http.Request) {
 	d := channelListData{pageBase: s.basePage(w, r)}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		d.Error = err.Error()
 		s.renderTemplate(w, "channel/list.html", d)
@@ -106,7 +105,7 @@ type setupChannelsData struct {
 
 func (s *Server) setupChannels(w http.ResponseWriter, r *http.Request) {
 	d := setupChannelsData{CSRF: s.state.EnsureCSRF(w, r)}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		d.Error = err.Error()
 		s.renderPartial(w, "partials/setup_channels.html", d)
@@ -180,7 +179,7 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cfg, err := config.Load()
+	cfg, err := loadCfg(r)
 	if err != nil {
 		SetFlash(w, "error", "config: "+err.Error())
 		http.Redirect(w, r, errBack, http.StatusSeeOther)
@@ -192,7 +191,7 @@ func (s *Server) channelSetSubmit(w http.ResponseWriter, r *http.Request) {
 	// and gc. The web form has no --force — use a fresh profile (or
 	// the CLI) for deliberate rebinds.
 	if cfg.Channel.ID != 0 && cfg.Channel.ID != id {
-		if mstore, merr := openMetaExisting(); merr == nil {
+		if mstore, merr := openMetaExistingFor(cfg); merr == nil {
 			has, rerr := mstore.HasAnyChunks(r.Context())
 			mstore.Close()
 			if rerr == nil && has {

@@ -106,7 +106,7 @@ type flashData struct{ Kind, Msg string }
 // profile's channel and filesystem, then every TelFS mount.
 func (s *Server) dashboardIndex(w http.ResponseWriter, r *http.Request) {
 	d := s.loadDashboard(r.Context(), w, r)
-	d.Monitors = monitorProfiles(r.Context(), monFull)
+	d.Monitors = monitorProfiles(r.Context(), monFull, profileOf(r))
 	d.MountList = mountList()
 	s.renderTemplateWith(w, "dashboard.html", d, "templates/partials/profiles.html")
 }
@@ -123,7 +123,7 @@ type profilesPanelData struct {
 // sees it. EnsureCSRF reuses the browser's token (no rotation), so the
 // table's Select buttons keep working across polls.
 func (s *Server) profilesPartial(w http.ResponseWriter, r *http.Request) {
-	d := profilesPanelData{CSRF: s.state.EnsureCSRF(w, r), Monitors: monitorProfiles(r.Context(), monLive)}
+	d := profilesPanelData{CSRF: s.state.EnsureCSRF(w, r), Monitors: monitorProfiles(r.Context(), monLive, profileOf(r))}
 	s.renderPartialBlock(w, "partials/profiles.html", "profiles_panel", d)
 }
 
@@ -186,9 +186,9 @@ const setupSkipCookie = "telfs_setup_skip"
 // skipping the optional encryption step on one profile must not mark
 // it skipped on every other profile the operator switches to.
 // Profile names are [A-Za-z0-9_-], all valid cookie-name chars.
-func setupSkipCookieName() string {
-	if p := config.ActiveProfile(); p != "" {
-		return setupSkipCookie + "_" + p
+func setupSkipCookieName(profile string) string {
+	if profile != "" {
+		return setupSkipCookie + "_" + profile
 	}
 	return setupSkipCookie
 }
@@ -222,7 +222,7 @@ func (s *Server) setupWizard(w http.ResponseWriter, r *http.Request) {
 		Active:     d.Active,
 		Mountpoint: defaultMountpoint(),
 	}
-	if cfg, err := config.Load(); err == nil {
+	if cfg, err := loadCfg(r); err == nil {
 		pageData.APIID = cfg.APIID
 	}
 	// In-flight phone login? Render the code/password form instead of
@@ -232,12 +232,12 @@ func (s *Server) setupWizard(w http.ResponseWriter, r *http.Request) {
 	}
 	pageData.CryptoOn = d.Crypto.Enabled
 	pageData.Codec = "none"
-	if cfg, err := config.Load(); err == nil {
+	if cfg, err := loadCfg(r); err == nil {
 		pageData.SecretSource = cfg.Secret.EffectiveSource()
 		pageData.SecretFile = cfg.Secret.File
 		pageData.SecretEntry = cfg.Secret.Entry
 	}
-	if cfg, err := config.Load(); err == nil && fileExists(cfg.DBPath()) {
+	if cfg, err := loadCfg(r); err == nil && fileExists(cfg.DBPath()) {
 		if mstore, err := meta.Open(cfg.DBPath()); err == nil {
 			if codec, err := mstore.CompressionCodec(r.Context()); err == nil {
 				pageData.Codec = codec
@@ -279,13 +279,13 @@ func (s *Server) setupSkip(w http.ResponseWriter, r *http.Request) {
 	} else {
 		skipped[atoiSafe(idx)] = true
 	}
-	writeSkipCookie(w, skipped)
+	writeSkipCookie(w, profileOf(r), skipped)
 	http.Redirect(w, r, "/setup", http.StatusSeeOther)
 }
 
 func readSkipCookie(r *http.Request) map[int]bool {
 	out := map[int]bool{}
-	c, err := r.Cookie(setupSkipCookieName())
+	c, err := r.Cookie(setupSkipCookieName(profileOf(r)))
 	if err != nil || c.Value == "" {
 		return out
 	}
@@ -298,7 +298,7 @@ func readSkipCookie(r *http.Request) map[int]bool {
 	return out
 }
 
-func writeSkipCookie(w http.ResponseWriter, m map[int]bool) {
+func writeSkipCookie(w http.ResponseWriter, profile string, m map[int]bool) {
 	parts := make([]string, 0, len(m))
 	for k, v := range m {
 		if v {
@@ -307,7 +307,7 @@ func writeSkipCookie(w http.ResponseWriter, m map[int]bool) {
 	}
 	sort.Strings(parts)
 	http.SetCookie(w, &http.Cookie{
-		Name:     setupSkipCookieName(),
+		Name:     setupSkipCookieName(profile),
 		Value:    strings.Join(parts, ","),
 		Path:     "/",
 		HttpOnly: true,
@@ -332,8 +332,8 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	kind, msg := ConsumeFlash(w, r)
 	d.Flash = flashData{Kind: kind, Msg: msg}
-	d.Active = config.ActiveProfile()
-	cfg, err := config.Load()
+	d.Active = profileOf(r)
+	cfg, err := loadCfg(r)
 	if err == nil {
 		d.Profile = nameForDashboard(d.Active)
 		d.Identity = cfg.Identity.Label()
@@ -345,7 +345,7 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 		// auto-bootstraps a db.sqlite, which we don't want on the
 		// "no active profile / empty dashboard" path.
 		if _, err := os.Stat(cfg.DBPath()); err == nil {
-			if mstore, err := meta.Open(cfg.DBPath()); err == nil {
+			if mstore, err := openMetaRead(cfg); err == nil {
 				d.HasMeta = true
 				if u, err := mstore.FSUUID(ctx); err == nil {
 					d.FSUUID = u
@@ -369,7 +369,7 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	d.Mounts = activeMounts()
 	d.Profiles = listProfileNames()
-	d.Setup = buildSetupChecklist(d)
+	d.Setup = buildSetupChecklist(d, cfg)
 	return d
 }
 
@@ -378,8 +378,7 @@ func (s *Server) loadDashboard(ctx context.Context, w http.ResponseWriter, r *ht
 // the conceptual prerequisites: API creds → login → channel → optional
 // encryption → mount. The first not-done step gets a Why message; the
 // dashboard template renders that prominently.
-func buildSetupChecklist(d dashboardData) setupChecklist {
-	cfg, _ := config.Load()
+func buildSetupChecklist(d dashboardData, cfg *config.Config) setupChecklist {
 	apiOK := cfg != nil && cfg.APIID != 0 && cfg.APIHash != ""
 	// Authenticated means the LOGIN COMPLETED — [identity] is written
 	// only after a successful auth. session.json alone is NOT enough:
@@ -637,7 +636,8 @@ type profilesListData struct {
 	CSRF     string
 	Flash    flashData
 	Path     string
-	Active   string
+	Active   string // the profile this browser has selected
+	Default  string // the CLI's default (~/.config/telfs/active)
 	Profiles []string
 }
 
@@ -647,7 +647,8 @@ func (s *Server) profilesList(w http.ResponseWriter, r *http.Request) {
 		CSRF:     s.state.EnsureCSRF(w, r),
 		Flash:    flashData{kind, msg},
 		Path:     r.URL.Path,
-		Active:   config.ActiveProfile(),
+		Active:   profileOf(r),
+		Default:  config.ActiveProfile(),
 		Profiles: listProfileNames(),
 	}
 	s.renderTemplate(w, "profile/list.html", d)
@@ -678,7 +679,7 @@ func (s *Server) basePage(w http.ResponseWriter, r *http.Request) pageBase {
 		Flash: flashData{Kind: kind, Msg: msg},
 		Path:  r.URL.Path,
 	}
-	if cfg, err := config.Load(); err == nil {
+	if cfg, err := loadCfg(r); err == nil {
 		pb.SecretPrompt = secretIsPrompt(cfg)
 		pb.NewSecret = !cfg.HasSession()
 	}
@@ -721,19 +722,19 @@ func (s *Server) profilesCreate(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, errBack, http.StatusSeeOther)
 		return
 	}
-	// Wizard-created profiles become active immediately — the wizard's
-	// remaining steps all operate on the active profile.
+	// A new profile is the one to configure next: this browser selects it
+	// (the wizard's remaining steps act on the selection). It becomes the
+	// CLI's default too when there is none yet, so `telfs` commands work.
+	setSelected(w, name)
+	if config.ActiveProfile() == "" {
+		_ = config.SetActiveProfile(name)
+	}
 	if r.FormValue("from") == "setup" {
-		if err := config.SetActiveProfile(name); err != nil {
-			SetFlash(w, "error", "activate: "+err.Error())
-			http.Redirect(w, r, "/setup", http.StatusSeeOther)
-			return
-		}
-		SetFlash(w, "ok", fmt.Sprintf("created profile %q — it is now active", name))
+		SetFlash(w, "ok", fmt.Sprintf("created profile %q — selected", name))
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
 	}
-	SetFlash(w, "ok", fmt.Sprintf("created profile %q", name))
+	SetFlash(w, "ok", fmt.Sprintf("created profile %q — selected", name))
 	http.Redirect(w, r, "/profiles/"+name, http.StatusSeeOther)
 }
 
@@ -742,7 +743,8 @@ type profileShowData struct {
 	Flash      flashData
 	Path       string
 	Name       string
-	Active     string
+	Active     string // the profile this browser has selected
+	Default    string // the CLI's default (~/.config/telfs/active)
 	Dir        string
 	APIID      int
 	HasAPI     bool
@@ -765,10 +767,11 @@ func (s *Server) profilesShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d := profileShowData{
-		CSRF:   s.state.EnsureCSRF(w, r),
-		Path:   r.URL.Path,
-		Name:   name,
-		Active: config.ActiveProfile(),
+		CSRF:    s.state.EnsureCSRF(w, r),
+		Path:    r.URL.Path,
+		Name:    name,
+		Active:  profileOf(r),
+		Default: config.ActiveProfile(),
 	}
 	kind, msg := ConsumeFlash(w, r)
 	d.Flash = flashData{kind, msg}
@@ -881,13 +884,42 @@ func (s *Server) profilesUse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	if err := config.SetActiveProfile(name); err != nil {
-		SetFlash(w, "error", err.Error())
+	if !profileExists(name) {
+		SetFlash(w, "error", fmt.Sprintf("no profile %q", name))
 		http.Redirect(w, r, "/profiles", http.StatusSeeOther)
 		return
 	}
-	SetFlash(w, "ok", fmt.Sprintf("active profile set to %q", name))
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	// The browser's choice only (v1.1 W1): the CLI's default and other
+	// browsers are untouched.
+	setSelected(w, name)
+	SetFlash(w, "ok", fmt.Sprintf("selected profile %s — the Setup, Browse and State pages act on it", name))
+	http.Redirect(w, r, localBack(r, "/"), http.StatusSeeOther)
+}
+
+// profilesDefault makes a profile the CLI's default (~/.config/telfs/active,
+// what `telfs profile use` writes) — separate from the console's selection.
+func (s *Server) profilesDefault(w http.ResponseWriter, r *http.Request) {
+	if err := s.state.CheckCSRF(r); err != nil {
+		http.Error(w, "csrf: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	name := r.PathValue("name")
+	if err := config.SetActiveProfile(name); err != nil {
+		SetFlash(w, "error", err.Error())
+	} else {
+		SetFlash(w, "ok", fmt.Sprintf("%s is now the CLI's default profile (telfs commands without TELFS_PROFILE use it)", name))
+	}
+	http.Redirect(w, r, "/profiles/"+name, http.StatusSeeOther)
+}
+
+// localBack is the form's "back" field when it is a local path, else def
+// (never an open redirect).
+func localBack(r *http.Request, def string) string {
+	b := r.FormValue("back")
+	if strings.HasPrefix(b, "/") && !strings.HasPrefix(b, "//") && !strings.Contains(b, "\\") {
+		return b
+	}
+	return def
 }
 
 func (s *Server) profilesDelete(w http.ResponseWriter, r *http.Request) {

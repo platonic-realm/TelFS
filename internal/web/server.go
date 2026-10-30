@@ -161,9 +161,11 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 			}
 		}()
+		// The profile this request acts on (per browser, v1.1 W1).
+		r, sel := withSelection(r)
 		// request log (cheap)
 		start := time.Now()
-		ww := &statusRecorder{ResponseWriter: w, status: 200}
+		ww := &statusRecorder{ResponseWriter: w, status: 200, profile: sel}
 		next.ServeHTTP(ww, r)
 		s.opts.Logger.Printf("%s %s %d %s", r.Method, r.URL.Path, ww.status, time.Since(start))
 	})
@@ -200,7 +202,8 @@ func (s *Server) hostAllowed(hostport string) bool {
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status  int
+	profile string // the request's selected profile (selection.go)
 }
 
 func (sr *statusRecorder) WriteHeader(c int) {

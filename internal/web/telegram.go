@@ -372,11 +372,10 @@ func fillTGState(ctx context.Context, data *tgPageData, cfg *config.Config, cfgE
 func requestProfile(r *http.Request) (*config.Config, string, error) {
 	name := strings.TrimSpace(r.FormValue("profile"))
 	if name == "" {
-		name = config.ActiveProfile()
+		name = profileOf(r)
 	}
 	if name == "" {
-		cfg, err := config.Load()
-		return cfg, "", err
+		return nil, "", errNoProfile
 	}
 	if err := config.ValidateProfileName(name); err != nil {
 		return nil, name, err
@@ -530,16 +529,6 @@ var httpClient = &http.Client{Timeout: 2 * time.Second}
 // control socket (spec v1 §3). A `source=` URL (loopback only) still reads
 // a daemon started with --metrics-addr over TCP.
 const controlSource = "the profile's control socket"
-
-// daemonGet fetches path from the active profile's running daemon over its
-// control socket.
-func daemonGet(path string) (*http.Response, error) {
-	cfg, err := config.Load()
-	if err != nil {
-		return nil, err
-	}
-	return daemonGetFor(cfg, path)
-}
 
 // daemonGetFor fetches path from cfg's profile's running daemon.
 func daemonGetFor(cfg *config.Config, path string) (*http.Response, error) {
